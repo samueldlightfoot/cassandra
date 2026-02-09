@@ -207,6 +207,7 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
         private final ChannelProxy channel;
         private final ByteBufferHolder bufferHolder;
         private final ThreadLocalReadAheadBuffer readAheadBuffer;
+        private boolean isAllocated;
 
         private ScanCompressedReader(ChannelProxy channel, ByteBufferHolder bufferHolder,
                                      ThreadLocalReadAheadBuffer readAheadBuffer)
@@ -214,6 +215,7 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
             this.channel = channel;
             this.bufferHolder = bufferHolder;
             this.readAheadBuffer = readAheadBuffer;
+            this.isAllocated = false;
         }
 
         @Override
@@ -252,18 +254,20 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
         public void allocateResources()
         {
             readAheadBuffer.allocateBuffer();
+            isAllocated = true;
         }
 
         @Override
         public void deallocateResources()
         {
             readAheadBuffer.clear(true);
+            isAllocated = false;
         }
 
         @Override
         public boolean allocated()
         {
-            return readAheadBuffer.hasBuffer();
+            return isAllocated;
         }
 
         @Override

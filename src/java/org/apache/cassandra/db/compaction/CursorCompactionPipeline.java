@@ -19,7 +19,9 @@
 package org.apache.cassandra.db.compaction;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.Set;
 
 import org.apache.cassandra.db.AbstractCompactionController;
@@ -27,6 +29,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
 import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.TimeUUID;
 
@@ -38,7 +41,18 @@ class CursorCompactionPipeline extends AbstractCompactionPipeline {
 
     CursorCompactionPipeline(CompactionTask task, OperationType type, AbstractCompactionStrategy.ScannerList scanners, AbstractCompactionController controller, long nowInSec, TimeUUID compactionId) {
         this.task = task;
-        cursorCompactor = new CursorCompactor(type, scanners.scanners, controller, nowInSec, compactionId);
+        // Extract SSTableReaders from the scanners, then close the scanners immediately.
+        // CursorCompactor opens its own data readers via SSTableCursorReader so the scanner-opened
+        // readers are not needed. Keeping them open wastes file descriptors and, when using direct
+        // disk access mode, the scanner's ThreadLocalReadAheadBuffer pollutes the same static
+        // thread-local block map that the cursor reader will use, causing read corruption.
+        List<SSTableReader> sstables = new ArrayList<>();
+        for (ISSTableScanner scanner : scanners.scanners)
+        {
+            sstables.addAll(scanner.getBackingSSTables());
+            scanner.close();
+        }
+        cursorCompactor = new CursorCompactor(type, sstables, controller, nowInSec, compactionId);
     }
 
     public AutoCloseable openWriterResource(ColumnFamilyStore cfs,

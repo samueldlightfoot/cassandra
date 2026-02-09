@@ -247,13 +247,13 @@ public class CursorCompactor extends CompactionInfo.Holder
     int partitionHeaderLength = 0;
     private CompactionAwareWriter compactionAwareWriter;
 
-    public CursorCompactor(OperationType type, List<ISSTableScanner> scanners, AbstractCompactionController controller, long nowInSec, TimeUUID compactionId)
+    public CursorCompactor(OperationType type, Collection<SSTableReader> sstables, AbstractCompactionController controller, long nowInSec, TimeUUID compactionId)
     {
-        this(type, scanners, controller, nowInSec, compactionId, ActiveCompactionsTracker.NOOP);
+        this(type, sstables, controller, nowInSec, compactionId, ActiveCompactionsTracker.NOOP);
     }
 
     private CursorCompactor(OperationType type,
-                           List<ISSTableScanner> scanners,
+                           Collection<SSTableReader> sstables,
                            AbstractCompactionController controller,
                            long nowInSec,
                            TimeUUID compactionId,
@@ -265,17 +265,15 @@ public class CursorCompactor extends CompactionInfo.Holder
         this.compactionId = compactionId;
 
         long inputBytes = 0;
-        for (ISSTableScanner scanner : scanners)
-            inputBytes += scanner.getLengthInBytes();
+        for (SSTableReader sstable : sstables)
+            inputBytes += sstable.uncompressedLength();
         this.totalInputBytes = inputBytes;
-        this.partitionMergeCounters = new long[scanners.size()];
+        this.partitionMergeCounters = new long[sstables.size()];
         this.staticRowMergeCounters = new long[partitionMergeCounters.length];
         this.rowMergeCounters = new long[partitionMergeCounters.length];
         this.rangeTombstonesMergeCounters = new long[partitionMergeCounters.length];
         this.cellMergeCounters = new long[partitionMergeCounters.length];
-        // note that we leak `this` from the constructor when calling beginCompaction below, this means we have to get the sstables before
-        // calling that to avoid a NPE.
-        this.sstables = scanners.stream().map(ISSTableScanner::getBackingSSTables).flatMap(Collection::stream).collect(ImmutableSet.toImmutableSet());
+        this.sstables = ImmutableSet.copyOf(sstables);
         // This is always NOOP, but keep it around in case we need it later to match CompactionIterator
         this.activeCompactions = activeCompactions == null ? ActiveCompactionsTracker.NOOP : activeCompactions;
         this.activeCompactions.beginCompaction(this); // note that CompactionTask also calls this, but CT only creates CompactionIterator with a NOOP ActiveCompactions
@@ -295,8 +293,8 @@ public class CursorCompactor extends CompactionInfo.Holder
          * {@link CompactionIterator#CompactionIterator(OperationType, List, AbstractCompactionController, long, TimeUUID, ActiveCompactionsTracker)}
          */
 
-        this.sstableCursors = createCursors(sstables, DatabaseDescriptor.getCompactionReadDiskAccessMode());
-        this.sstableCursorsEqualsNext = new boolean[sstables.size()];
+        this.sstableCursors = createCursors(this.sstables, DatabaseDescriptor.getCompactionReadDiskAccessMode());
+        this.sstableCursorsEqualsNext = new boolean[this.sstables.size()];
         this.enforceStrictLiveness = controller.cfs.metadata.get().enforceStrictLiveness();
 
         purger = new Purger(type, controller, nowInSec);
