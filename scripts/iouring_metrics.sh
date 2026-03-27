@@ -75,7 +75,7 @@ Benchmark mode (--benchmark):
   --warmup <n>           JMH warmup iterations (default: 5)
   --iterations <n>       JMH measurement iterations (default: 10)
   --jmh-args <args>      Extra JMH arguments (passed through)
-  --skip-build           Skip 'ant build-jmh' (use existing jar)
+  --skip-build           Skip 'ant build' (use existing build)
 
 Metrics collected:
   1. Syscall profile (strace -c)    — proves io_uring_enter vs pread64
@@ -779,8 +779,7 @@ fi
 if $BENCHMARK_MODE; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     CASSANDRA_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-    JMH_JAR="$CASSANDRA_DIR/build/test/jmh/microbench.jar"
-    BENCH_CLASS="IoUringReadBench"
+    BENCH_NAME="IoUringReadBench"
 
     # Determine timestamp-based name if none given
     if [[ -z "$TEST_NAME" ]]; then
@@ -803,15 +802,14 @@ if $BENCHMARK_MODE; then
     log "Light mode:    $LIGHT_MODE"
     log ""
 
-    # Step 1: Build JMH jar
+    # Step 1: Build Cassandra (microbench classes compile with test build)
     if ! $BENCH_SKIP_BUILD; then
-        log "=== Step 1: Building JMH jar ==="
-        (cd "$CASSANDRA_DIR" && ant build-jmh) >> "$LOG_FILE" 2>&1 || die "ant build-jmh failed (see $LOG_FILE)"
+        log "=== Step 1: Building Cassandra ==="
+        (cd "$CASSANDRA_DIR" && ant build) >> "$LOG_FILE" 2>&1 || die "ant build failed (see $LOG_FILE)"
         log "Build complete"
     else
         log "=== Step 1: Skipping build (--skip-build) ==="
     fi
-    [[ -f "$JMH_JAR" ]] || die "JMH jar not found: $JMH_JAR"
 
     # Determine compression params to iterate over
     case "$BENCH_COMPRESSION" in
@@ -821,6 +819,7 @@ if $BENCHMARK_MODE; then
     esac
 
     # Build common JMH args
+    # ant microbench uses: -Dbenchmark.name=<pattern> -Djmh.args="<extra args>"
     JMH_COMMON_ARGS="-f $BENCH_FORKS -wi $BENCH_WARMUP -i $BENCH_ITERATIONS"
     [[ -n "$BENCH_JMH_ARGS" ]] && JMH_COMMON_ARGS="$JMH_COMMON_ARGS $BENCH_JMH_ARGS"
 
@@ -842,16 +841,16 @@ if $BENCHMARK_MODE; then
             log ""
             log "--- Run: $run_label ---"
 
-            # Build JMH command
-            JMH_CMD="java -jar $JMH_JAR $BENCH_CLASS -p useIoUring=$uring_val -p compression=$comp $JMH_COMMON_ARGS -rf json -rff $run_dir/jmh_results.json"
-            log "JMH: $JMH_CMD"
+            # Build JMH args: param selection + common args + JSON output
+            JMH_PARAMS="-p useIoUring=$uring_val -p compression=$comp $JMH_COMMON_ARGS -rf json -rff $run_dir/jmh_results.json"
+            log "ant microbench -Dbenchmark.name=$BENCH_NAME -Djmh.args=\"$JMH_PARAMS\""
 
             # Build args to pass to ourselves in normal mode
             SELF_ARGS=(--name "$TEST_NAME/$run_label")
             $LIGHT_MODE && SELF_ARGS+=(--light)
             $BIOSNOOP_ENABLED && SELF_ARGS+=(--biosnoop)
             [[ "$POLL_INTERVAL" != "1" ]] && SELF_ARGS+=(--poll-interval "$POLL_INTERVAL")
-            SELF_ARGS+=(-- $JMH_CMD)
+            SELF_ARGS+=(-- ant -f "$CASSANDRA_DIR/build.xml" microbench "-Dbenchmark.name=$BENCH_NAME" "-Djmh.args=$JMH_PARAMS")
 
             # Re-invoke ourselves in normal mode for this run
             "$0" "${SELF_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
