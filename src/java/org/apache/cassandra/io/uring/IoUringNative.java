@@ -95,8 +95,8 @@ public class IoUringNative
     static final int PARAMS_SQ_ENTRIES_OFF  = 0;
     static final int PARAMS_CQ_ENTRIES_OFF  = 4;
     static final int PARAMS_FLAGS_OFF       = 8;
-    static final int PARAMS_SQ_OFF_OFF      = 24; // start of sq_off struct (io_sqring_offsets)
-    static final int PARAMS_CQ_OFF_OFF      = 64; // start of cq_off struct (io_cqring_offsets)
+    static final int PARAMS_SQ_OFF_OFF      = 40; // start of sq_off struct (after 7 u32 fields + 3 u32 reserved)
+    static final int PARAMS_CQ_OFF_OFF      = 80; // start of cq_off struct (sq_off + 40 bytes for io_sqring_offsets)
 
     // io_sqring_offsets field offsets (relative to sq_off start)
     static final int SQ_OFF_HEAD        = 0;
