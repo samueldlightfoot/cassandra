@@ -679,6 +679,14 @@ public class DatabaseDescriptor
         }
         logger.info("compaction_read_disk_access_mode resolved to: {}", compactionReadDiskAccessMode);
 
+        if (CassandraRelevantProperties.USE_IO_URING.getBoolean())
+        {
+            if (org.apache.cassandra.io.uring.IoUringAvailability.isAvailable())
+                logger.info("io_uring enabled and available for SSTable reads");
+            else
+                logger.warn("io_uring enabled but not available: {}", org.apache.cassandra.io.uring.IoUringAvailability.unavailabilityReason());
+        }
+
         /* phi convict threshold for FailureDetector */
         if (conf.phi_convict_threshold < 5 || conf.phi_convict_threshold > 16)
         {

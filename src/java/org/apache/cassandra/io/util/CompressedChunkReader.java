@@ -95,7 +95,7 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
         return new BufferManagingRebufferer.Aligned(isScan ? forScan() : this);
     }
 
-    protected interface CompressedReader extends Closeable
+    public interface CompressedReader extends Closeable
     {
         default void allocateResources()
         {
@@ -281,10 +281,17 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
 
         public Direct(ChannelProxy channel, CompressionMetadata metadata, Supplier<Double> crcCheckChanceSupplier)
         {
-            super(channel, metadata, crcCheckChanceSupplier);
-            int blockSize = FileUtils.getFileBlockSize(channel.file());
-            this.reader = new DirectRandomAccessReader(channel, blockSize);
+            this(channel, metadata, crcCheckChanceSupplier,
+                 new DirectRandomAccessReader(channel, FileUtils.getFileBlockSize(channel.file())));
+        }
 
+        public Direct(ChannelProxy channel, CompressionMetadata metadata, Supplier<Double> crcCheckChanceSupplier,
+                       CompressedReader reader)
+        {
+            super(channel, metadata, crcCheckChanceSupplier);
+            this.reader = reader;
+
+            int blockSize = FileUtils.getFileBlockSize(channel.file());
             int readAheadBufferSize = DatabaseDescriptor.getCompressedReadAheadBufferSize();
             this.scanReader = (readAheadBufferSize > 0 && readAheadBufferSize > metadata.chunkLength())
                               ? new ScanCompressedReader(channel,

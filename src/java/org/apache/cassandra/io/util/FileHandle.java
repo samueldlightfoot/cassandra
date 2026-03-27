@@ -25,8 +25,12 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.RateLimiter;
 
 import org.apache.cassandra.cache.ChunkCache;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.compress.CompressionMetadata;
+import org.apache.cassandra.io.uring.IoUringAvailability;
+import org.apache.cassandra.io.uring.IoUringChunkReader;
+import org.apache.cassandra.io.uring.IoUringCompressedReader;
 import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Ref;
@@ -350,6 +354,7 @@ public class FileHandle extends SharedCloseableImpl
         private DiskAccessMode diskAccessMode = DiskAccessMode.standard;
         private long lengthOverride = -1;
         private MmappedRegionsCache mmappedRegionsCache;
+        private boolean useIoUring = CassandraRelevantProperties.USE_IO_URING.getBoolean();
 
         public Builder(File file)
         {
@@ -404,6 +409,12 @@ public class FileHandle extends SharedCloseableImpl
         public Builder withMmappedRegionsCache(MmappedRegionsCache mmappedRegionsCache)
         {
             this.mmappedRegionsCache = mmappedRegionsCache;
+            return this;
+        }
+
+        public Builder withIoUring(boolean useIoUring)
+        {
+            this.useIoUring = useIoUring;
             return this;
         }
 
@@ -512,7 +523,13 @@ public class FileHandle extends SharedCloseableImpl
                     if (compressionMetadata != null)
                     {
                         final CompressedChunkReader compressedChunkReader;
-                        if (DiskAccessMode.direct == diskAccessMode)
+                        if (DiskAccessMode.direct == diskAccessMode && useIoUring && IoUringAvailability.isAvailable())
+                        {
+                            int blockSize = FileUtils.getFileBlockSize(channel.file());
+                            compressedChunkReader = new CompressedChunkReader.Direct(channel, compressionMetadata, crcCheckChanceSupplier,
+                                                                                     new IoUringCompressedReader(channel, blockSize));
+                        }
+                        else if (DiskAccessMode.direct == diskAccessMode)
                         {
                             compressedChunkReader = new CompressedChunkReader.Direct(channel, compressionMetadata, crcCheckChanceSupplier);
                         }
@@ -525,7 +542,12 @@ public class FileHandle extends SharedCloseableImpl
                     else
                     {
                         int chunkSize = DiskOptimizationStrategy.roundForCaching(bufferSize, ChunkCache.roundUp);
-                        rebuffererFactory = maybeCached(new SimpleChunkReader(channel, length, bufferType, chunkSize));
+                        ChunkReader chunkReader;
+                        if (useIoUring && IoUringAvailability.isAvailable())
+                            chunkReader = new IoUringChunkReader(channel, length, bufferType, chunkSize);
+                        else
+                            chunkReader = new SimpleChunkReader(channel, length, bufferType, chunkSize);
+                        rebuffererFactory = maybeCached(chunkReader);
                     }
                 }
 
