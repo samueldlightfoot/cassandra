@@ -56,7 +56,7 @@ public class SSTableAbstractBench extends CQLTester
 
     @Param("50000")
     int rowCount = 50000;
-    private String table;
+    protected String table;
 
     // TODO: elaborate data setup with multiple schemas
     @Setup(Level.Trial)
