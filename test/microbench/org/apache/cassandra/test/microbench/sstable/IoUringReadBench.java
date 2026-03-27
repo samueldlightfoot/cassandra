@@ -58,15 +58,21 @@ public class IoUringReadBench extends SSTableAbstractBench
     private SSTableCursorReader cursor;
     long[] counters = new long[4];
 
-    @Setup(Level.Trial)
-    public void setupIoUring()
+    @Override
+    public void setup() throws Throwable
     {
+        // Set io_uring and partitioner BEFORE prepareServer() reads config
         System.setProperty(CassandraRelevantProperties.USE_IO_URING.getKey(), String.valueOf(useIoUring));
+        // Cursor API requires Murmur3 (createReusableKey not supported by ByteOrderedPartitioner)
+        System.setProperty(CassandraRelevantProperties.PARTITIONER.getKey(),
+                           "org.apache.cassandra.dht.Murmur3Partitioner");
 
         String status = useIoUring
                         ? (IoUringAvailability.isAvailable() ? "io_uring ENABLED" : "io_uring REQUESTED but unavailable")
                         : "io_uring DISABLED (FileChannel baseline)";
         System.err.println(status + " | compression=" + compression);
+
+        super.setup();
     }
 
     @Override
