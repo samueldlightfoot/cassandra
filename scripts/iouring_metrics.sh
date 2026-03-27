@@ -594,11 +594,15 @@ compare_results() {
 
         for syscall in pread64 io_uring_enter read write mmap; do
             local a_count b_count
-            a_count=$(awk "/$syscall/"' {gsub(/[^0-9]/, "", $4); print $4}' "$dir1/syscalls.txt" 2>/dev/null || echo 0)
-            b_count=$(awk "/$syscall/"' {gsub(/[^0-9]/, "", $4); print $4}' "$dir2/syscalls.txt" 2>/dev/null || echo 0)
-            [[ "${a_count:-0}" -eq 0 ]] && [[ "${b_count:-0}" -eq 0 ]] && continue
+            # strace -c format: %time  seconds  usecs/call  calls  errors  syscall
+            # Column 4 is 'calls'. Use head -1 to avoid multiline matches.
+            a_count=$(grep -w "$syscall" "$dir1/syscalls.txt" 2>/dev/null | head -1 | awk '{print $4}' | tr -cd '0-9')
+            b_count=$(grep -w "$syscall" "$dir2/syscalls.txt" 2>/dev/null | head -1 | awk '{print $4}' | tr -cd '0-9')
+            a_count=${a_count:-0}
+            b_count=${b_count:-0}
+            [[ "$a_count" -eq 0 ]] && [[ "$b_count" -eq 0 ]] && continue
 
-            local delta=$((${b_count:-0} - ${a_count:-0}))
+            local delta=$(( b_count - a_count ))
             local sign=""
             [[ $delta -gt 0 ]] && sign="+"
             printf "  %-25s %15s %15s %10s\n" "$syscall" "${a_count:-0}" "${b_count:-0}" "${sign}${delta}"

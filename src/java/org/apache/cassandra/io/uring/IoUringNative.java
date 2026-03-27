@@ -153,35 +153,25 @@ public class IoUringNative
         }
     }
 
-    // libc syscall() — used to invoke io_uring syscalls which aren't in libc
-    private static native long syscall(long number, Object... args) throws LastErrorException;
+    // JNA direct mapping does not support varargs, so we declare fixed-arity overloads
+    // for the syscall signatures we actually use.
+    // io_uring_setup(entries, params) — 2 args
+    private static native long syscall(long number, int arg1, Pointer arg2) throws LastErrorException;
+    // io_uring_enter(ring_fd, to_submit, min_complete, flags, sig, sigsize) — 6 args
+    private static native long syscall(long number, int arg1, int arg2, int arg3, int arg4, Pointer arg5, int arg6) throws LastErrorException;
+    // io_uring_register(ring_fd, opcode, arg, nr_args) — 4 args
+    private static native long syscall(long number, int arg1, int arg2, Pointer arg3, int arg4) throws LastErrorException;
 
     // libc mmap/munmap — for mapping the ring buffers
     private static native Pointer mmap(Pointer addr, long length, int prot, int flags, int fd, long offset) throws LastErrorException;
     private static native int munmap(Pointer addr, long length) throws LastErrorException;
     private static native int close(int fd) throws LastErrorException;
 
-    /**
-     * io_uring_setup(2) — create an io_uring instance.
-     *
-     * @param entries number of SQ entries (rounded up to power of 2 by kernel)
-     * @param params  pointer to io_uring_params struct (120 bytes, zeroed before call)
-     * @return ring file descriptor on success, or throws LastErrorException
-     */
     static int ioUringSetup(int entries, Pointer params) throws LastErrorException
     {
         return (int) syscall(SYS_IO_URING_SETUP, entries, params);
     }
 
-    /**
-     * io_uring_enter(2) — submit I/O requests and/or wait for completions.
-     *
-     * @param ringFd      ring file descriptor from io_uring_setup
-     * @param toSubmit    number of SQEs to submit
-     * @param minComplete minimum number of completions to wait for
-     * @param flags       IORING_ENTER_GETEVENTS to wait
-     * @return number of SQEs consumed on success
-     */
     static int ioUringEnter(int ringFd, int toSubmit, int minComplete, int flags) throws LastErrorException
     {
         return (int) syscall(SYS_IO_URING_ENTER, ringFd, toSubmit, minComplete, flags, Pointer.NULL, 0);
