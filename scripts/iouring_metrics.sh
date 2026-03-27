@@ -387,23 +387,61 @@ start_uring_ring_monitor() {
 # PID Discovery
 # ============================================================
 
-# Find JVM PID from child process tree (JMH forks a child JVM)
+# Find the JMH forked JVM PID from a process tree.
+# ant microbench launches: ant (java) -> JMH Main -> forked JVM (actual benchmark).
+# We want the forked JVM since that's where benchmark I/O happens.
+# Falls back to the deepest java child, then the parent itself.
 discover_jvm_pid() {
     local parent_pid=$1
-    local max_wait=30
+    local max_wait=10
     local waited=0
 
     log "Discovering JVM PID (parent=$parent_pid, max wait=${max_wait}s)..."
 
     while [[ $waited -lt $max_wait ]]; do
-        # Look for java processes that are children (or grandchildren) of our command
-        local jvm_pid
-        jvm_pid=$(pgrep -f 'java.*jmh\|java.*microbench\|java.*Benchmark\|CassandraDaemon' 2>/dev/null | head -1 || echo "")
+        # Strategy 1: Look for a JMH-forked JVM (child of our process tree)
+        # pgrep -P finds direct children; we check recursively
+        local jvm_pid=""
 
-        if [[ -n "$jvm_pid" ]] && [[ "$jvm_pid" != "$parent_pid" ]]; then
-            log "Found JVM PID: $jvm_pid"
+        # Find all java processes descended from parent_pid
+        if $IS_LINUX; then
+            # On Linux, walk /proc to find java children of our process tree
+            jvm_pid=$(pgrep -a java 2>/dev/null | while read pid cmdline; do
+                # Skip the parent itself
+                [[ "$pid" == "$parent_pid" ]] && continue
+                # Check if this pid is a descendant of parent_pid
+                local check_pid=$pid
+                while [[ "$check_pid" -gt 1 ]] 2>/dev/null; do
+                    local ppid
+                    ppid=$(awk '{print $4}' /proc/"$check_pid"/stat 2>/dev/null || echo 0)
+                    if [[ "$ppid" == "$parent_pid" ]]; then
+                        echo "$pid"
+                        break 2
+                    fi
+                    check_pid=$ppid
+                done
+            done)
+        else
+            # macOS fallback
+            jvm_pid=$(pgrep -P "$parent_pid" -f java 2>/dev/null | head -1 || echo "")
+        fi
+
+        if [[ -n "$jvm_pid" ]]; then
+            log "Found JVM PID: $jvm_pid (child of $parent_pid)"
             echo "$jvm_pid"
             return 0
+        fi
+
+        # If the parent is itself a java process (ant), use it directly after a short wait
+        # to give JMH fork time to appear
+        if [[ $waited -ge 5 ]]; then
+            local parent_comm
+            parent_comm=$(cat /proc/"$parent_pid"/comm 2>/dev/null || ps -p "$parent_pid" -o comm= 2>/dev/null || echo "")
+            if [[ "$parent_comm" == "java" ]]; then
+                log "Parent PID $parent_pid is java (ant JVM), using it directly"
+                echo "$parent_pid"
+                return 0
+            fi
         fi
 
         sleep 1
@@ -574,6 +612,17 @@ generate_summary() {
             bio_lines=$(wc -l < "$results_dir/biosnoop.txt")
             echo "--- Block I/O (biosnoop) ---"
             echo "  Lines captured: $bio_lines"
+            echo ""
+        fi
+
+        # --- Command Output (tail) ---
+        if [[ -f "$results_dir/command_output.log" ]]; then
+            local cmd_lines
+            cmd_lines=$(wc -l < "$results_dir/command_output.log")
+            echo "--- Command Output (last 20 lines of $cmd_lines total) ---"
+            tail -20 "$results_dir/command_output.log" | while IFS= read -r line; do
+                echo "  $line"
+            done
             echo ""
         fi
 
@@ -1015,7 +1064,7 @@ if [[ -n "$TARGET_PID" ]]; then
         log "PID $TARGET_PID exited"
     fi
 else
-    # Launch command, discover PID, attach monitors
+    # Launch command, attach monitors to process tree
     log "Running: ${CMD_ARGS[*]}"
     START_EPOCH=$(date +%s)
 
@@ -1023,21 +1072,43 @@ else
     CMD_PID=$!
     log "Command PID: $CMD_PID"
 
-    # Discover JVM PID (JMH forks a child)
-    MONITOR_TARGET=$(discover_jvm_pid "$CMD_PID")
+    # Give the process a moment to start
+    sleep 2
 
-    start_strace "$MONITOR_TARGET"
-    start_perf_stat "$MONITOR_TARGET"
-    start_context_switch_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
-    start_cpu_time_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
-    start_uring_ring_monitor "$MONITOR_TARGET"
+    if ! kill -0 "$CMD_PID" 2>/dev/null; then
+        # Command already exited (build error, bad args, etc.)
+        wait "$CMD_PID" || true
+        CMD_EXIT=$?
+        END_EPOCH=$(date +%s)
+        log "Command exited immediately with code $CMD_EXIT ($(( END_EPOCH - START_EPOCH ))s)"
+        log "Check $RESULTS_DIR/command_output.log for details"
+    else
+        # Attach monitors immediately to the command PID (which is java/ant)
+        # Then try to discover the JMH-forked child for more targeted monitoring
+        MONITOR_TARGET="$CMD_PID"
 
-    # Wait for command to finish
-    wait "$CMD_PID" || true
-    CMD_EXIT=$?
-    END_EPOCH=$(date +%s)
-    DURATION=$((END_EPOCH - START_EPOCH))
-    log "Command exited with code $CMD_EXIT (${DURATION}s)"
+        # Try to find the JMH forked JVM (wait up to 10s)
+        jvm_pid=$(discover_jvm_pid "$CMD_PID")
+        if [[ -n "$jvm_pid" ]]; then
+            MONITOR_TARGET="$jvm_pid"
+        fi
+
+        log "Monitoring PID: $MONITOR_TARGET"
+
+        # Use -f (follow forks) with strace to capture the entire process tree
+        start_strace "$MONITOR_TARGET"
+        start_perf_stat "$MONITOR_TARGET"
+        start_context_switch_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
+        start_cpu_time_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
+        start_uring_ring_monitor "$MONITOR_TARGET"
+
+        # Wait for command to finish
+        wait "$CMD_PID" || true
+        CMD_EXIT=$?
+        END_EPOCH=$(date +%s)
+        DURATION=$((END_EPOCH - START_EPOCH))
+        log "Command exited with code $CMD_EXIT (${DURATION}s)"
+    fi
 fi
 
 # ============================================================
