@@ -81,7 +81,7 @@ public class IoUringReadBench extends SSTableAbstractBench
         String tableDef = "CREATE TABLE %s ( userid bigint, picid1 bigint, picid2 bigint, commentid bigint, "
                           + "PRIMARY KEY(userid, picid1, picid2)) " + compressionClause;
 
-        String table = createTable(keyspace, tableDef);
+        table = createTable(keyspace, tableDef);
         execute("use " + keyspace + ";");
 
         Keyspace.system().forEach(k -> k.getColumnFamilyStores().forEach(c -> c.disableAutoCompaction()));
