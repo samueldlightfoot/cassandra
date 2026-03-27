@@ -388,67 +388,74 @@ start_uring_ring_monitor() {
 # ============================================================
 
 # Find the JMH forked JVM PID from a process tree.
-# ant microbench launches: ant (java) -> JMH Main -> forked JVM (actual benchmark).
-# We want the forked JVM since that's where benchmark I/O happens.
-# Falls back to the deepest java child, then the parent itself.
+# ant microbench launches: shell -> ant (java) -> JMH Main (same JVM) -> forked JVM (actual benchmark).
+# The ant JVM first runs build/check steps, then JMH. JMH then forks a NEW JVM for the benchmark.
+# We want that forked JVM since that's where benchmark I/O happens.
+# The forked JVM's cmdline contains "jmh" and is a grandchild of the ant PID.
 discover_jvm_pid() {
     local parent_pid=$1
-    local max_wait=10
+    local max_wait=${2:-60}
     local waited=0
 
     log "Discovering JVM PID (parent=$parent_pid, max wait=${max_wait}s)..."
 
     while [[ $waited -lt $max_wait ]]; do
-        # Strategy 1: Look for a JMH-forked JVM (child of our process tree)
-        # pgrep -P finds direct children; we check recursively
-        local jvm_pid=""
+        if ! kill -0 "$parent_pid" 2>/dev/null; then
+            log "Parent PID $parent_pid exited during discovery"
+            echo "$parent_pid"
+            return 1
+        fi
 
-        # Find all java processes descended from parent_pid
         if $IS_LINUX; then
-            # On Linux, walk /proc to find java children of our process tree
-            jvm_pid=$(pgrep -a java 2>/dev/null | while read pid cmdline; do
-                # Skip the parent itself
+            # Find java processes whose cmdline contains jmh/Benchmark markers
+            # and that are descendants of our parent_pid
+            local jvm_pid=""
+            jvm_pid=$(find /proc -maxdepth 1 -regex '/proc/[0-9]+' 2>/dev/null | while read proc_dir; do
+                local pid="${proc_dir##*/}"
                 [[ "$pid" == "$parent_pid" ]] && continue
-                # Check if this pid is a descendant of parent_pid
-                local check_pid=$pid
-                while [[ "$check_pid" -gt 1 ]] 2>/dev/null; do
-                    local ppid
-                    ppid=$(awk '{print $4}' /proc/"$check_pid"/stat 2>/dev/null || echo 0)
-                    if [[ "$ppid" == "$parent_pid" ]]; then
-                        echo "$pid"
-                        break 2
-                    fi
-                    check_pid=$ppid
-                done
-            done)
+
+                # Check cmdline for JMH benchmark markers
+                local cmdline
+                cmdline=$(tr '\0' ' ' < "$proc_dir/cmdline" 2>/dev/null || echo "")
+                if [[ "$cmdline" == *"jmh"* ]] || [[ "$cmdline" == *"ForkedMain"* ]]; then
+                    # Verify it's a descendant of parent_pid
+                    local check_pid=$pid
+                    local depth=0
+                    while [[ "$check_pid" -gt 1 ]] && [[ $depth -lt 10 ]] 2>/dev/null; do
+                        local ppid
+                        ppid=$(awk '{print $4}' /proc/"$check_pid"/stat 2>/dev/null || echo 0)
+                        if [[ "$ppid" == "$parent_pid" ]]; then
+                            echo "$pid"
+                            break
+                        fi
+                        check_pid=$ppid
+                        depth=$((depth + 1))
+                    done
+                fi
+            done | head -1)
+
+            if [[ -n "$jvm_pid" ]]; then
+                log "Found JMH forked JVM PID: $jvm_pid (descendant of $parent_pid)"
+                echo "$jvm_pid"
+                return 0
+            fi
         else
-            # macOS fallback
-            jvm_pid=$(pgrep -P "$parent_pid" -f java 2>/dev/null | head -1 || echo "")
-        fi
-
-        if [[ -n "$jvm_pid" ]]; then
-            log "Found JVM PID: $jvm_pid (child of $parent_pid)"
-            echo "$jvm_pid"
-            return 0
-        fi
-
-        # If the parent is itself a java process (ant), use it directly after a short wait
-        # to give JMH fork time to appear
-        if [[ $waited -ge 5 ]]; then
-            local parent_comm
-            parent_comm=$(cat /proc/"$parent_pid"/comm 2>/dev/null || ps -p "$parent_pid" -o comm= 2>/dev/null || echo "")
-            if [[ "$parent_comm" == "java" ]]; then
-                log "Parent PID $parent_pid is java (ant JVM), using it directly"
-                echo "$parent_pid"
+            # macOS fallback: look for jmh in child processes
+            local jvm_pid
+            jvm_pid=$(pgrep -f 'jmh|ForkedMain' 2>/dev/null | head -1 || echo "")
+            if [[ -n "$jvm_pid" ]]; then
+                log "Found JMH forked JVM PID: $jvm_pid"
+                echo "$jvm_pid"
                 return 0
             fi
         fi
 
-        sleep 1
-        waited=$((waited + 1))
+        sleep 2
+        waited=$((waited + 2))
     done
 
-    log "WARNING: Could not discover JVM PID after ${max_wait}s, using parent PID $parent_pid"
+    # Fall back to parent
+    log "WARNING: Could not find JMH forked JVM after ${max_wait}s, using parent PID $parent_pid"
     echo "$parent_pid"
 }
 
@@ -678,11 +685,6 @@ compare_results() {
         printf "  %-20s %15s %15s %10s\n" "Metric" "A" "B" "Delta"
         printf "  %-20s %15s %15s %10s\n" "------" "-" "-" "-----"
 
-        for dir in "$dir1" "$dir2"; do
-            local _vol _nonvol
-            eval "$(awk -F',' 'END { printf "vol_%s=%s nonvol_%s=%s", "'$(basename "$dir")'", $3, "'$(basename "$dir")'", $4 }' "$dir/context_switches.csv" 2>/dev/null || true)"
-        done
-
         local a_vol b_vol a_nonvol b_nonvol
         a_vol=$(awk -F',' 'END {print $3}' "$dir1/context_switches.csv" 2>/dev/null || echo 0)
         b_vol=$(awk -F',' 'END {print $3}' "$dir2/context_switches.csv" 2>/dev/null || echo 0)
@@ -890,8 +892,10 @@ if $BENCHMARK_MODE; then
             log ""
             log "--- Run: $run_label ---"
 
-            # Build JMH args: param selection + common args + JSON output
-            JMH_PARAMS="-p useIoUring=$uring_val -p compression=$comp $JMH_COMMON_ARGS -rf json -rff $run_dir/jmh_results.json"
+            # Build JMH args: param selection + common args
+            # NOTE: Do NOT pass -rf/-rff here — build-bench.xml already sets them.
+            # Results go to build/test/jmh-result.json; we copy them after.
+            JMH_PARAMS="-p useIoUring=$uring_val -p compression=$comp $JMH_COMMON_ARGS"
             log "ant microbench -Dbenchmark.name=$BENCH_NAME -Djmh.args=\"$JMH_PARAMS\""
 
             # Build args to pass to ourselves in normal mode
@@ -899,7 +903,7 @@ if $BENCHMARK_MODE; then
             $LIGHT_MODE && SELF_ARGS+=(--light)
             $BIOSNOOP_ENABLED && SELF_ARGS+=(--biosnoop)
             [[ "$POLL_INTERVAL" != "1" ]] && SELF_ARGS+=(--poll-interval "$POLL_INTERVAL")
-            SELF_ARGS+=(-- ant -f "$CASSANDRA_DIR/build.xml" microbench "-Dbenchmark.name=$BENCH_NAME" "-Djmh.args=$JMH_PARAMS")
+            SELF_ARGS+=(-- ant -f "$CASSANDRA_DIR/build.xml" microbench "-Dbenchmark.name=$BENCH_NAME" "-Djmh.args=$JMH_PARAMS" -Dno-build-test=true)
 
             # Re-invoke ourselves in normal mode for this run
             "$0" "${SELF_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
@@ -909,10 +913,14 @@ if $BENCHMARK_MODE; then
                 log "WARNING: Run $run_label exited with code $RUN_EXIT"
             fi
 
-            # Copy JMH results to the per-run metric directory for convenience
-            METRICS_RUN_DIR="$RESULTS_BASE/$TEST_NAME/$run_label"
-            if [[ -f "$run_dir/jmh_results.json" ]] && [[ "$run_dir" != "$METRICS_RUN_DIR" ]]; then
-                cp "$run_dir/jmh_results.json" "$METRICS_RUN_DIR/" 2>/dev/null || true
+            # Copy JMH JSON results from default output location
+            JMH_DEFAULT_RESULT="$CASSANDRA_DIR/build/test/jmh-result.json"
+            if [[ -f "$JMH_DEFAULT_RESULT" ]]; then
+                cp "$JMH_DEFAULT_RESULT" "$run_dir/jmh_results.json"
+                # Also copy to the metrics directory
+                METRICS_RUN_DIR="$RESULTS_BASE/$TEST_NAME/$run_label"
+                cp "$JMH_DEFAULT_RESULT" "$METRICS_RUN_DIR/jmh_results.json" 2>/dev/null || true
+                log "JMH results copied to $run_dir/jmh_results.json"
             fi
         done
 
@@ -1064,7 +1072,7 @@ if [[ -n "$TARGET_PID" ]]; then
         log "PID $TARGET_PID exited"
     fi
 else
-    # Launch command, attach monitors to process tree
+    # Launch command, discover the JMH forked JVM, attach monitors
     log "Running: ${CMD_ARGS[*]}"
     START_EPOCH=$(date +%s)
 
@@ -1073,34 +1081,31 @@ else
     log "Command PID: $CMD_PID"
 
     # Give the process a moment to start
-    sleep 2
+    sleep 1
 
     if ! kill -0 "$CMD_PID" 2>/dev/null; then
-        # Command already exited (build error, bad args, etc.)
         wait "$CMD_PID" || true
         CMD_EXIT=$?
         END_EPOCH=$(date +%s)
         log "Command exited immediately with code $CMD_EXIT ($(( END_EPOCH - START_EPOCH ))s)"
         log "Check $RESULTS_DIR/command_output.log for details"
     else
-        # Attach monitors immediately to the command PID (which is java/ant)
-        # Then try to discover the JMH-forked child for more targeted monitoring
-        MONITOR_TARGET="$CMD_PID"
+        # For ant microbench: the build/check steps run first (~10-15s),
+        # then JMH forks a new JVM for the actual benchmark.
+        # We need to wait for that forked JVM before attaching monitors.
+        # Use a generous timeout since the build steps take a while.
+        MONITOR_TARGET=$(discover_jvm_pid "$CMD_PID" 120)
 
-        # Try to find the JMH forked JVM (wait up to 10s)
-        jvm_pid=$(discover_jvm_pid "$CMD_PID")
-        if [[ -n "$jvm_pid" ]]; then
-            MONITOR_TARGET="$jvm_pid"
+        if kill -0 "$MONITOR_TARGET" 2>/dev/null; then
+            log "Monitoring PID: $MONITOR_TARGET"
+            start_strace "$MONITOR_TARGET"
+            start_perf_stat "$MONITOR_TARGET"
+            start_context_switch_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
+            start_cpu_time_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
+            start_uring_ring_monitor "$MONITOR_TARGET"
+        else
+            log "WARNING: Monitor target PID $MONITOR_TARGET already exited, skipping PID monitors"
         fi
-
-        log "Monitoring PID: $MONITOR_TARGET"
-
-        # Use -f (follow forks) with strace to capture the entire process tree
-        start_strace "$MONITOR_TARGET"
-        start_perf_stat "$MONITOR_TARGET"
-        start_context_switch_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
-        start_cpu_time_monitor "$MONITOR_TARGET" "$POLL_INTERVAL"
-        start_uring_ring_monitor "$MONITOR_TARGET"
 
         # Wait for command to finish
         wait "$CMD_PID" || true
