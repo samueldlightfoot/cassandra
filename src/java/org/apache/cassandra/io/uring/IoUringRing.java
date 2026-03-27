@@ -24,7 +24,6 @@ import java.nio.ByteBuffer;
 
 import com.sun.jna.LastErrorException;
 import com.sun.jna.Memory;
-import com.sun.jna.Native;
 import com.sun.jna.Pointer;
 
 import org.slf4j.Logger;
@@ -32,7 +31,41 @@ import org.slf4j.LoggerFactory;
 
 import sun.misc.Unsafe;
 
-import static org.apache.cassandra.io.uring.IoUringNative.*;
+import static org.apache.cassandra.io.uring.IoUringNative.CQE_RES_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.CQE_SIZE;
+import static org.apache.cassandra.io.uring.IoUringNative.CQ_OFF_CQES;
+import static org.apache.cassandra.io.uring.IoUringNative.CQ_OFF_HEAD;
+import static org.apache.cassandra.io.uring.IoUringNative.CQ_OFF_RING_MASK;
+import static org.apache.cassandra.io.uring.IoUringNative.CQ_OFF_TAIL;
+import static org.apache.cassandra.io.uring.IoUringNative.IORING_ENTER_GETEVENTS;
+import static org.apache.cassandra.io.uring.IoUringNative.IORING_OFF_CQ_RING;
+import static org.apache.cassandra.io.uring.IoUringNative.IORING_OFF_SQES;
+import static org.apache.cassandra.io.uring.IoUringNative.IORING_OFF_SQ_RING;
+import static org.apache.cassandra.io.uring.IoUringNative.IORING_OP_READ;
+import static org.apache.cassandra.io.uring.IoUringNative.IORING_REGISTER_FILES;
+import static org.apache.cassandra.io.uring.IoUringNative.IORING_UNREGISTER_FILES;
+import static org.apache.cassandra.io.uring.IoUringNative.PARAMS_CQ_ENTRIES_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.PARAMS_CQ_OFF_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.PARAMS_SIZE;
+import static org.apache.cassandra.io.uring.IoUringNative.PARAMS_SQ_ENTRIES_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.PARAMS_SQ_OFF_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.SQE_ADDR_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.SQE_FD_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.SQE_LEN_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.SQE_OFF_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.SQE_OPCODE_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.SQE_SIZE;
+import static org.apache.cassandra.io.uring.IoUringNative.SQE_USER_DATA_OFF;
+import static org.apache.cassandra.io.uring.IoUringNative.SQ_OFF_ARRAY;
+import static org.apache.cassandra.io.uring.IoUringNative.SQ_OFF_HEAD;
+import static org.apache.cassandra.io.uring.IoUringNative.SQ_OFF_RING_MASK;
+import static org.apache.cassandra.io.uring.IoUringNative.SQ_OFF_TAIL;
+import static org.apache.cassandra.io.uring.IoUringNative.closeFd;
+import static org.apache.cassandra.io.uring.IoUringNative.ioUringEnter;
+import static org.apache.cassandra.io.uring.IoUringNative.ioUringRegister;
+import static org.apache.cassandra.io.uring.IoUringNative.ioUringSetup;
+import static org.apache.cassandra.io.uring.IoUringNative.mmapRing;
+import static org.apache.cassandra.io.uring.IoUringNative.munmapRing;
 
 /**
  * Manages a single io_uring instance: the submission queue (SQ), completion queue (CQ),
