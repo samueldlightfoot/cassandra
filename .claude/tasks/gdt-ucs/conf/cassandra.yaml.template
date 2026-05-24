@@ -1,0 +1,51 @@
+# cassandra.yaml template for GDT-aware UCS comparison runs.
+# Substitution tokens (filled in by run_comparison.sh):
+#   __DATA_DIR__              data_file_directories
+#   __COMMITLOG_DIR__         commitlog_directory
+#   __HINTS_DIR__             hints_directory
+#   __SAVED_CACHES_DIR__      saved_caches_directory
+#   __LISTEN_ADDRESS__        listen_address / rpc_address
+#
+# Compaction strategy is set per-table via CREATE TABLE WITH compaction = ...
+# in the workload, not here — we keep this template strategy-agnostic.
+
+cluster_name: 'gdt-ucs-comparison'
+num_tokens: 16
+hinted_handoff_enabled: false
+authenticator: AllowAllAuthenticator
+authorizer: AllowAllAuthorizer
+role_manager: CassandraRoleManager
+network_authorizer: AllowAllNetworkAuthorizer
+roles_validity_in_ms: 0
+permissions_validity_in_ms: 0
+
+partitioner: org.apache.cassandra.dht.Murmur3Partitioner
+
+data_file_directories:
+    - __DATA_DIR__
+commitlog_directory: __COMMITLOG_DIR__
+hints_directory: __HINTS_DIR__
+saved_caches_directory: __SAVED_CACHES_DIR__
+
+# Deterministic compaction concurrency for cross-condition comparability.
+concurrent_writes: 64
+concurrent_compactors: 4
+
+# Disable features that add noise to a steady-state benchmark.
+incremental_backups: false
+auto_snapshot: false
+batch_size_warn_threshold_in_kb: 1024
+batchlog_replay_throttle_in_kb: 1024
+hinted_handoff_throttle_in_kb: 1024
+
+endpoint_snitch: SimpleSnitch
+
+seed_provider:
+    - class_name: org.apache.cassandra.locator.SimpleSeedProvider
+      parameters:
+          - seeds: "__LISTEN_ADDRESS__"
+
+listen_address: __LISTEN_ADDRESS__
+rpc_address: __LISTEN_ADDRESS__
+native_transport_port: 9042
+storage_port: 7000
