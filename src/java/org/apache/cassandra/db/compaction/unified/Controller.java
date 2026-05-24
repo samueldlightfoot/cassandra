@@ -134,6 +134,17 @@ public class Controller
         CassandraRelevantProperties.ALLOW_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION.getBoolean();
     static final boolean DEFAULT_ALLOW_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION = false;
 
+    /**
+     * GDT (Deathtime-Based Grouping) — when enabled, UCS partitions compaction
+     * candidates by {@link DeathtimeClassifier} output before forming overlap
+     * sets, keeping data of differing lifetimes out of the same compaction.
+     * See Lee et al. 2026 §4 and .claude/tasks/gdt-ucs/task_plan.md.
+     */
+    static final boolean GDT_ENABLED =
+        CassandraRelevantProperties.UCS_GDT_ENABLED.getBoolean();
+    static final long GDT_BASE_WINDOW_MICROS =
+        CassandraRelevantProperties.UCS_GDT_BASE_WINDOW_MICROS.getLong();
+
     static final int DEFAULT_EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS = 60 * 10;
     static final String EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS_OPTION = "expired_sstable_check_frequency_seconds";
 
@@ -183,6 +194,11 @@ public class Controller
     protected final Overlaps.InclusionMethod overlapInclusionMethod;
     protected final boolean parallelizeOutputShards;
 
+    // Lazily-instantiated GDT classifier. Null when GDT is disabled — the
+    // null-vs-instance distinction is the only signal callers need; they can
+    // simply skip partitioning when this returns null.
+    private final DeathtimeClassifier deathtimeClassifier;
+
     Controller(ColumnFamilyStore cfs,
                MonotonicClock clock,
                int[] scalingParameters,
@@ -211,6 +227,9 @@ public class Controller
         this.overlapInclusionMethod = overlapInclusionMethod;
         this.sstableGrowthModifier = sstableGrowthModifier;
         this.parallelizeOutputShards = parallelizeOutputShards;
+        this.deathtimeClassifier = GDT_ENABLED
+                                   ? new DeathtimeClassifier.MaxTimestamp(GDT_BASE_WINDOW_MICROS)
+                                   : null;
 
         if (maxSSTablesToCompact <= 0)
             maxSSTablesToCompact = Integer.MAX_VALUE;
@@ -256,6 +275,16 @@ public class Controller
     public int getThreshold(int index) {
         int W = getScalingParameter(index);
         return UnifiedCompactionStrategy.thresholdFromScalingParameter(W);
+    }
+
+    /**
+     * @return the GDT classifier when {@link #GDT_ENABLED} is true, else null.
+     *         Callers should branch on null and skip deathtime partitioning
+     *         when GDT is disabled — preserves baseline behaviour exactly.
+     */
+    public DeathtimeClassifier getDeathtimeClassifier()
+    {
+        return deathtimeClassifier;
     }
 
     /**

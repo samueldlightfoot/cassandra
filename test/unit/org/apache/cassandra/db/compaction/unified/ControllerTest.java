@@ -116,6 +116,25 @@ public class ControllerTest
         testValidateOptions(false);
     }
 
+    /**
+     * GDT is disabled by default at the system-property level, so a controller
+     * built with default options must not expose a classifier. This is the
+     * baseline-behaviour guard: if this test ever fails, GDT was accidentally
+     * promoted to on-by-default.
+     */
+    @Test
+    public void getDeathtimeClassifier_returnsNullWhenGdtDisabled()
+    {
+        // We rely on the default value of UCS_GDT_ENABLED ("false") loaded at
+        // class init. The GDT_ENABLED-true case is exercised by integration
+        // runs on the rig where the system property is set explicitly.
+        org.junit.Assume.assumeFalse(
+            "Skipped: GDT was enabled via system property for this JVM",
+            Controller.GDT_ENABLED);
+        Controller controller = testFromOptions(new HashMap<>());
+        Assert.assertNull(controller.getDeathtimeClassifier());
+    }
+
     @Test
     public void testValidateOptionsIntegers()
     {
