@@ -1122,4 +1122,63 @@ public class UnifiedCompactionStrategyTest
         return partitioner.split(partitioner.getMinimumToken(), partitioner.getMaximumTokenForSplitting(), i / numSSTables);
     }
 
+    // -- GDT-aware bucket partitioning (Phase 2 of .claude/tasks/gdt-ucs) ---------------
+
+    @Test
+    public void partitionByDeathtime_groupsSSTablesByClassifierOutput()
+    {
+        org.apache.cassandra.db.compaction.unified.DeathtimeClassifier classifier =
+            (sstable, level, controller) -> ((int) sstable.getMaxTimestamp()) % 3;
+        org.apache.cassandra.db.compaction.unified.Controller controller =
+            org.mockito.Mockito.mock(org.apache.cassandra.db.compaction.unified.Controller.class);
+
+        java.util.List<SSTableReader> sstables = new java.util.ArrayList<>();
+        for (long ts : new long[] { 1, 2, 3, 4, 5, 6 })
+        {
+            SSTableReader rdr = org.mockito.Mockito.mock(SSTableReader.class);
+            org.mockito.Mockito.when(rdr.getMaxTimestamp()).thenReturn(ts);
+            sstables.add(rdr);
+        }
+
+        Map<Integer, List<SSTableReader>> partitioned =
+            UnifiedCompactionStrategy.Level.partitionByDeathtime(sstables, classifier, 0, controller);
+
+        // mod-3 → 3 buckets (0, 1, 2), each with 2 sstables
+        Assert.assertEquals(3, partitioned.size());
+        for (List<SSTableReader> partition : partitioned.values())
+            Assert.assertEquals(2, partition.size());
+    }
+
+    @Test
+    public void partitionByDeathtime_emptyInputReturnsEmptyMap()
+    {
+        org.apache.cassandra.db.compaction.unified.DeathtimeClassifier classifier =
+            (sstable, level, controller) -> 0;
+        org.apache.cassandra.db.compaction.unified.Controller controller =
+            org.mockito.Mockito.mock(org.apache.cassandra.db.compaction.unified.Controller.class);
+        Map<Integer, List<SSTableReader>> partitioned =
+            UnifiedCompactionStrategy.Level.partitionByDeathtime(
+                java.util.Collections.emptyList(), classifier, 0, controller);
+        Assert.assertTrue(partitioned.isEmpty());
+    }
+
+    @Test
+    public void partitionByDeathtime_singleBucketWhenClassifierConstant()
+    {
+        org.apache.cassandra.db.compaction.unified.DeathtimeClassifier classifier =
+            (sstable, level, controller) -> 42; // everything in bucket 42
+        org.apache.cassandra.db.compaction.unified.Controller controller =
+            org.mockito.Mockito.mock(org.apache.cassandra.db.compaction.unified.Controller.class);
+        java.util.List<SSTableReader> sstables = new java.util.ArrayList<>();
+        for (int i = 0; i < 5; i++)
+        {
+            SSTableReader rdr = org.mockito.Mockito.mock(SSTableReader.class);
+            org.mockito.Mockito.when(rdr.getMaxTimestamp()).thenReturn((long) i);
+            sstables.add(rdr);
+        }
+        Map<Integer, List<SSTableReader>> partitioned =
+            UnifiedCompactionStrategy.Level.partitionByDeathtime(sstables, classifier, 0, controller);
+        Assert.assertEquals(1, partitioned.size());
+        Assert.assertEquals(5, partitioned.get(42).size());
+    }
 }

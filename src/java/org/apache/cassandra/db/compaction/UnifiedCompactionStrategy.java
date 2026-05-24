@@ -21,6 +21,7 @@ package org.apache.cassandra.db.compaction;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -44,6 +45,7 @@ import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.commitlog.IntervalSet;
 import org.apache.cassandra.db.compaction.unified.Controller;
+import org.apache.cassandra.db.compaction.unified.DeathtimeClassifier;
 import org.apache.cassandra.db.compaction.unified.ShardedMultiWriter;
 import org.apache.cassandra.db.compaction.unified.UnifiedCompactionTask;
 import org.apache.cassandra.db.lifecycle.CompositeLifecycleTransaction;
@@ -779,10 +781,13 @@ public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
 
             logger.trace("Creating compaction pick with live set {}", liveSet);
 
-            List<Set<SSTableReader>> overlaps = Overlaps.constructOverlapSets(liveSet,
-                                                                              UnifiedCompactionStrategy::startsAfter,
-                                                                              SSTableReader.firstKeyComparator,
-                                                                              SSTableReader.lastKeyComparator);
+            DeathtimeClassifier classifier = context.controller.getDeathtimeClassifier();
+            List<Set<SSTableReader>> overlaps = (classifier != null)
+                ? overlapsByDeathtime(liveSet, classifier, index, context.controller)
+                : Overlaps.constructOverlapSets(liveSet,
+                                                UnifiedCompactionStrategy::startsAfter,
+                                                SSTableReader.firstKeyComparator,
+                                                SSTableReader.lastKeyComparator);
             for (Set<SSTableReader> overlap : overlaps)
                 maxOverlap = Math.max(maxOverlap, overlap.size());
             if (maxOverlap < threshold)
@@ -800,6 +805,61 @@ public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
             return endIndex == startIndex + 1
                    ? new SimpleBucket(this, overlaps.get(startIndex))
                    : new MultiSetBucket(this, overlaps.subList(startIndex, endIndex));
+        }
+
+        /**
+         * Partition {@code liveSet} by deathtime classifier output, then form
+         * overlap sets within each partition independently. SSTables of
+         * differing deathtime classes therefore never appear in the same
+         * overlap set and consequently never end up in the same compaction
+         * pick — implementing the GDT principle from Lee et al. 2026 §4.
+         *
+         * <p>The returned list concatenates per-partition overlap sets.
+         * {@code Overlaps.assignOverlapsIntoBuckets} treats each set
+         * independently (or transitively within sets), so concatenation order
+         * does not affect correctness.
+         */
+        @VisibleForTesting
+        static List<Set<SSTableReader>> overlapsByDeathtime(List<SSTableReader> liveSet,
+                                                            DeathtimeClassifier classifier,
+                                                            int level,
+                                                            Controller controller)
+        {
+            Map<Integer, List<SSTableReader>> partitions =
+                partitionByDeathtime(liveSet, classifier, level, controller);
+            if (logger.isDebugEnabled())
+                logger.debug("GDT level {} partitioned {} sstables into {} buckets: {}",
+                             level, liveSet.size(), partitions.size(), partitionSizes(partitions));
+            List<Set<SSTableReader>> all = new ArrayList<>();
+            for (List<SSTableReader> partition : partitions.values())
+                all.addAll(Overlaps.constructOverlapSets(partition,
+                                                         UnifiedCompactionStrategy::startsAfter,
+                                                         SSTableReader.firstKeyComparator,
+                                                         SSTableReader.lastKeyComparator));
+            return all;
+        }
+
+        @VisibleForTesting
+        static Map<Integer, List<SSTableReader>> partitionByDeathtime(Collection<SSTableReader> sstables,
+                                                                      DeathtimeClassifier classifier,
+                                                                      int level,
+                                                                      Controller controller)
+        {
+            Map<Integer, List<SSTableReader>> result = new HashMap<>();
+            for (SSTableReader sstable : sstables)
+            {
+                int bucket = classifier.classify(sstable, level, controller);
+                result.computeIfAbsent(bucket, k -> new ArrayList<>()).add(sstable);
+            }
+            return result;
+        }
+
+        private static List<Integer> partitionSizes(Map<Integer, List<SSTableReader>> partitions)
+        {
+            List<Integer> sizes = new ArrayList<>(partitions.size());
+            for (List<SSTableReader> p : partitions.values())
+                sizes.add(p.size());
+            return sizes;
         }
 
         @Override
