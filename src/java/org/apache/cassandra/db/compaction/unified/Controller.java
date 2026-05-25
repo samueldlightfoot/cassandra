@@ -47,6 +47,20 @@ public class Controller
     protected static final Logger logger = LoggerFactory.getLogger(Controller.class);
 
     /**
+     * Bump this on every Java change in this fork. The static initializer logs it once
+     * at class-load time so any operator can grep `system.log` for
+     * "GDT POC build rev" and confirm the JAR Cassandra is loading actually contains
+     * their latest changes — guards against the stale-jar bug where `ant build`
+     * compiles `.class` files but doesn't refresh `apache-cassandra-*.jar`.
+     */
+    private static final int GDT_POC_BUILD_REV = 2;
+
+    static
+    {
+        logger.info("GDT POC build rev {} — Controller class loaded", GDT_POC_BUILD_REV);
+    }
+
+    /**
      * The scaling parameters W, one per bucket index and separated by a comma.
      * Higher indexes will use the value of the last index with a W specified.
      */
