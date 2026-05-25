@@ -690,6 +690,7 @@ public enum CassandraRelevantProperties
     // See org.apache.cassandra.db.compaction.unified.Controller for the definition of the UCS parameters
     UCS_BASE_SHARD_COUNT("unified_compaction.base_shard_count", "4"),
     UCS_GDT_BASE_WINDOW_MICROS("unified_compaction.gdt.base_window_micros", "3600000000"), // 1 hour
+    UCS_GDT_CLASSIFIER("unified_compaction.gdt.classifier", "max_timestamp"),
     UCS_GDT_ENABLED("unified_compaction.gdt.enabled", "false"),
     UCS_MIN_SSTABLE_SIZE("unified_compaction.min_sstable_size", "100MiB"),
     UCS_OVERLAP_INCLUSION_METHOD("unified_compaction.overlap_inclusion_method"),

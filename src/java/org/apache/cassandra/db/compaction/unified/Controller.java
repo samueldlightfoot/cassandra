@@ -144,6 +144,8 @@ public class Controller
         CassandraRelevantProperties.UCS_GDT_ENABLED.getBoolean();
     static final long GDT_BASE_WINDOW_MICROS =
         CassandraRelevantProperties.UCS_GDT_BASE_WINDOW_MICROS.getLong();
+    static final String GDT_CLASSIFIER =
+        CassandraRelevantProperties.UCS_GDT_CLASSIFIER.getString();
 
     static final int DEFAULT_EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS = 60 * 10;
     static final String EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS_OPTION = "expired_sstable_check_frequency_seconds";
@@ -227,9 +229,7 @@ public class Controller
         this.overlapInclusionMethod = overlapInclusionMethod;
         this.sstableGrowthModifier = sstableGrowthModifier;
         this.parallelizeOutputShards = parallelizeOutputShards;
-        this.deathtimeClassifier = GDT_ENABLED
-                                   ? new DeathtimeClassifier.MaxTimestamp(GDT_BASE_WINDOW_MICROS)
-                                   : null;
+        this.deathtimeClassifier = GDT_ENABLED ? buildDeathtimeClassifier() : null;
 
         if (maxSSTablesToCompact <= 0)
             maxSSTablesToCompact = Integer.MAX_VALUE;
@@ -285,6 +285,42 @@ public class Controller
     public DeathtimeClassifier getDeathtimeClassifier()
     {
         return deathtimeClassifier;
+    }
+
+    /**
+     * Build a DeathtimeClassifier per the {@code unified_compaction.gdt.classifier}
+     * system property. Recognized values:
+     * <ul>
+     *   <li>{@code max_timestamp} (default) — buckets by SSTable maxTimestamp.
+     *       Note this provides no information UCS T4 doesn't already use
+     *       implicitly via its maxTimestamp-descending bucket sort.</li>
+     *   <li>{@code min_local_deletion_time} — buckets by SSTable's earliest
+     *       row-expiration time. Provides information UCS T4 does NOT use:
+     *       most useful for workloads with heterogeneous TTLs.</li>
+     * </ul>
+     * Unknown values fall back to {@code max_timestamp} with a warning.
+     */
+    private static DeathtimeClassifier buildDeathtimeClassifier()
+    {
+        String name = GDT_CLASSIFIER == null ? "" : GDT_CLASSIFIER.trim().toLowerCase();
+        switch (name)
+        {
+            case "min_local_deletion_time":
+            case "ttl":
+                logger.info("GDT classifier: MinLocalDeletionTime (TTL-aware, base window = {} us)",
+                            GDT_BASE_WINDOW_MICROS);
+                return new DeathtimeClassifier.MinLocalDeletionTime(GDT_BASE_WINDOW_MICROS);
+            case "":
+            case "max_timestamp":
+            case "maxtimestamp":
+                logger.info("GDT classifier: MaxTimestamp (base window = {} us)",
+                            GDT_BASE_WINDOW_MICROS);
+                return new DeathtimeClassifier.MaxTimestamp(GDT_BASE_WINDOW_MICROS);
+            default:
+                logger.warn("Unknown unified_compaction.gdt.classifier value '{}'; falling back to MaxTimestamp",
+                            GDT_CLASSIFIER);
+                return new DeathtimeClassifier.MaxTimestamp(GDT_BASE_WINDOW_MICROS);
+        }
     }
 
     /**

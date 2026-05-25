@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.db.compaction.unified;
 
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 /**
@@ -87,6 +88,81 @@ public interface DeathtimeClassifier
             // bucket fits comfortably in int (~3e7 at the extreme). Use exact to
             // surface programmer error if a pathological window is chosen.
             return Math.toIntExact(bucket);
+        }
+
+        long windowForLevel(int level, Controller controller)
+        {
+            int fanout = Math.max(controller.getFanout(level), 2);
+            long window = baseWindowMicros;
+            for (int i = 0; i < level; i++)
+                window = Math.multiplyExact(window, (long) fanout);
+            return window;
+        }
+
+        public long baseWindowMicros()
+        {
+            return baseWindowMicros;
+        }
+    }
+
+    /**
+     * TTL-aware classifier that buckets SSTables by their earliest expiration time.
+     *
+     * <p>For SSTables containing rows written with TTL, Cassandra's
+     * {@link SSTableReader#getMinLocalDeletionTime()} returns the earliest
+     * expiration time across all rows in the SSTable (in seconds since epoch).
+     * This is a direct measure of "how soon will this SSTable's data start
+     * dying" — strictly stronger information than {@link MaxTimestamp} can
+     * provide, because the same {@code maxTimestamp} can correspond to vastly
+     * different deathtimes if the rows have different TTLs.
+     *
+     * <p>The bucket is computed as {@code floor(minLocalDeletionTime / windowSeconds)}.
+     * SSTables without TTL information (sentinel {@link Cell#NO_DELETION_TIME})
+     * fall back to {@link MaxTimestamp} classification — that preserves
+     * baseline behaviour for non-TTL data while letting TTL data drive
+     * grouping where it's meaningful.
+     *
+     * <p>This classifier provides information UCS T4 baseline cannot use
+     * implicitly: UCS sorts by {@code maxTimestamp} (write-time), not by
+     * {@code localDeletionTime} (expiration-time). On workloads with
+     * heterogeneous TTLs, the two diverge — and bucketing by expiration is
+     * the operationally useful axis.
+     */
+    final class MinLocalDeletionTime implements DeathtimeClassifier
+    {
+        public static final long DEFAULT_BASE_WINDOW_MICROS = 300_000_000L; // 5 min
+
+        private final long baseWindowMicros;
+        private final MaxTimestamp fallback;
+
+        public MinLocalDeletionTime(long baseWindowMicros)
+        {
+            if (baseWindowMicros <= 0)
+                throw new IllegalArgumentException("baseWindowMicros must be > 0, got " + baseWindowMicros);
+            this.baseWindowMicros = baseWindowMicros;
+            this.fallback = new MaxTimestamp(baseWindowMicros);
+        }
+
+        public MinLocalDeletionTime()
+        {
+            this(DEFAULT_BASE_WINDOW_MICROS);
+        }
+
+        @Override
+        public int classify(SSTableReader sstable, int level, Controller controller)
+        {
+            long minDelSeconds = sstable.getMinLocalDeletionTime();
+            if (minDelSeconds == Cell.NO_DELETION_TIME)
+            {
+                // No TTL'd rows in this SSTable — defer to maxTimestamp-based
+                // bucketing so non-TTL data still gets time-coherent grouping.
+                return fallback.classify(sstable, level, controller);
+            }
+            // minLocalDeletionTime is seconds since epoch; convert to microseconds
+            // for unit consistency with windowForLevel (which is in microseconds).
+            long minDelMicros = Math.multiplyExact(minDelSeconds, 1_000_000L);
+            long window = windowForLevel(level, controller);
+            return Math.toIntExact(Math.floorDiv(minDelMicros, window));
         }
 
         long windowForLevel(int level, Controller controller)
