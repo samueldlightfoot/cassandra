@@ -62,24 +62,22 @@ Inserted between Phase 1 and Phase 2 because installimage was a discrete chunk o
 
 Library work landed in `cassandra-agent-harness` commit `a7cbaeb` (origin/main); progress narrative in `progress.md`. 116/116 library tests + end-to-end smoke test on live rig (SSD WAF 1.1539 lifetime from prior tenants — non-Cassandra calibration).
 
-Original plan vs delivered:
+Scoping note: the work belonged in the library `cassandra_agent_harness`, not the GDT app — these primitives are reusable across investigations.
 
-Extend `gdt-poc-harness` with OCP-aware measurement.
+Delivered:
+- [x] OCP capture in library `capture/ocp.py`:
+  - Real nvme-cli 2.x JSON field names (existing scaffold had snake_case keys that don't match real output — silent regression caught by adding fixture-validated tests)
+  - **Raw binary log page fallback** via `nvme get-log -i 0xc0 -l 512 -b` — works on stock Ubuntu 22.04 nvme-cli 1.16 without the OCP plugin
+  - `find_device_by_serial()` for stable device resolution across NVMe re-enumeration
+- [x] SMART capture helpers (`data_units_written_bytes`, `data_units_read_bytes`, `percent_used`, `available_spare`)
+- [x] WAF math `compute_waf()` → `WafResult` dataclass with all three layers (SSD/DB/Total), each independently `None` when inputs absent
+- [x] Prereq checks `check_ocp_available(serial)` + `check_swap_off(swaps_path=...)`
+- [x] Unit tests against real PM9A3 fixtures captured from the live rig (4 fixtures: nvme-cli 2.16 OCP JSON, raw OCP binary log page, standard SMART JSON, `nvme list` JSON). **116/116 library tests passing.**
+- [x] **End-to-end smoke test on live rig** — library installed, both drives' prereq checks pass, live PMUW snapshot working.
 
-- [ ] New `OcpReader` helper in `gdt-poc-harness/src/gdt_poc/ocp.py`:
-  - Wraps `nvme ocp smart-add-log <device> -o json`
-  - Parses output → returns `{ pmuw_bytes, host_writes_bytes, ... }`
-  - Handles error cases (device not OCP-capable, permission errors, parse failures)
-- [ ] New `SmartReader` helper for plain NVMe SMART (data_units_written, data_units_read) for cross-check
-- [ ] Wire into investigation lifecycle:
-  - Pre-condition snapshot: read both counters at "T0" (start of measurement window, after steady-state warmup)
-  - Periodic sampling thread: poll every 60s during the measurement window, write to JSONL
-  - Post-condition snapshot: read at "T1" (end of measurement)
-  - Compute deltas → SSD WAF = ΔPMUW / Δhost_writes; DB WAF = Δhost_writes / client_payload_bytes; Total WAF = ΔPMUW / client_payload_bytes
-- [ ] Add prereq check: `check_ocp_available` extension to `prereqs.py` that verifies `nvme ocp smart-add-log` works on the configured device before the bench launches
-- [ ] Add prereq check: `check_swap_off` to ensure no swap on the measurement drive
-- [ ] Add prereq check: `check_drive_isolation` to verify Cassandra is the only meaningful writer
-- [ ] Unit tests for OCP/SMART parsing + WAF math
+Deferred to Phase 3 (where they logically belong alongside building the WafBaselineInvestigation):
+- [ ] Wire OCP/SMART captures into investigation lifecycle (pre-window snapshot, periodic sampling thread, post-window snapshot)
+- [ ] `check_drive_isolation` — verify Cassandra is the only meaningful writer to the measurement device
 
 ### Phase 3 — Methodology + procedure scripts (~3 days)
 
