@@ -170,7 +170,19 @@ Tests validate parser against these real fixtures — guards against the "looks 
 ### Status
 - **116/116 library tests passing.**
 - Library committed + pushed to `origin/main` (`a7cbaeb`).
-- Sanity test on the rig (clone + install + run against live PM9A3) — in progress at time of writing.
+- **End-to-end smoke test PASSED on real rig** (2026-05-26):
+  - `check_swap_off` → ok
+  - `check_ocp_available("S64FNE0R401522")` → ok, resolves to `/dev/nvme1n1`, PMUW=48.22 TB lifetime
+  - `check_ocp_available("S64FNE0R401526")` → ok, resolves to `/dev/nvme0n1`, PMUW=44.23 TB lifetime
+  - Live data-drive snapshot: SSD WAF = **1.1539** (lifetime, prior-tenants history — not Cassandra-specific yet)
+
+### Rig setup additions discovered during smoke test (capture in installimage automation)
+
+- Ubuntu 22.04 ships Python 3.10; library requires Python 3.11+ (uses `StrEnum`). Two options on the rig:
+  - Install Python 3.11 via deadsnakes PPA (used here): `add-apt-repository -y ppa:deadsnakes/ppa && apt install -y python3.11 python3.11-venv python3.11-dev`
+  - Or relax the library `requires-python` to `>=3.10` and replace `StrEnum` with `enum.Enum + str` mixin (not done; deadsnakes path is acceptable)
+- **Do NOT install `.[dev]` on the rig.** `ruff` has no prebuilt wheel for Ubuntu 22.04 + Python 3.11 from deadsnakes; pip tries to compile from Rust source which requires a toolchain we don't want to install. The first attempt spun for 26 min at 99% CPU before being killed. Use plain `pip install -e .` on the rig; run dev tooling (pytest, ruff) only on the developer machine.
+- `python3-venv` is not installed by default on Ubuntu 22.04. Add `python3.11-venv` (or `python3-venv`) via apt in the rig setup automation.
 
 ## Next steps
 
