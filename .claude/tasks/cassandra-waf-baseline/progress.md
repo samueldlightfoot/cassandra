@@ -142,10 +142,41 @@ Ubuntu 22.04 ships nvme-cli 1.16 which **lacks the OCP plugin**. To get OCP smar
 
 Ready to begin Phase 2: harness OCP instrumentation.
 
+## 2026-05-26 — Phase 2 progress (harness OCP instrumentation)
+
+Library work, not the GDT app — these are reusable across investigations and land in `cassandra-agent-harness` (commit `a7cbaeb` on `main`):
+
+### OCP/SMART capture
+- `cassandra_agent_harness.capture.ocp` rewritten:
+  - **Real nvme-cli 2.x JSON field names** (existing scaffold used snake_case keys that don't match real output — silent regression caught by adding fixture-validated tests). Real format: `{"Physical media units written": {"hi": N, "lo": N}}` with spaces and nested hi/lo.
+  - **Raw binary log page fallback** via `nvme get-log -i 0xc0 -l 512 -b` — required because Ubuntu 22.04's stock nvme-cli 1.16 lacks the OCP plugin (building 2.x from source is fine for the rig but not portable).
+  - **`find_device_by_serial()`** for stable device resolution. The rig observed nvme0n1↔nvme1n1 swap between rescue and installed OS due to PCI re-enumeration; path-based references would have broken silently. Harness always resolves S/N → device at runtime.
+- `cassandra_agent_harness.capture.smart`: helpers added for `data_units_read_bytes`, `percent_used`, `available_spare` (useful for prereq checks).
+- `cassandra_agent_harness.capture.waf`: new `compute_waf()` returning a `WafResult` dataclass with all three layers (SSD WAF, DB WAF, Total WAF). Each layer independently `None` when its inputs are absent, so partial inputs produce partial results rather than failure.
+
+### Prereq checks
+- `check_swap_off(swaps_path=...)` — reads `/proc/swaps`; testable via the arg.
+- `check_ocp_available(serial)` — resolves S/N → device → OCP snapshot, validates PMUW non-zero. The gating check for any WAF measurement: if it fails, refuse to launch the bench.
+
+### Test fixtures
+Four real fixtures captured from the rig (`tests/capture/fixtures/`):
+- `ocp_pm9a3_nvme_cli_2_16.json` — actual nvme-cli 2.16 OCP JSON output
+- `ocp_pm9a3_raw_logpage.bin` — raw 512-byte binary log page from same drive ~1s later
+- `smart_pm9a3_nvme_cli_2_16.json` — standard SMART log
+- `nvme_list_pm9a3.json` — for testing S/N-based device resolution
+
+Tests validate parser against these real fixtures — guards against the "looks right but doesn't match real output" failure mode that the original scaffold hit.
+
+### Status
+- **116/116 library tests passing.**
+- Library committed + pushed to `origin/main` (`a7cbaeb`).
+- Sanity test on the rig (clone + install + run against live PM9A3) — in progress at time of writing.
+
 ## Next steps
 
-- Begin Phase 2: extend `gdt-poc-harness` with `OcpReader` + `SmartReader` + pre-flight checks. Implementation target: S/N-based device resolution (not path-based, to be robust to enumeration swaps). Both nvme-cli 2.x subprocess path and raw log-page-parse path should be implemented; harness can pick whichever is available.
-- Once Phase 2 lands, run the §5.3 zone-sweep (small) on the new rig as a methodology verification.
+- Confirm the rig smoke test passes (validation that nvme-cli 2.16 output matches the fixture format end-to-end on real hardware).
+- Begin Phase 3 (Methodology + procedure scripts): pre-fill, steady-state, measurement window, workload selection (YCSB-A zipf 0.8 + TWCS time-series).
+- Likely also need: a small dedicated `WafBaselineInvestigation` class in `gdt-poc-harness` or a new app to drive the measurement loop. The GDT investigation is parked but its code structure (conditions, lifecycle, summary) is a useful template.
 
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
