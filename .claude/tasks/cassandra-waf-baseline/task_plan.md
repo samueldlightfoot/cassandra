@@ -58,7 +58,11 @@ Inserted between Phase 1 and Phase 2 because installimage was a discrete chunk o
 - Lifetime PMUW already captured as a baseline for cross-check
 - OCP tooling installed + raw `nvme get-log -i 0xc0 -b` confirmed as a fallback path that doesn't require the built-from-source nvme-cli
 
-### Phase 2 — Harness instrumentation (~2 days)
+### Phase 2 — Harness instrumentation (CLOSED 2026-05-26)
+
+Library work landed in `cassandra-agent-harness` commit `a7cbaeb` (origin/main); progress narrative in `progress.md`. 116/116 library tests + end-to-end smoke test on live rig (SSD WAF 1.1539 lifetime from prior tenants — non-Cassandra calibration).
+
+Original plan vs delivered:
 
 Extend `gdt-poc-harness` with OCP-aware measurement.
 
@@ -141,7 +145,7 @@ A single end-to-end execution at one condition (recommend YCSB-A at 80% fill) to
 |---|---|---|---|
 | 1. Rig + OCP verify | **closed** | 1 day actual | ~3h actual |
 | 1.5. OS install + rig setup (inserted) | **closed** | <1 day actual | ~2h actual |
-| 2. Harness instrumentation | not started | 2 days | ~12 hours |
+| 2. Harness instrumentation | **closed** | <1 day actual | ~5h actual |
 | 3. Methodology + procedure scripts | not started | 3 days | ~16 hours |
 | 4. Pilot run | not started | 2 days | ~8 hours |
 | 5. Measurement matrix | not started | 1-2 weeks wall | ~16 hours (mostly automation supervision) |
