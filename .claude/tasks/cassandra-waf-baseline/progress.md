@@ -184,11 +184,32 @@ Tests validate parser against these real fixtures — guards against the "looks 
 - **Do NOT install `.[dev]` on the rig.** `ruff` has no prebuilt wheel for Ubuntu 22.04 + Python 3.11 from deadsnakes; pip tries to compile from Rust source which requires a toolchain we don't want to install. The first attempt spun for 26 min at 99% CPU before being killed. Use plain `pip install -e .` on the rig; run dev tooling (pytest, ruff) only on the developer machine.
 - `python3-venv` is not installed by default on Ubuntu 22.04. Add `python3.11-venv` (or `python3-venv`) via apt in the rig setup automation.
 
-## Next steps
+## 2026-05-26 — Phase 3 partial: measurement primitives landed
 
-- Confirm the rig smoke test passes (validation that nvme-cli 2.16 output matches the fixture format end-to-end on real hardware).
-- Begin Phase 3 (Methodology + procedure scripts): pre-fill, steady-state, measurement window, workload selection (YCSB-A zipf 0.8 + TWCS time-series).
-- Likely also need: a small dedicated `WafBaselineInvestigation` class in `gdt-poc-harness` or a new app to drive the measurement loop. The GDT investigation is parked but its code structure (conditions, lifecycle, summary) is a useful template.
+Library commit `891a0b7` on `origin/main`. Two foundational primitives:
+
+### `MeasurementWindow` (cassandra_agent_harness.capture.measurement)
+Context manager bracketing a section of bench execution with pre/post OCP+SMART snapshots + a background sampler thread polling counters at a configurable cadence. Final `MeasurementWindowResult` bundles bracket deltas (the headline WAF) plus the time series (steady-state detection + transient diagnostics).
+
+Key contract:
+- `__enter__` takes T0 snapshots, starts sampler
+- `__exit__` guarantees sampler is stopped (10s join timeout)
+- `finalise(client_payload_bytes=...)` produces the `WafResult` — idempotent, must be called inside the with block to capture the post snapshot
+- Sampler errors recorded per-sample, not propagated — transient OCP issues don't kill the bench
+- `latest_waf_estimate()` and `waf_time_series()` for in-window introspection (used by steady-state detector)
+
+### `is_steady_state` (same module)
+Pure function over `(timestamp, ssd_waf)` series. Returns True when the last N samples agree within tolerance of each other. Used during pre-measurement warmup to make the "wait for free-block pool to settle" rule adaptive instead of fixed.
+
+### Testing
+15 new tests including threading-sensitive ones (sampler liveness, sampler-error resilience, finalise idempotency) using mocked snapshot fns + very short intervals to avoid real sleep. **Full library suite: 131/131 passing.**
+
+### Phase 3 remaining
+- [ ] Pre-fill helper — runs easy-cass-stress write-only until target fill ratio
+- [ ] Cassandra clean-state reset helper — drops keyspace + wait for compaction drain between cells
+- [ ] `check_drive_isolation` prereq (deferred from Phase 2)
+- [ ] `WafBaselineInvestigation` class wiring everything together (probably a new app, since GDT is parked)
+- [ ] Workload specs for YCSB-A zipf 0.8 + TWCS time-series
 
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
