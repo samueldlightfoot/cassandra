@@ -247,6 +247,38 @@ These belong in a new `waf-baseline-poc` app that imports the library scaffold �
 3. **Async workload launcher** — likely simplest path is to construct the easy-cass-stress subprocess directly in the runner and stash a Popen handle for SIGTERM-on-stop
 4. **Pilot run** on the rig: single cell (YCSB-A at 80% fill) to validate the full toolchain end-to-end before committing to the matrix
 
+## 2026-05-27 — Phase 4 progress: async launcher + app scaffold landed
+
+### Library: async workload launch
+Commit `fe61017` on `cassandra-agent-harness:main`:
+- `launch_easy_stress_async(spec, output_dir) → WorkloadHandle` alongside `run_easy_stress`
+- `WorkloadHandle.stop(sigterm_timeout=30s)` — SIGTERM → wait → SIGKILL escalation, idempotent if the process already exited naturally, closes stdout fd
+- Wired into `WafBaselineRunner._launch_workload_async` + `_stop_workload` — two of the four runner TODOs eliminated
+- 7 new tests including the SIGKILL fallback path; library 175 → 182
+
+### App: waf-baseline-poc (local repo at `/Users/samlightfoot/repos/waf-baseline-poc`)
+Initial commit `347e846`. Investigation-app layer subclassing `WafBaselineRunner`:
+- `workloads.py`: spec factories for YCSB-A (KeyValue, 50/50, UCS T4) + TWCS (BasicTimeSeries, 95/5, TWCS 1h) + prefill (write-only variant of either)
+- `runner.py`: `WafBaselinePoc(WafBaselineRunner)` overriding the two remaining workload-spec TODOs
+- `cli.py`: `waf-baseline pilot|matrix` with all three Gate B prereqs (swap_off, ocp_available, drive_isolation) enforced before any cell runs
+- 29 tests passing locally
+
+**No remote yet** — repo lives only on the dev box. Push to a github.com/samueldlightfoot/... fork when ready.
+
+### What's now possible
+The full pipeline — prereqs → reset → prefill → warmup-to-steady-state → measurement → persist — can run end-to-end with concrete workload specs. Pilot mode `waf-baseline pilot --workload ycsb_a_zipf_0.8 --fill-fraction 0.80` is the natural next step.
+
+### Phase 4 next step
+
+**Run the pilot.** Single cell, validates the full toolchain end-to-end on the live rig. Need to:
+1. Install Cassandra on the rig (currently the rig is set up but has no Cassandra checkout)
+2. Build Cassandra (ant jar)
+3. Install easy-cass-stress on the rig
+4. rsync waf-baseline-poc + library to the rig + install
+5. Run `waf-baseline pilot` and watch what happens
+
+The pilot is bounded — even at a long pre-fill + warmup + 30 min measurement, single cell ≤ 3-4 hours wall. If it works, we proceed to the matrix. If it breaks somewhere, we know what to fix.
+
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
 ### Migration from old rig (65.108.227.158 → 157.180.98.112)
