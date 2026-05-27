@@ -190,16 +190,99 @@ The Jira post discussion section will pick the corresponding framing.
 - `../gdt-ucs/operational-lessons.md` — bench-noise observations (3-15% on this rig class) informing replicate count and CI design.
 - Paper: Lee, Ziegler, Leis. "How to Write to SSDs." PVLDB Vol. 19 No. 7, 2026.
 
-## 11. Results
+## 11. Methodology lessons from the first rig runs (2026-05-27)
+
+Surfaced during smoke + 30-min runs on `cassandra-waf-rig`. Each lesson cost real bench-time to find; documenting so we don't pay for them again on the matrix or any follow-on investigation.
+
+### 11.1 cass-stress's KeyValue workload uses keyspace `cassandra_easy_stress`, not `keyvalue`
+
+**Symptom:** the harness's `reset_cassandra()` was running `DROP KEYSPACE IF EXISTS keyvalue` (the table name) between runs. Reset was a silent no-op for the entire investigation — `cqlsh "DESCRIBE KEYSPACES"` revealed the actual keyspace is `cassandra_easy_stress` (matching the binary's post-Apache-donation name). Data accumulated across all runs without the operator noticing.
+
+**Implication for production matrix:** every cell's `data_bytes_before` reflects whatever the previous cell left behind. Pre-fill is then approximating "add to existing" instead of "start clean and fill to target".
+
+**Rule:** when configuring `keyspaces_to_drop` or any keyspace-targeted CQL against a cass-stress workload, verify the actual keyspace name via `DESCRIBE KEYSPACES` or read the cass-stress source. **Don't assume the keyspace name matches the table or workload name.**
+
+**Default `keyspaces_to_drop` in waf-baseline-poc should be `["cassandra_easy_stress"]` (NOT `["keyvalue", "sensor_data"]`).** TWCS workload uses the same keyspace with a different table (`sensor_data`), so dropping the keyspace covers both.
+
+### 11.2 DB WAF measured here is *post-compression* on disk vs uncompressed client bytes
+
+**What we measure:**
+```
+DB WAF = host_bytes_written / client_payload_bytes
+       = (compressed SSTable bytes hitting /data, from SMART) / (writes_count × row_size_bytes)
+```
+
+LZ4 compression is enabled by default on Cassandra tables (`chunk_length_in_kb=16, class=LZ4Compressor` for cass-stress's KeyValue). The host-side bytes counter measures the COMPRESSED writes that leave the OS for the NVMe device. The client-side payload calculation uses the UNCOMPRESSED row size.
+
+**This is the paper's convention.** Lee/Ziegler/Leis Table 1 shows compression dropping DB WAF from 4.06 → 0.62 — exactly this effect. For paper-comparability, our number is right.
+
+**But it must be disclosed in any writeup.** A reader assuming "DB WAF = bytes the database physically wrote per user byte without compression" would interpret our 2.62 as much lower than it really is when measured against uncompressed SSTable size.
+
+For our `random(1024, 1025)` value pattern: cass-stress's `Random.getText()` produces high-entropy text → LZ4 compression is ~1:1 in practice (verified by comparing lifetime tablestats Space-used vs `total_writes × row_size`). So our numbers happen to also approximate "uncompressed DB WAF". This won't hold for real-world data; document the workload's compressibility separately.
+
+### 11.3 cass-stress `--csv` output is truncated by SIGTERM; stdout is authoritative for counts
+
+**Observation:** the 30-min v2 run's CSV showed `Mutations Count = 3,441,363` in its last fully-written row at elapsed=1404s. The window ran for 1800s and stdout's tabular summary reported `Mutations Count = 4,423,663`. Discrepancy: ~22%.
+
+**Root cause:** cass-stress flushes the CSV every few seconds; when SIGTERM fires, the in-flight CSV record is left incomplete (the last line in our CSV is literally truncated mid-timestamp: `2026-05-27T1`). The stdout summary captures the moment-of-stop counts more accurately.
+
+**Rule:** for `writes_count` totals, use the cass-stress stdout parser (`parse_easy_stress_summary`). Use the CSV ONLY for per-second time-series visualisation (latency CDFs, ops/sec curves over time). **Never sum CSV rows to get totals.**
+
+### 11.4 cass-stress's launcher orphans the JVM on SIGTERM (FIXED in library `3e28c41`)
+
+The launcher script ends with `java -jar` (no `exec`). SIGTERM to the bash leader leaves the JVM running orphaned. Discovered when the warmup-phase JVM was still running on port 19500 throughout 22 of the 30-min measurement window — Δhost on /data was DOUBLED, DB WAF was inflated from ~2.6 to ~3.8.
+
+**Fix lives in `cassandra-agent-harness:capture/easy_stress.py`** — `launch_easy_stress_async` now uses `start_new_session=True` and `WorkloadHandle.stop` uses `os.killpg`. Permanent fix; future runs benefit automatically.
+
+**Why this still matters as a lesson:** any future investigation that wraps a Java tool needs to assume the launcher doesn't `exec`. Default to process-group signaling rather than `subprocess.terminate()` alone.
+
+### 11.5 Methodology principle: validate workload counts via multiple independent signals
+
+The 30-min validation cross-checked `writes_count` against:
+1. **stdout summary parser** (authoritative)
+2. **per-second CSV** (truncated, but consistent shape)
+3. **Throughput math**: `writes_count / window_seconds` matched stdout's reported `ops_per_second × 0.5` (50/50 r/w) within 1%
+4. **`SELECT length(value)`** to confirm row_size matches the workload's `--field` override
+5. **`nodetool tablestats` Local write count** (lifetime, not delta — useful as upper bound)
+
+Without (4) we wouldn't have noticed the key-bytes undercount or known to verify compression. Without (1)+(2)+(3) consistency we wouldn't have caught the orphan JVM. **Cross-checking is the methodology, not just the measurement.**
+
+### 11.6 Minor: client_payload_bytes ignores the key column (~1.2% bias)
+
+Our calculation is `writes_count × 1024`. The actual write includes a `key` column too — observed keys like `001.17.425960` are ~13-14 bytes. Total client bytes per row is ~1037, not 1024. Net effect: our DB WAF is overestimated by ~1.2% (true ~2.59 vs computed ~2.62).
+
+Two options to address:
+- Estimate avg key bytes via `SELECT length(key) FROM ...` once and add to row_size_bytes
+- Switch to a workload schema where the key is a fixed-size synthetic — gives exact reproducibility
+
+For the Jira-post-grade methodology either is fine. Disclose either way.
+
+## 12. Results
 
 (Filled as Phase 5 runs complete. Structure planned:
 
-- §11.1 Pilot run (Phase 4) — pilot data
-- §11.2 W1 × fill ratio matrix
-- §11.3 W2 × fill ratio matrix
-- §11.4 (W3 if executed)
-- §11.5 Cross-workload analysis
-- §11.6 Paper comparison
-- §11.7 Final summary numbers for the Jira post
+- §12.1 Pilot run (Phase 4) — pilot data
+- §12.2 W1 × fill ratio matrix
+- §12.3 W2 × fill ratio matrix
+- §12.4 (W3 if executed)
+- §12.5 Cross-workload analysis
+- §12.6 Paper comparison
+- §12.7 Final summary numbers for the Jira post
 
-End of pre-bench section.)
+### 12.0 First clean 30-min single-cell result (2026-05-27, low-fill validation)
+
+| field | value |
+|---|---|
+| cell | YCSB-A zipf 0.8, 50/50 r/w, 1KB rows, ~7% fill |
+| window | 30 min, 31 OCP samples (60s interval) |
+| writes_count | 4,423,663 |
+| ops_per_second | 5,000.0 |
+| p99_latency_ms | 0.68 |
+| host_bytes_written (SMART Δ) | 11.89 GB |
+| physical_bytes (PMUW Δ) | 11.89 GB |
+| client_payload_bytes (writes_count × 1024) | 4.53 GB |
+| **SSD WAF** | **0.9999** |
+| **DB WAF** | **2.62** (post-compression bytes / uncompressed user bytes) |
+| **Total WAF** | **2.62** |
+
+Caveats: single replicate; low fill (drive's free-block pool deep, no SSD GC pressure); steady state never reached in 10-min warmup; key-bytes undercount of ~1.2%. Numbers are CORRECT under the stated definition, but this is NOT a production-representative measurement (fill is too low and replicate count is one). **It is the first methodologically-defensible single data point on the rig.**)
