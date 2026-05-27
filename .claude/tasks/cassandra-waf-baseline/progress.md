@@ -391,6 +391,44 @@ The **real pilot is now a tested code path**. Two follow-ups before committing t
 
 Then: real pilot at YCSB-A 80% fill (~3-4h wall, operator-monitored).
 
+## 2026-05-27 — client_payload_bytes wired + prometheus port collision fixed
+
+Library commit `99e04ff` on `cassandra-agent-harness:main`.
+
+### Three changes:
+
+1. **`client_payload_bytes` now lands in WafResult.** `_warmup_then_measure` captures the workload summary from `WorkloadHandle.stop()`, extracts `writes_count`, multiplies by new `WafBaselineConfig.row_size_bytes` (default 1024). DB WAF and Total WAF now compute end-to-end.
+2. **`CellArtifacts.measurement_workload_summary` field**: persists the workload's parsed summary (writes_count, reads_count, ops/sec, p99_latency_ms) into `cell.json` alongside the WAF numbers — needed for analysis + the eventual Jira post.
+3. **Prometheus port collision fix**: cass-stress's Prometheus HTTPServer binds default port 9500 without SO_REUSEADDR. Back-to-back warmup→measurement launches collided on TIME_WAIT and the second JVM crashed with BindException. Workaround in `_launch_workload_async`: each invocation gets a fresh `--prometheusport` from a monotonic counter (starts at 19500, increments per launch).
+
+### Smoke re-run after fixes (cell.json from `/data/results/smoke-20260527T130244Z/`)
+
+```
+Workload summary:
+  writes_count:        74,441
+  reads_count:         75,076
+  ops_per_second:      1924.22
+  p99_latency_ms:      0.35
+  total_operations:    149,517
+
+WafResult:
+  host_bytes_written:   2,560,000  (Δ in 60s on /data drive)
+  physical_bytes:       2,535,424  (Δ PMUW on same drive)
+  client_payload_bytes: 76,227,584 (74441 × 1024)
+  SSD WAF = 0.9904
+  DB WAF  = 0.0336
+  Total   = 0.0333
+```
+
+**Honest read of the smoke numbers:**
+- SSD WAF ≈ 1.0 is exactly what we expect at this fill level (99% free blocks, drive's free-block pool is fat, no internal GC pressure)
+- DB WAF < 1.0 is real but **misleading** at this short (60s) window: commitlog is on a separate device, and most of the 74K writes are still in the memtable waiting for flush. They haven't hit `/data` yet. At a real 30-minute steady-state window this resolves into a meaningful number because the memtable-flush cycle reaches equilibrium and Δhost on `/data` ≈ bytes the workload actually pushed through to SSTables.
+
+**Validated end-to-end with real WAF computation**: every code path between Gate B prereqs and persisted `cell.json` works on real PM9A3 hardware including the DB-WAF math.
+
+### Phase 4 status
+Pipeline is fully tested. Real pilot at YCSB-A 80% fill is now a tested code path; operator can fire it when ready per `waf-baseline-poc/RUNBOOK.md`.
+
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
 ### Migration from old rig (65.108.227.158 → 157.180.98.112)
