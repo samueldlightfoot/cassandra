@@ -279,6 +279,65 @@ The full pipeline — prereqs → reset → prefill → warmup-to-steady-state �
 
 The pilot is bounded — even at a long pre-fill + warmup + 30 min measurement, single cell ≤ 3-4 hours wall. If it works, we proceed to the matrix. If it breaks somewhere, we know what to fix.
 
+## 2026-05-27 — Phase 4 continued: rig fully prepped, pilot ready to launch
+
+### Naming correction (load-bearing)
+User confirmed: `cassandra-easy-stress` is the NEW name (post-Apache donation); `easy-cass-stress` is the OLD name. Earlier memory had the labels inverted. Library + app default binary corrected to `cassandra-easy-stress`. Library commit `6a65a4d` on `cassandra-agent-harness:main`; app commit `da28d11` (local).
+
+### Rig setup (157.180.98.112)
+All four prerequisites for the pilot are in place:
+
+| component | location | notes |
+|---|---|---|
+| OpenJDK 17 + ant | apt-installed | builds Cassandra |
+| Cassandra fork | `/root/repos/fork/cassandra` | branch `fdp-poc`, built via `ant jar`, JAR is `apache-cassandra-7.0-SNAPSHOT.jar` (the `base.version` was bumped to 7.0 in an earlier commit; expected) |
+| `cassandra-easy-stress` | `/root/repos/cassandra-easy-stress` | gradle `shadowJar` build; fat jar at `build/libs/cassandra-easy-stress-10-all.jar` |
+| PATH wrapper | `/usr/local/bin/cassandra-easy-stress` | shell script that `exec`s the absolute path — symlink failed because the launcher script uses `dirname $0` and only works from its install directory |
+| Library + app installs | `/root/cassandra-agent-harness/.venv` | editable installs of both; `waf-baseline --help` works |
+
+### Cassandra config edits (rig-local, not in the source repo)
+
+`/root/repos/fork/cassandra/conf/cassandra.yaml` edited to point at our split-drive layout:
+
+| key | value |
+|---|---|
+| `data_file_directories` | `[/data]` |
+| `commitlog_directory` | `/commitlog` |
+| `hints_directory` | `/data/hints` |
+| `saved_caches_directory` | `/data/saved_caches` |
+
+Other settings stay default. Original at `conf/cassandra.yaml.orig` for rollback.
+
+### Boot verification
+Cassandra started cleanly on the rig:
+- `nodetool status` returned `UN` (Up/Normal) within ~30s
+- `/data` accumulated 740K (system keyspace data), `/commitlog` 184K (commit log)
+- Drained + stopped cleanly via `nodetool drain` + SIGTERM
+
+### Pilot procedure
+Documented in `waf-baseline-poc/RUNBOOK.md`. Top-line:
+```bash
+# 1. Start Cassandra (wait for UN)
+nohup ./bin/cassandra -f -R > /data/logs/cassandra.stdout 2> /data/logs/cassandra.stderr &
+
+# 2. Run pilot
+.venv/bin/waf-baseline pilot \
+    --cassandra-home /root/repos/fork/cassandra \
+    --data-mount /data \
+    --measurement-drive-serial S64FNE0R401522 \
+    --results-dir /data/results/pilot-$(date -u +%Y%m%dT%H%M%SZ) \
+    --workload ycsb_a_zipf_0.8 \
+    --fill-fraction 0.80 \
+    --measurement-duration 30m
+
+# 3. nodetool drain + kill -TERM after the pilot finishes
+```
+
+Expected wall time: **~3-4 hours total** (1.5-2.5h pre-fill, <1h warmup typically, 30 min measurement). Operator should monitor `tail -f /data/logs/cassandra.stdout` and the harness stdout.
+
+### Phase 4 status: ready to launch
+All technical pieces in place. The pilot itself is operator-triggered when ready — long-running and needs monitoring. After the pilot returns a clean `WafResult`, we have validation of the full toolchain and can decide whether to commit to the 24-cell matrix.
+
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
 ### Migration from old rig (65.108.227.158 → 157.180.98.112)
