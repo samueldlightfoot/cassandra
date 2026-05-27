@@ -338,6 +338,59 @@ Expected wall time: **~3-4 hours total** (1.5-2.5h pre-fill, <1h warmup typicall
 ### Phase 4 status: ready to launch
 All technical pieces in place. The pilot itself is operator-triggered when ready — long-running and needs monitoring. After the pilot returns a clean `WafResult`, we have validation of the full toolchain and can decide whether to commit to the 24-cell matrix.
 
+## 2026-05-27 — Phase 4 smoke run on rig: PIPELINE VALIDATED
+
+Before committing to a 3-4h real pilot, ran a `waf-baseline pilot --smoke --fill-fraction 0.055` end-to-end on the live rig to validate every code path in ~90 seconds. **The pipeline works.**
+
+### Two bugs surfaced + fixed
+
+1. **`_run_workload` defaulted to None**, so the pre-fill loop's `write_chunk()` callback raised NotImplementedError. Library fix: default to the synchronous `run_easy_stress` from the workload module. Pre-fill needs blocking semantics so the loop can observe completed writes before re-checking fill.
+
+2. **Pre-fill chunk duration was hardcoded to "60m"** in `workloads.prefill_workload()`. Each iteration ran cass-stress for an hour before the harness's fill loop got to re-check anything — first smoke attempt timed out after iter 13/80 with the cell unfinished. Fix: added `WafBaselineConfig.prefill_chunk_duration` (default `"5m"` for production; CLI `--prefill-chunk-duration`); `--smoke` preset overrides to `"30s"`.
+
+### Smoke run result (`cell.json` from `/data/results/smoke-20260527T122004Z/`)
+
+```
+prereqs:      all 3 PASS (swap_off, ocp_available, drive_isolation)
+reset:        dropped [keyvalue, sensor_data], compaction drained in 2.34s
+prefill:      iterations=0 (used 50.4 GB >= target 48.9 GB, bailed)
+measurement:  60s window, 12 OCP samples
+RESULT:       SSD WAF = 1.20 (host 2.05 MB Δ -> PMUW 2.46 MB Δ)
+              DB WAF = None  (client_payload_bytes not wired yet)
+              Total = None
+success:      True
+elapsed:      92.4s
+```
+
+The 1.20 SSD WAF is **not** a meaningful baseline number — warmup never reached steady state in 30s (timed out on safety net) and prefill was a no-op. But the number is REAL: it came from real PMUW counters reading a real workload writing to a real PM9A3.
+
+### What this validates
+- All three Gate B prereqs pass on real hardware
+- Reset (cqlsh DROP + nodetool flush + compaction-quiet wait) works
+- Pre-fill loop logic (bail-on-target, iterate, history tracking)
+- Async workload launch via `WorkloadHandle` (SIGTERM on stop)
+- MeasurementWindow with periodic sampler thread
+- OCP PMUW delta + SMART data_units_written delta → SSD WAF computed correctly
+- Cell artifact persistence (cell.json with raw OCP snapshots preserved)
+- Summary.json + result-dir layout
+
+### What's NOT validated by smoke
+- Steady-state detection (warmup needed only 4 samples but had ≤3 before timeout)
+- Long pre-fill at production target (would have taken ~60min in smoke; works in principle since iter 13 was healthy progress)
+- Client payload byte tracking → DB WAF + Total WAF (TODO documented in runner)
+- High-fill SSD WAF behaviour (smoke ran at ~5.7%, production target is 80%+)
+
+### Commits
+- Library `531694e` on `cassandra-agent-harness:main` — pushed
+- App `5332a4a` on `waf-baseline-poc` (local) — CLI knobs + --smoke preset
+
+### Phase 4 next step
+The **real pilot is now a tested code path**. Two follow-ups before committing to it:
+1. Wire `client_payload_bytes` from the cass-stress output CSV into the WafResult so DB WAF + Total WAF land
+2. Optionally: a longer smoke at moderate fill (e.g., 10% target, --warmup-max-s 600) to validate steady-state detection actually fires
+
+Then: real pilot at YCSB-A 80% fill (~3-4h wall, operator-monitored).
+
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
 ### Migration from old rig (65.108.227.158 → 157.180.98.112)
