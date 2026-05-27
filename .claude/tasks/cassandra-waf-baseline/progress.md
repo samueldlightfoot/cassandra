@@ -429,6 +429,66 @@ WafResult:
 ### Phase 4 status
 Pipeline is fully tested. Real pilot at YCSB-A 80% fill is now a tested code path; operator can fire it when ready per `waf-baseline-poc/RUNBOOK.md`.
 
+## 2026-05-27 — First real 30-min WAF measurement (after orphan-JVM fix)
+
+### Bug found in production: orphaned JVMs after _stop_workload()
+
+First 30-min run (`window30-20260527T130837Z`) revealed that cassandra-easy-stress's launcher script ends with `java -jar` (NOT `exec java -jar`), so the JVM is a bash *child* not a bash replacement. SIGTERM to the bash leader killed bash but left the JVM orphaned and writing. The warmup JVM (port 19500) ran for the entire 22-minute span of the subsequent measurement window, contaminating Δhost on /data.
+
+Library fix (`cassandra-agent-harness:main` commit `3e28c41`):
+- `launch_easy_stress_async` Popen now uses `start_new_session=True`
+- `WorkloadHandle.stop` uses `os.killpg(getpgid(pid), SIGTERM)` then SIGKILL, signaling the whole process group instead of just the bash leader
+- 3 new tests; library: 183 → 186
+
+Verified the fix by re-running and observing no orphan JVMs in `ps`.
+
+### Clean v2 result (`window30v2-20260527T135616Z`)
+
+Same conditions as v1, this time without contamination:
+
+| metric | v1 (contaminated) | v2 (clean) |
+|---|---:|---:|
+| writes_count | 4,425,126 | 4,423,663 |
+| ops_per_second | 5000.01 | 5000.0 |
+| p99_latency_ms | 39.8 | 0.68 |
+| host_bytes_written | 17.40 GB | 11.89 GB |
+| physical_bytes (PMUW) | 17.40 GB | 11.89 GB |
+| client_payload_bytes | 4.53 GB | 4.53 GB |
+| **SSD WAF** | 1.0001 | **0.9999** |
+| **DB WAF** | 3.84 | **2.62** |
+| **Total WAF** | 3.84 | **2.62** |
+
+The p99 latency in v1 was 39.8 ms (terrible) vs 0.68 ms in v2 (excellent) — direct confirmation that the orphan workload was creating contention. DB WAF dropped from 3.84 → 2.62 (≈ 32% lower) which is consistent with the orphan contributing ~half the host writes for ~22/30 of the window.
+
+### What v2 means (and what it doesn't)
+
+This is the **first real, defensible WAF measurement on the rig**. Caveats:
+- Single replicate, single workload (YCSB-A zipf 0.8, 50/50 r/w, 1KB rows)
+- Low fill (~7% — accumulated from prior tests; still far below paper's 90% condition)
+- Steady state never reached during warmup (10-min cap fired; at this throughput on a near-empty drive the SSD's free-block pool depletion is far slower than 10 min)
+- Single 30-min window, no replicates
+
+But the **shape is right**:
+- SSD WAF ≈ 1.0 at low fill (free-block pool is enormous, no GC pressure) — exactly what Lee/Ziegler/Leis predict
+- DB WAF ≈ 2.6 for UCS T4 — reasonable for LSM (flush 1x + compaction 1.5-2x + index/stats files)
+- Total WAF dominated by the DB layer at this fill — also expected; the SSD's contribution scales with fill
+
+### Throughput concern for the real pilot
+
+At 5 MB/s client × 2.6 DB WAF = ~13 MB/s on /data. Growing /data from 23 GB to 80% (~665 GB) would take ~14 hours of pure prefill at this rate. The current prefill workload config (KeyValue, 64 threads, 1M partitions, default rate-limit) isn't fast enough for a 24-cell production matrix.
+
+Options for the next phase:
+1. Crank cass-stress threads + remove rate caps → measure actual sustained write throughput
+2. Switch prefill to dsbulk (designed for bulk-load)
+3. Lower target fill for the first matrix runs (e.g. 30% fill is ~3h prefill; useful headline if the SSD WAF curve is interesting at moderate fill)
+4. Pre-fill once, snapshot, restore between cells (avoids re-filling for each replicate)
+
+### Phase 4 closing state
+- Pipeline fully tested end-to-end including DB WAF + Total WAF computation
+- Process-group fix in place (`cassandra-agent-harness:main:3e28c41`)
+- First real WAF data point: SSD WAF 0.9999 / DB WAF 2.62 / Total 2.62 at ~7% fill
+- Prefill-throughput is the next blocker before a feasible production matrix
+
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
 ### Migration from old rig (65.108.227.158 → 157.180.98.112)
