@@ -257,6 +257,63 @@ Two options to address:
 
 For the Jira-post-grade methodology either is fine. Disclose either way.
 
+### 11.7 SSD preconditioning: skipping the fill-to-80% bench time
+
+**The problem.** SSD WAF is structurally pinned at 1.0 until the drive's free-block pool has been depleted. At low logical fill (≤30%), the SSD has so much OP space + uncommitted LBA range that GC almost never has to relocate valid data. So measuring "Cassandra under high SSD pressure" naively requires filling /data to 80%+, which at our observed throughput (~13 MB/s on /data) takes ~14 hours of pure prefill — for *every* cell that needs that fill state.
+
+**The shortcut.** The SSD doesn't know about partitions, filesystems, or files — it only sees LBAs. We can fill the *raw device* with random data in ~10-45 minutes via `dd` or `fio`, which makes the SSD's FTL mark every LBA as valid. Then we run Cassandra in a fresh ext4 partition on top, and Cassandra's writes face an SSD whose free-block pool is already at the OP-only minimum. SSD WAF > 1.0 immediately, no 14-hour wait. Standard methodology in the SSD-benchmark community (called "preconditioning" or "drive saturation").
+
+**Two preconditioning modes:**
+
+| pattern | command (≈) | time on PM9A3 | accuracy |
+|---|---|---|---|
+| Sequential dd-random | `fio --rw=write --bs=1M --size=800G --direct=1 --buffer_compress_percentage=0 --refill_buffers` | ~10 min @ 1.5 GB/s | **lower bound** — ballast superblocks are all-valid; GC initially targets Cassandra's region (easier victims); SSD WAF starts low and climbs over time |
+| Random precondition | `fio --rw=randwrite --bs=4k --size=1200G --io_size=1200G --direct=1 --iodepth=32 --buffer_compress_percentage=0 --refill_buffers` | ~30-45 min | **realistic steady state** — writing 1.5× capacity ensures every LBA touched + re-touched; FTL fully scrambled |
+
+The 1.5× capacity overwrite in mode 2 is intentional. Writing capacity-once leaves the FTL in a "first-pass" state where valid pages are clustered by write order. Writing 1.5× ensures the SSD has done its first round of GC, blocks have mixed valid/invalid pages, and the next host write hits realistic GC behaviour.
+
+**Procedure on our rig:**
+
+```bash
+# 1. Stop Cassandra
+nodetool drain && kill -TERM $(cat /data/cassandra.pid)
+umount /data
+
+# 2. Precondition (Path B — realistic):
+fio --name=precond --filename=/dev/nvme1n1 \
+    --rw=randwrite --bs=4k --size=1200G \
+    --io_size=1200G --direct=1 --ioengine=libaio --iodepth=32 \
+    --buffer_compress_percentage=0 --refill_buffers
+
+# 3. Recreate FS + remount (precondition nuked the partition table + ext4 super)
+parted /dev/nvme1n1 mklabel gpt mkpart primary ext4 1MiB 100%
+mkfs.ext4 /dev/nvme1n1p1
+mount /dev/nvme1n1p1 /data
+mkdir -p /data/hints /data/saved_caches /data/logs
+
+# 4. Restart Cassandra; recreate system tables
+# 5. Run waf-baseline pilot — SSD WAF now reflects high-fill behaviour
+```
+
+**What this enables.** Each cell that would have needed 14h of prefill now needs:
+- 30-45 min precondition (one-time before the high-fill matrix)
+- 0 min prefill (FS-level fill is whatever the precondition + minimal Cassandra state is; the SSD-level fill is ~100% from the precondition)
+- 30 min measurement window as usual
+
+A 3-replicate × 2-workload × 3-T-parameter (T4/T8/T16) high-fill matrix becomes ~5h of bench wall instead of ~30h.
+
+**What this changes about interpretation.** Honest disclosure for the writeup:
+- Δhost during the measurement window still reflects Cassandra's writes only (precondition is one-time pre-event; doesn't contribute to Δ)
+- SSD WAF measured is "Cassandra under post-fresh drive conditions" — equivalent to a drive that's been in production for several weeks of normal write traffic
+- *Not* equivalent to "Cassandra at 90% Cassandra-allocated logical fill after natural buildup" — the SSD's heatmap of "which LBAs are hot" reflects the precondition pattern, not Cassandra's natural access pattern over time
+- In practice these should converge after enough Cassandra work, but for a 30-min window the precondition signature might be visible
+
+**When this approach is wrong.** If we wanted to claim "Cassandra fills naturally to 90% over 6 months of production load and then we measured SSD WAF", preconditioning wouldn't reproduce that — natural fill produces an FTL state where Cassandra's *own write pattern* shaped the SSD's view of hot/cold LBAs. For the Jira post we should claim only "Cassandra under steady-state post-fresh-pool SSD conditions" — accurate and honestly disclosed.
+
+**Caveat: TRIM/discard.** Modern ext4 with the `discard` mount option or periodic `fstrim` will send TRIM commands telling the SSD that freed LBAs are no longer needed → SSD removes them from its valid set → fresh-pool grows back. This UNDOES preconditioning. For the bench window, the mount must NOT have `discard` enabled, and `fstrim` should not be run mid-bench. Our current `/data` is mounted `defaults,noatime` (no `discard`) — good.
+
+**Why this approach didn't surface earlier.** The investigation framed prefill as "make Cassandra's data directory full." A subtle reframing — "make the SSD's free-block pool empty" — is the operationally useful invariant. Preconditioning at the block-device level is the right tool for it.
+
 ## 12. Results
 
 (Filled as Phase 5 runs complete. Structure planned:
