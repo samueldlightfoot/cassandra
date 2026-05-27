@@ -79,7 +79,19 @@ Deferred to Phase 3 (where they logically belong alongside building the WafBasel
 - [ ] Wire OCP/SMART captures into investigation lifecycle (pre-window snapshot, periodic sampling thread, post-window snapshot)
 - [ ] `check_drive_isolation` — verify Cassandra is the only meaningful writer to the measurement device
 
-### Phase 3 — Methodology + procedure scripts (~3 days)
+### Phase 3 — Library substrate (CLOSED 2026-05-27)
+
+All five planned primitives delivered + a runner scaffold. Library commits 891a0b7, 33c8373, c94004e, b6e774c on `cassandra-agent-harness:main`. Library suite 116 → 175 tests across the phase, zero regressions.
+
+Delivered:
+- [x] `capture.measurement.MeasurementWindow` — pre/post OCP+SMART snapshot bracketing with periodic sampler thread, idempotent `finalise()`, sampler-error resilience
+- [x] `capture.measurement.is_steady_state` — adaptive replacement for the paper's "wait 3 drive-writes" fixed rule
+- [x] `prereqs.checks.check_drive_isolation` + S/N ↔ device-path helpers in `capture.ocp` — catches NVMe re-enumeration scenarios + duplicate-mount cases
+- [x] `bench.reset_cassandra` + `bench.wait_for_compaction_quiet` — soft reset between cells with structured result + timeout
+- [x] `bench.prefill_to_target` — workload-agnostic fill loop with stuck-writes detection
+- [x] `investigations.waf_baseline.WafBaselineRunner` — matrix-shape runner (Cell, CellArtifacts, cells() ordering) wiring all primitives together. **Scaffold with explicit TODOs** for workload-spec construction and async launch — those belong in the investigation-app layer (next phase).
+
+Original plan body preserved below for reference:
 
 - [ ] Pre-fill procedure: bulk-load Cassandra to target fill ratio via easy-cass-stress with disabled deletes. Validate it actually reaches the target via `nodetool tablestats`.
 - [ ] Steady-state procedure: run the target workload for N drive-writes before opening the measurement window. Tunable per workload. Validate by checking that SSD WAF readings stabilize before declaring "steady state reached".

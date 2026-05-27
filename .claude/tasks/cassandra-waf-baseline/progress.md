@@ -205,11 +205,47 @@ Pure function over `(timestamp, ssd_waf)` series. Returns True when the last N s
 15 new tests including threading-sensitive ones (sampler liveness, sampler-error resilience, finalise idempotency) using mocked snapshot fns + very short intervals to avoid real sleep. **Full library suite: 131/131 passing.**
 
 ### Phase 3 remaining
-- [ ] Pre-fill helper — runs easy-cass-stress write-only until target fill ratio
-- [ ] Cassandra clean-state reset helper — drops keyspace + wait for compaction drain between cells
-- [ ] `check_drive_isolation` prereq (deferred from Phase 2)
-- [ ] `WafBaselineInvestigation` class wiring everything together (probably a new app, since GDT is parked)
-- [ ] Workload specs for YCSB-A zipf 0.8 + TWCS time-series
+- [x] Pre-fill helper — runs easy-cass-stress write-only until target fill ratio
+- [x] Cassandra clean-state reset helper — drops keyspace + wait for compaction drain between cells
+- [x] `check_drive_isolation` prereq (deferred from Phase 2)
+- [x] `WafBaselineInvestigation` class wiring everything together (probably a new app, since GDT is parked)
+- [ ] Workload specs for YCSB-A zipf 0.8 + TWCS time-series — **TODOs explicit in runner**, deferred to Phase 4 (pilot needs them anyway)
+
+## 2026-05-27 — Phase 3 closed (library substrate complete)
+
+All five Phase 3 library primitives landed across four commits on cassandra-agent-harness origin/main. Library tests: 116 (Phase 2) → 175 (Phase 3 end), zero regressions.
+
+| commit | scope |
+|---|---|
+| `891a0b7` | MeasurementWindow + is_steady_state |
+| `33c8373` | check_drive_isolation + serial_for_device + parent_namespace_path |
+| `c94004e` | bench module: reset_cassandra + prefill_to_target |
+| `b6e774c` | WafBaselineRunner scaffold + matrix shape |
+
+### What's wired vs what's stubbed
+
+**Wired** (testable + verified on live rig where applicable):
+- All capture primitives (OCP/SMART/WAF math/MeasurementWindow)
+- All prereq checks (swap_off, ocp_available, drive_isolation)
+- All bench helpers (reset_cassandra, prefill_to_target, wait_for_compaction_quiet)
+- WafBaselineRunner matrix shape (cell ordering, persistence, error capture)
+
+**Stubbed in WafBaselineRunner with explicit TODO markers** — investigation-app-level decisions:
+- `_build_measurement_workload(workload_name)` — needs YCSB-A profile + TWCS schema decisions
+- `_build_prefill_workload(target)` — needs write-only profile decision
+- `_launch_workload_async()` + `_stop_workload()` — easy-cass-stress is currently sync-invoked in `workload.easy_stress.run_easy_stress`; for the warmup→measure pattern we need an async variant. Either extend the existing function or construct the subprocess directly inline.
+
+These belong in a new `waf-baseline-poc` app that imports the library scaffold — same pattern as `gdt-poc-harness` extends the library for GDT investigation.
+
+### Phase 4 kickoff items (next session)
+
+1. **Create `waf-baseline-poc` app** that imports `WafBaselineRunner` and supplies the four TODO methods with concrete decisions
+2. **Workload profile decisions**:
+   - YCSB-A: KeyValue workload, zipf 0.8, 50/50 read/write, 1 KB rows, 1M partitions — matches paper config
+   - TWCS: BasicTimeSeries workload, time-window compaction, monotonic timestamps
+   - Pre-fill: same KeyValue with read_ratio=0, deletes off
+3. **Async workload launcher** — likely simplest path is to construct the easy-cass-stress subprocess directly in the runner and stash a Popen handle for SIGTERM-on-stop
+4. **Pilot run** on the rig: single cell (YCSB-A at 80% fill) to validate the full toolchain end-to-end before committing to the matrix
 
 ## Follow-up TODOs (out of scope for Phase 1 itself)
 
