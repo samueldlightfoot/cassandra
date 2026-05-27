@@ -314,6 +314,86 @@ A 3-replicate × 2-workload × 3-T-parameter (T4/T8/T16) high-fill matrix become
 
 **Why this approach didn't surface earlier.** The investigation framed prefill as "make Cassandra's data directory full." A subtle reframing — "make the SSD's free-block pool empty" — is the operationally useful invariant. Preconditioning at the block-device level is the right tool for it.
 
+### 11.8 Deploy-before-launch discipline — the T8 rsync-forgot incident
+
+**Cost: ~4 hours of wall time lost on 2026-05-27.**
+
+**Symptom.** T8 cell launched at 15:51 UTC with `--ucs-scaling-parameters T8`. Local library + app tests passed. The CLI parser on the dev box accepted the flag. But the **rig's installed waf-baseline didn't have that flag** — I'd added it locally + committed but never `rsync`'d the source to the rig before launching. The rig's argparse rejected the flag immediately:
+
+```
+waf-baseline: error: unrecognized arguments: --ucs-scaling-parameters T8
+```
+
+The process exited within milliseconds. No `cells_succeeded`, no `cells_failed`, no `Traceback` — just an argparse error printed to stderr and a clean exit. **The monitor I'd armed didn't include `unrecognized arguments` in its grep pattern.** Zero events emitted. I went idle waiting for a notification that would never come.
+
+**Detection: the next "check" the user asked for, ~4 hours later.**
+
+**Root causes:**
+
+1. **The rig's waf-baseline-poc was a separate editable install** at `/root/waf-baseline-poc/`. It tracks the local files on the rig, NOT my dev machine. Adding a CLI flag locally requires an explicit `rsync` to propagate. No automation does this; it's a manual mental gate.
+2. **The monitor's grep pattern only matched the happy path + known explicit failures.** Argparse-time errors weren't covered. (See §11.9.)
+
+**Rules — enforce before any further multi-hour bench:**
+
+- **A "deploy" step MUST precede every rig launch.** Either:
+  - Add a `bin/deploy-and-run` helper script in waf-baseline-poc that does `rsync local→rig` then `ssh ... waf-baseline run ...` in one atomic operation. Use this for every launch.
+  - Or: extend the harness with a `--rig` mode that detects local vs rig and refuses to launch from local without first rsync'ing.
+- **Verify the deploy worked** by calling `waf-baseline --help | grep <new-flag>` on the rig before the actual run. Three-second check.
+- **Add a startup smoke test**: 5-second invocation with the same args but with `--measurement-window-s 5 --warmup-max-s 5 --measurement-duration 1s` to verify the args parse and the bench at least starts. If THAT works, then launch the real run.
+
+The 4-hour loss came from a 30-second rsync that wasn't done. Process discipline matters more than code quality at this stage.
+
+### 11.9 Monitor grep coverage — silence is not success
+
+**Cost: contributed to the 4-hour loss in §11.8.**
+
+The Monitor I armed for the failed T8 launch used:
+
+```
+grep -E --line-buffered "cells succeeded|cells failed|cell failed|Traceback"
+```
+
+T8 actually failed at startup with `unrecognized arguments` — which matches NONE of those patterns. The monitor emitted zero events. I interpreted "no events" as "still running." For 4 hours.
+
+This is the **exact failure mode** the Monitor tool's own docs warn about:
+
+> *"Coverage — silence is not success. When watching a job or process for an outcome, your filter must match every terminal state, not just the happy path. ... ask: if this process crashed right now, would my filter emit anything? If not, widen it."*
+
+I did exactly the wrong thing despite the explicit warning. The lesson is in the tool docs already; I just need to apply it.
+
+**Template for any bench-launch monitor:**
+
+```
+grep -E --line-buffered "PASS|FAIL|cells succeeded|cells failed|cell failed|Traceback|Error |error:|unrecognized|usage:|exit|killed|aborted|warmup timed out|bootstrapping"
+```
+
+The alternation is intentionally broad. Some events are progress markers (`bootstrapping`, `warmup timed out`) — those confirm the run is alive. Others are failure markers (`error:`, `unrecognized`, `Traceback`). Either way, the monitor is NEVER silent for >5 min if the bench is actually progressing.
+
+**Rule:** if a monitor goes silent for >5 min when something interesting should be happening, ASSUME silent failure. Don't wait — verify directly via `ssh ... pgrep` + log tail. Five seconds beats four hours.
+
+### 11.10 DROP KEYSPACE doesn't free disk space (snapshot accumulation)
+
+**Symptom.** After v3's reset which actually dropped `cassandra_easy_stress`, /data still showed ~70 GB used per statvfs (~8% fill) instead of dropping to ~3 GB. The bootstrap workload's 10s of writes can't account for >60 GB.
+
+**Root cause.** Cassandra's DROP KEYSPACE doesn't `rm -rf` the SSTable files. It moves them to `<keyspace>/<table>/snapshots/dropped-<ts>-<keyspace>/` subdirectories. These persist until either:
+- `nodetool clearsnapshot` is run
+- `auto_snapshot: false` is set in cassandra.yaml **before** the DROP
+- Manual `rm -rf` of the snapshot directories
+
+Cassandra's design treats DROP as recoverable — the snapshots exist so you can `nodetool refresh` to restore. For our bench it's the opposite — we want DROP to actually free disk.
+
+**Rules for the upcoming high-fill matrix:**
+
+| approach | when to use |
+|---|---|
+| `auto_snapshot: false` in cassandra.yaml | Recommended for the entire bench. We never want bench-time snapshots. Add this before the precondition step. |
+| `nodetool clearsnapshot` after each reset | Belt-and-braces if `auto_snapshot` isn't disabled. Should be added to `reset_cassandra()` in the library. |
+| `rm -rf /data/.../snapshots/` after reset | Brute-force, only if nodetool's mechanism breaks. |
+
+**Why this matters for SSD WAF interpretation.** The SSD tracks "valid LBAs" — its view of `which physical pages contain data the host might want again`. Even after DROP, the LBAs holding snapshot data are still marked valid in the FTL. So the SSD's fresh-block pool never recovers from a heavy write run unless we follow up with TRIM (which would happen automatically only with `discard` mount option, which we deliberately disabled).
+
+This actually compounds with §11.7 (preconditioning) in a useful way: once the SSD is in "high-pressure" mode from preconditioning + accumulated writes, it stays there regardless of Cassandra-side DROPs. **Inter-cell reset on the host side doesn't reset the SSD-side measurement conditions.** Good for measuring sustained high-fill behaviour across cells.
+
 ## 12. Results
 
 (Filled as Phase 5 runs complete. Structure planned:
