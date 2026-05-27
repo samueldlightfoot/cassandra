@@ -339,9 +339,20 @@ The process exited within milliseconds. No `cells_succeeded`, no `cells_failed`,
   - Add a `bin/deploy-and-run` helper script in waf-baseline-poc that does `rsync local→rig` then `ssh ... waf-baseline run ...` in one atomic operation. Use this for every launch.
   - Or: extend the harness with a `--rig` mode that detects local vs rig and refuses to launch from local without first rsync'ing.
 - **Verify the deploy worked** by calling `waf-baseline --help | grep <new-flag>` on the rig before the actual run. Three-second check.
-- **Add a startup smoke test**: 5-second invocation with the same args but with `--measurement-window-s 5 --warmup-max-s 5 --measurement-duration 1s` to verify the args parse and the bench at least starts. If THAT works, then launch the real run.
+- **🛑 Mandatory ~10-second post-launch verification.** Every `nohup ... &` MUST be followed by a sanity check that the process is alive and making progress. This is non-negotiable for any bench that exceeds 5 minutes of expected runtime:
+  ```bash
+  # After launching, wait ~10s for argparse / imports / first prereq check
+  sleep 10
+  ssh root@rig 'pgrep -af waf-baseline | head -1' && \
+  ssh root@rig 'tail -5 /data/logs/<bench>.log'
+  # Expected: a python3.11 process still alive, log shows at least one "PASS"
+  # or "Starting N cells" line. If process dead or log empty: bench died.
+  # Investigate before walking away.
+  ```
+  This catches: argparse errors, Python import errors, missing files, missing binaries on PATH, permission errors, Cassandra connection failures (if fast enough). Things that fail in <1s leave no trace for a monitor's grep to ever match. **The 10s wait is cheap insurance against 4-hour silent failures.**
+- **Add a startup smoke test** for high-risk launches (new CLI args, new code paths): 5-second invocation with the same args but with `--measurement-window-s 5 --warmup-max-s 5 --measurement-duration 1s` to verify the args parse and the bench at least starts. If THAT works, then launch the real run.
 
-The 4-hour loss came from a 30-second rsync that wasn't done. Process discipline matters more than code quality at this stage.
+The 4-hour loss came from a 30-second rsync that wasn't done AND a 10-second verify that wasn't done. Process discipline matters more than code quality at this stage.
 
 ### 11.9 Monitor grep coverage — silence is not success
 
