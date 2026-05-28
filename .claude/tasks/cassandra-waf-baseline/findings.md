@@ -312,6 +312,58 @@ A 3-replicate × 2-workload × 3-T-parameter (T4/T8/T16) high-fill matrix become
 
 **Caveat: TRIM/discard.** Modern ext4 with the `discard` mount option or periodic `fstrim` will send TRIM commands telling the SSD that freed LBAs are no longer needed → SSD removes them from its valid set → fresh-pool grows back. This UNDOES preconditioning. For the bench window, the mount must NOT have `discard` enabled, and `fstrim` should not be run mid-bench. Our current `/data` is mounted `defaults,noatime` (no `discard`) — good.
 
+**🛑 CRITICAL GOTCHA — `mkfs.ext4` issues TRIM by default.** This is what bit us on 2026-05-28. Procedure was:
+
+1. Fio sequential precondition of `/dev/nvme1n1p3` (843 GB)
+2. SSD's `percent_free_blocks` correctly drops 99 → 5 ✓
+3. `mkfs.ext4 -F /dev/nvme1n1p3` — recreates the filesystem
+4. Observed `percent_free_blocks` IMMEDIATELY back at 78 after mkfs
+5. **The precondition was effectively undone in seconds.**
+
+Root cause: `mkfs.ext4` (and most modern mkfs variants) issue a TRIM/DISCARD ioctl across the entire partition after formatting. The semantics are "I'm creating a fresh FS; mark the device's view of these LBAs as unused." Great for FS performance on SSDs in normal use; disastrous for our preconditioned-bench setup.
+
+**The fix:** `mkfs.ext4 -E nodiscard /dev/nvme1n1p3`. The `-E nodiscard` flag suppresses the post-format TRIM. Documented in `man mke2fs`:
+> `nodiscard` — Do not attempt to discard blocks at mkfs time.
+
+**Correct precondition procedure** (revised after 2026-05-28 incident):
+
+```bash
+# 1. Stop Cassandra cleanly
+nodetool drain && kill -TERM $(cat /data/cassandra.pid)
+umount /data
+
+# 2. Precondition raw partition with non-compressible random data
+fio --name=precond --filename=/dev/nvme1n1p3 \
+    --rw=write --bs=1M --size=843G \
+    --direct=1 --ioengine=libaio --iodepth=8 \
+    --buffer_compress_percentage=0 --refill_buffers
+
+# 3. Verify SSD's view is post-precondition (percent_free_blocks ≤ ~10)
+nvme ocp smart-add-log /dev/nvme1n1 | grep 'Percent free'
+
+# 4. mkfs with -E nodiscard (CRITICAL — without this, step 2 is undone)
+mkfs.ext4 -F -E nodiscard /dev/nvme1n1p3
+
+# 5. Re-verify SSD's view is STILL post-precondition
+nvme ocp smart-add-log /dev/nvme1n1 | grep 'Percent free'
+# If percent_free_blocks jumped back up, mkfs TRIMmed despite the flag —
+# escalate to alternative FS-setup approach (e.g. existing FS image dd'd
+# onto the partition rather than mkfs'd in place).
+
+# 6. Mount, restart Cassandra, run cells
+mount /dev/nvme1n1p3 /data
+```
+
+**Verification is non-negotiable.** Step 5 (re-check `percent_free_blocks` after mkfs) is the only way to catch if the FS setup is silently undoing the precondition. Add this verify to any preconditioning procedure.
+
+**Other TRIM-undo paths to be aware of:**
+- `fstrim /data` invocation (manual or systemd timer-triggered) — disable any `fstrim.timer` on the rig
+- `mount -o discard` — never use this option for the bench mount
+- Periodic `cron` cleanup scripts that include `fstrim` — audit `/etc/cron.*` on the rig
+- LVM/dm-discard — not applicable here (direct partition mount) but worth knowing for other setups
+
+**Lesson cost:** ~50 min of bench wall time on a wasted T4 high-fill cell that ran against the same low-pressure SSD state as the cold-start cells. Caught mid-flight by monitoring `percent_free_blocks` and noticing it had jumped back up.
+
 **Why this approach didn't surface earlier.** The investigation framed prefill as "make Cassandra's data directory full." A subtle reframing — "make the SSD's free-block pool empty" — is the operationally useful invariant. Preconditioning at the block-device level is the right tool for it.
 
 ### 11.8 Deploy-before-launch discipline — the T8 rsync-forgot incident
