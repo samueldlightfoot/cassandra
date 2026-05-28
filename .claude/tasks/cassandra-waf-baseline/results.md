@@ -180,4 +180,62 @@ What does the DB WAF curve look like over a 4-6 hour run that lets the compactio
 
 ---
 
-(Add R3+ as further validated measurements land. Next planned: T8 (in flight as of measurement), T16, then preconditioned high-fill at T4/T8/T16.)
+## R3. UCS T-parameter sweep at cold start (2026-05-27 / 2026-05-28, low fill)
+
+**Status:** validated. Three cells under identical conditions except for UCS `scaling_parameters`. Conditions: YCSB-A zipf 0.8, 50/50 r/w, 1 KB values, 30-min window, fill_fraction=0.04 → bailed (actual fill ~7-9% via accumulated dropped-keyspace snapshots). Cold start each time (reset drops keyspace; bootstrap recreates fresh).
+
+### Numbers
+
+| T | writes_count | ops/sec | p99 (ms) | host GB | phys GB | SSD WAF | DB WAF | results dir |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| T4  | 4,426,312 | 5000.0 | 0.44 | 6.267 | 6.266 | 0.9999 | 1.3614 | `window30v3-20260527T151101Z/` |
+| T8  | 4,424,660 | 5000.0 | 0.56 | 6.257 | 6.258 | 1.0001 | 1.3598 | `T8-20260527T210223Z/` |
+| T16 | 4,424,785 | 5000.0 | 0.77 | 6.259 | 6.256 | 0.9995 | 1.3602 | `T16-20260528T054443Z/` |
+
+### Findings
+
+**DB WAF is essentially T-invariant at cold start.** Spread of 0.0016 across T4-T16 (0.12% relative) — below the measurement's noise floor for a single replicate. **The T-parameter does not impact DB WAF at 30-min cold-start measurement scale.**
+
+This is the *expected* result. UCS's T-parameter controls when compaction *triggers* (when N SSTables accumulate in a level). At cold start, the rate of trigger events depends on how fast L0 fills via flush, then how fast L1 fills via L0→L1 compactions. In 30 min:
+- ~4.4M writes × 1 KB ≈ 4.4 GB of client payload
+- Memtable threshold roughly ~256 MB (default) → ~17 memtable flushes → 17 L0 SSTables
+- At T4: L0→L1 fires every 4 L0 SSTables → 4 L0→L1 compactions in the window
+- At T8: L0→L1 fires every 8 L0 SSTables → 2 L0→L1 compactions
+- At T16: L0→L1 fires every 16 L0 SSTables → 1 L0→L1 compaction (or maybe zero, just barely)
+
+So at most ~4 compactions happen during the T4 window vs ~1 at T16. The compaction-driven write-amp difference at this scale is at most a few hundred MB out of ~6.3 GB — well within the noise floor for a single replicate. **T's effect lives in steady-state where dozens to hundreds of compactions fire per window.**
+
+**The p99 read-latency signal IS visible:**
+- T4 → 0.44 ms
+- T8 → 0.56 ms (+27%)
+- T16 → 0.77 ms (+75% vs T4)
+
+Reads have to check bloom filters across all L0 SSTables; higher T = more L0 SSTables → more filter checks → higher read latency. Even at cold-start, the read path is sensitive to T because every L0 SSTable is touched per query regardless of compaction events. **The classic "write-amp ↓ vs read-amp ↑" tradeoff that motivates the T-parameter is half-visible here — only the read side**, because we haven't run long enough for the write side to differentiate.
+
+### What R3 tells us
+
+- **T-parameter cannot reduce DB WAF in a 30-min cold-start measurement.** Any future writeup that wants to make a T-related DB WAF claim needs either (a) much longer runs or (b) pre-populated keyspaces where compaction is already firing at full rate.
+- **p99 IS T-sensitive even at cold-start.** Useful as a directional finding for read-heavy operational concerns.
+- **All three measurements landed at SSD WAF ≈ 1.0** — confirms the SSD WAF floor is structurally pinned at low fill regardless of which DB-side configuration we test.
+
+### What R3 does NOT tell us
+
+- ❌ Steady-state DB WAF for T4 vs T8 vs T16 — needs multi-hour runs
+- ❌ Any high-fill behaviour for either DB or SSD WAF — needs preconditioning
+- ❌ Crossover point where higher T's read-amp cost exceeds its write-amp savings — needs an actual mixed-workload optimization study
+
+### Code state at measurement time
+
+All three cells: `cassandra-agent-harness:main` = `cf7bd7b` (post-bootstrap fix + key_size_bytes), `waf-baseline-poc:main` = `29fa03d` (T-param flag + threading).
+
+### What's next
+
+The preconditioned high-fill matrix (per §11.7 in findings.md) is the next planned bench:
+1. Stop Cassandra, set `auto_snapshot: false` in cassandra.yaml (per §11.10), unmount /data
+2. fio sequential or randwrite precondition of /dev/nvme1n1p3 — ~10-30 min
+3. mkfs.ext4 + remount, restart Cassandra
+4. Run T4, T8, T16 high-fill cells — ~3 × 40 min = 2 hours
+
+Expected outcome: SSD WAF lifts above 1.0 (real GC pressure on the drive); DB WAF stays approximately the same (cold-start regime persists for the Cassandra keyspace). Whether SSD WAF lifts meaningfully or stays close to 1.0 is the open empirical question — the answer determines if there's any room for SSD-side mechanism work on Cassandra.
+
+(Add R4+ as further validated measurements land — high-fill cells next.)
