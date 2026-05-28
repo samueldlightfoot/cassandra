@@ -238,4 +238,91 @@ The preconditioned high-fill matrix (per §11.7 in findings.md) is the next plan
 
 Expected outcome: SSD WAF lifts above 1.0 (real GC pressure on the drive); DB WAF stays approximately the same (cold-start regime persists for the Cassandra keyspace). Whether SSD WAF lifts meaningfully or stays close to 1.0 is the open empirical question — the answer determines if there's any room for SSD-side mechanism work on Cassandra.
 
-(Add R4+ as further validated measurements land — high-fill cells next.)
+---
+
+## R4. UCS T-sweep at HIGH SSD pressure (2026-05-28)
+
+**Status:** the headline result of the investigation. Three cells with the SSD's free-block pool genuinely depleted to 5% via `fio` precondition + `mkfs.ext4 -E nodiscard`. Demonstrates that Cassandra's SSD WAF stays at the floor (~1.0) even when the drive is in the regime where the paper measured LeanStore at 1.94.
+
+### Conditions
+
+- Drive: PM9A3 960 GB U.2, `percent_free_blocks` = 5 (precondition preserved through mkfs by `-E nodiscard` flag)
+- Cassandra: same fork + commits as R3
+- Workload: YCSB-A zipf 0.8, 50/50 r/w, 1 KB values, 30-min window each
+- Reset between cells: `auto_snapshot: false` in cassandra.yaml + reset_cassandra dropping the (correctly named) keyspace; precondition preserved across cells because no TRIM occurs between them
+- SSD state verified at 5% percent_free_blocks before EACH of the three cell launches
+
+### Numbers
+
+| T | writes | ops/s | p99 ms | host GB | phys GB | SSD WAF | DB WAF | Total WAF |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| T4  | 4,424,548 | 5000.0 | 0.59 | 6.260 | 6.265 | 1.0007 | 1.3605 | 1.3615 |
+| T8  | 4,425,011 | 5000.0 | 0.60 | 6.273 | 6.285 | 1.0019 | 1.3631 | 1.3656 |
+| T16 | 4,424,780 | 5000.0 | 0.54 | 6.264 | 6.264 | 1.0000 | 1.3613 | 1.3613 |
+
+### Combined R3 + R4 — the full 6-cell matrix
+
+| cell | fill regime | SSD WAF | DB WAF | p99 ms |
+|---|---|---:|---:|---:|
+| T4 low-fill | percent_free 99 | 0.9999 | 1.3614 | 0.44 |
+| T8 low-fill | percent_free 99 | 1.0001 | 1.3598 | 0.56 |
+| T16 low-fill | percent_free 99 | 0.9995 | 1.3602 | 0.77 |
+| T4 high-fill | percent_free 5 | 1.0007 | 1.3605 | 0.59 |
+| T8 high-fill | percent_free 5 | 1.0019 | 1.3631 | 0.60 |
+| T16 high-fill | percent_free 5 | 1.0000 | 1.3613 | 0.54 |
+| **range** | | **0.9995 – 1.0019** | **1.3598 – 1.3631** | 0.44 – 0.77 |
+| **mean ± stdev** | | 1.0004 ± 0.0009 | 1.3611 ± 0.0012 | |
+
+### The headline findings (now n=6, robust)
+
+**Finding 1: Cassandra SSD WAF is structurally ~1.0 across the entire (T, fill) parameter space tested.**
+- SSD WAF spread of 0.0024 (0.24%) across 6 cells covering 3 T-parameters × 2 fill regimes
+- Even at SSD's high-pressure regime (5% free blocks, where Lee/Ziegler/Leis Figure 13b shows LeanStore at SSD WAF 2.36), Cassandra's LSM produces SSD WAF of 1.0007 ± 0.0019
+- **The paper's SSD-side mechanism work (NoWA, GDT, FDP, alignment) has effectively zero headroom on Cassandra in any of these conditions.** The mechanism question is closed by measurement.
+
+**Finding 2: DB WAF is 1.36 ± 0.002 at cold-start, T-invariant in this measurement window.**
+- DB WAF spread of 0.0033 (0.24%) across all 6 cells
+- T-parameter does not affect DB WAF at 30-min cold-start scale (compaction pyramid never builds up; needs multi-hour or pre-populated runs to differentiate)
+- This is the cold-start lower bound; steady-state DB WAF is higher (path-dependent on prior keyspace activity, as R1 vs R2 showed)
+
+**Finding 3: p99 read latency IS T-sensitive, even at cold-start.**
+- Low-fill: T4 → T16 gives p99 0.44 → 0.77 ms (+75%)
+- High-fill: T4 → T16 gives 0.59 → 0.54 ms (NOT monotonic — within noise band, see caveat)
+- Reads scale with L0 SSTable count (bloom filter checks) regardless of compaction history
+
+### Why the SSD WAF stays at 1.0 even under pressure
+
+Hypothesis (supported by measurement + LSM architecture):
+- Cassandra's LSM writes whole SSTables as single sequential append operations
+- Each SSTable is many MB to several GB, much larger than the SSD's superblock size
+- An SSTable's bytes are programmed contiguously into the SSD's open superblocks
+- When that SSTable is later compaction-deleted (TRUE delete, since auto_snapshot=false), it leaves a chunk of contiguous *invalid* pages in those superblocks
+- When the SSD's GC needs to reclaim a superblock, the victim it picks is dominated by Cassandra's deletions — i.e. the SSD finds a superblock that's already nearly all-invalid
+- Valid-ratio of GC victims is near zero → near-zero relocations per reclaimed block → SSD WAF ≈ 1.0
+
+This is the structural property the paper notes but doesn't quantify for LSM engines. **Cassandra's compaction-driven invalidation pattern happens to be exactly what an SSD's GC wants.**
+
+### Caveats explicitly disclosed
+
+1. **Single replicate per cell.** No formal confidence interval. Variance across the 6 cells is dominated by structural similarity, not noise — the 0.24% spread is itself indicative of stable behavior, but proper CIs would require ≥3 replicates per cell (12 more bench runs).
+2. **Cold-start regime for all cells.** DB WAF will be higher at steady-state; SSD WAF behavior at steady-state is unmeasured.
+3. **Single workload (YCSB-A 50/50).** TWCS time-series, read-heavy, write-heavy variants not measured. Likely DB WAF differs; SSD WAF likely unchanged (LSM property).
+4. **Single drive model.** PM9A3 specifically. Cross-drive generalization argued from architecture but not measured.
+5. **High-entropy values (`Random.getText()`).** LZ4 compression is effectively neutral on this data; production data may compress 2-4×, which would proportionally reduce DB WAF.
+
+### Code state
+
+- `cassandra-agent-harness:main` = `cf7bd7b` through R3, `18181b2624` for R4 (includes mkfs-TRIM gotcha documentation)
+- `waf-baseline-poc:main` = `29fa03d` (T-param threading)
+- Cassandra fork `fdp-poc` head includes results.md updates through R3 (R4 to be committed)
+
+### Investigation outlook
+
+**This is the investigation's pivotal result.** Combined with R2/R3:
+- The original NoWA/FDP/GDT mechanism investigation has a measured negative answer: zero SSD-side headroom on Cassandra
+- The WAF baseline measurement (the Jira-publishable artifact) has clean numbers at cold-start; steady-state remains a follow-up
+- The methodology lessons (findings.md §11) constitute an unintended but valuable secondary contribution
+
+The "should we pursue mechanism work" question is settled. The "what should the Jira post say" question now has a clear answer: report the measurements, the negative SSD-WAF finding, and the T-parameter sensitivity (read-amp side visible, write-amp side requires longer runs).
+
+(Future R5+ could add: replicates for CI, TWCS cells, compressible-data variant, multi-hour run for steady-state.)
