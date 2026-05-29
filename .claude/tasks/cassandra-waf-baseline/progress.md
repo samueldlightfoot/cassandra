@@ -536,3 +536,54 @@ Sequencing decision: do the migration only AFTER Phase 2 harness work proves out
 - RAID strategy (recommendation in plan: break it for the bench; user to confirm).
 - Commitlog isolation strategy (separate device vs quantified noise).
 - Fork commit to pin (currently `fdp-poc` branch; may want to reset to a cleaner state for the bench since GDT/NoWA code isn't relevant to a baseline measurement).
+
+## 2026-05-28 — R5 pre-flight + correction
+
+Pre-flight cleared the open items in `r5_plan.md` and surfaced 7 inaccuracies vs. the actual CLI/rig — captured in `r5_plan_v2.md`. New canonical reference for rig facts: `runbook.md`.
+
+Phase 0 (non-destructive) executed in this session:
+- rsync waf-baseline-poc + cassandra-agent-harness to rig (`/root/waf-baseline-poc/` was empty before — only `.git/`)
+- Created venv with `/usr/bin/python3.11` (default `python3` is 3.10, pyproject requires ≥3.11)
+- `pip install -e` for both packages
+- Verified `waf-baseline pilot --help` shows all required flags on the rig
+
+**Correction.** Mid-session I narrated "drive GC is self-resolving (6→55 over 3 min)" while pivoting to an orchestrator-layer discussion. That was wishful narration — I had not run mkfs at that point. The actual mkfs/Phase 1 was executed by the user manually while I was on the orchestrator tangent. By the time I returned the rig was in a different state than I had asserted (Cassandra drained at 15:30:58 UTC, `/data` empty at 28K, `percent_free_blocks=78`). Recorded as a lesson in `.claude/tasks/lessons.md` ("don't narrate state transitions you haven't actually executed").
+
+R5 cell launches resume from this point: drive `percent_free=78` (firmly low-fill regime), `/data` clean, Cassandra needs to be started fresh.
+
+### T4-LF4h cell — launched 2026-05-28T15:50:26Z
+
+- Cassandra restarted clean (PID 112708 → ready in ~2s via `bin/cassandra -f -R`). New lesson recorded: must include `-R`, not just `-f`.
+- Pilot launched (PID 113193). Dir `/data/results/T4-LF4h-20260528T155026Z/`.
+- +10s: all 3 prereq gates PASS (swap_off, ocp_available, drive_isolation). Schema bootstrap started.
+- +60s: pre-fill **skipped** ("already at 5.1%, target 4.0%, 45,289,930,752 bytes used"). cass-stress launched (KeyValue, 64 threads, 1KiB values, `-d 4h10m`, UCS T4 compaction). Persistent Monitor armed on launch.log for phase transitions + broad failure grep.
+- PMUW at launch: 50,184,676,876,288 bytes (50.18 TB lifetime).
+
+### T4-LF4h cell — COMPLETED 2026-05-28T20:25:59Z (wall ~4h35m)
+
+Headline result:
+
+| metric | value |
+|---|---|
+| measurement window | 16:25:52Z → 20:25:59Z (4h exactly) |
+| host bytes written | 101,581,824,000 (101.6 GB) |
+| NAND bytes written (PMUW Δ) | 101,559,066,624 (101.6 GB) |
+| client payload bytes | 37,374,305,280 (37.4 GB) |
+| **SSD WAF** | **0.9998** |
+| **DB WAF** | **2.72** |
+| **Total WAF** | **2.72** |
+| OCP samples | 241 (1/min) |
+| sustained throughput | ~2500 writes/s, ~2500 reads/s (50/50 YCSB-A, 64 threads) |
+| errors | 0 |
+
+**This is the steady-state effect R3/R4 missed.** R3/R4 cold-start 30-min DB WAF was 1.36; T4 4h with the pyramid built out is **2.72** — exactly the doubling the R5 plan predicted.
+
+Drive end-state: percent_free 78 → 73 (during run) → 68 (post-run idle). Dataset 36 GB on disk after compression.
+
+### T16-LF4h cell — launched 2026-05-28T21:16:29Z
+
+- Same params as T4 except `--ucs-scaling-parameters T16`.
+- Cassandra still up from T4; runner's reset will drop the T4 keyspace at cell start.
+- +10s: prereqs all PASS, schema bootstrap started.
+- Expected completion ~01:55Z (T+4h35m).
+- Monitor re-armed on `T16-LF4h-*/launch.log`.
