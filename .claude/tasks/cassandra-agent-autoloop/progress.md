@@ -14,6 +14,56 @@
 - No code changes yet. Awaiting user sign-off on the plan before phase
   A implementation starts.
 
+### 2026-05-29 (late) — Phase B (preflight gatekeeper) landed
+
+Implementation: harness commit (next; staged locally).
+
+Files:
+- `src/cassandra_agent_harness/prereqs/preflight.py` (~370 LoC)
+- `src/cassandra_agent_harness/cli.py` (`cah preflight` subcommand)
+- `tests/prereqs/test_preflight.py` (31 tests)
+- `tests/test_cli.py` (+3 tests)
+
+Design choices worth remembering:
+
+- **`PreflightCheck` wraps the existing `Check = Callable[[], CheckResult]`
+  callable rather than redefining it.** Provenance metadata
+  (`derived_from_memory` slug, `severity`) lives on the wrapper. Means
+  every existing check in `prereqs/checks.py` can be lifted into a
+  profile by adding a one-line `PreflightCheck(...)` shim.
+- **`run_preflight` is defensive.** Catches `Exception` from check
+  callables and turns it into a failing `CheckResult`; never raises.
+  The whole point of preflight is to refuse launch with a clear
+  reason — a check that itself crashes can't escape that contract.
+- **`check_drive_regime` searches the OCP snapshot dict for any of
+  several candidate keys.** nvme-cli 2.x with the OCP plugin emits
+  `"Percent free blocks": N`; the raw-binary fallback in the harness's
+  own OCP parser doesn't expose this field at all. The check reports
+  unparseable with a clear remediation pointing at nvme-cli 2.x
+  install — better than silently passing on a snapshot that's missing
+  the field.
+- **YAML config schema mirrors what `runbook.md` already documents.**
+  `PreflightConfig.from_yaml` takes `cassandra_home`, `cassandra_yaml`,
+  `cassandra_jar`, `drive_serial`, `data_mount`, `cli_argv`,
+  `required_cli_flags`, `expected_classes_in_jar`. No fancy schema
+  validation — just `KeyError` on missing fields and `ValueError` on
+  non-mapping top-level. The CLI exits 1 on either.
+- **Two memories deliberately deferred** (with rationale in the plan):
+  - `feedback_rsync_before_rig_launch` — needs workstation-side mtime
+    comparison; not feasible from a rig-side preflight.
+  - `feedback_cassandra_easy_stress_keyspace` — workload-spec concern,
+    nothing to check against rig state. `check_cli_recognizes_flags`
+    covers the analogous "CLI knows what we mean" risk.
+
+End-to-end smoke validated the right thing: against a tmp config on
+macOS, the 3 Linux-only checks (swap, OCP, drive-isolation) refuse with
+clear `how_to_fix` strings while the 3 portable checks (auto_snapshot,
+jar-class, CLI flags) pass. Exit code 1 propagates.
+
+Library suite: 247 → 281 passing. Ruff clean.
+
+Next: Phase C (deterministic result reviewer) or pause for review.
+
 ### 2026-05-29 (afternoon) — Phase A closed against real R5 logs
 
 R5 T16 finished (01:52Z, DB WAF 1.74, −36% vs T4). Pulled both

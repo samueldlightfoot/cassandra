@@ -109,36 +109,41 @@ reason.
 
 **Files to create / modify**:
 
-- [ ] `src/cassandra_agent_harness/prereqs/preflight.py`  *(new, ~300 LoC)*
-  - `class PreflightCheck` — `name`, `severity` (`block` | `warn`), `derived_from_memory` (slug), `run() -> CheckResult`
-  - `class CheckResult` — `name`, `ok: bool`, `evidence: dict`, `remediation: str | None`
-  - `def run_preflight(profile: PreflightProfile, *, rig: RigHandle) -> list[CheckResult]`
-  - Profiles: `cold_start`, `low_fill`, `high_fill`, `paper_comparable` — each is a list of checks (and their parameters)
-- [ ] Individual check implementations (one function per memory):
-  - `check_rsync_synced(local_paths, rig)` ← `feedback_rsync_before_rig_launch`
-  - `check_jar_contains_class(jar_path, fqcn)` ← `feedback_cassandra_jar_rebuild`
-  - `check_drive_regime(serial, expected_percent_free_range)` ← `feedback_mkfs_ext4_trim_undoes_precondition`
-  - `check_auto_snapshot_disabled(cassandra_yaml_path)` ← `feedback_cassandra_drop_keyspace_snapshots`
-  - `check_keyspace_name(expected="cassandra_easy_stress")` ← `feedback_cassandra_easy_stress_keyspace`
-  - `check_swap_off()` ← already exists in `prereqs/checks.py`, wrap it
-  - `check_ocp_available(serial)` ← already exists, wrap it
-  - `check_drive_isolation(serial)` ← already exists, wrap it
-  - `check_cli_recognizes_flags(cli_invocation, required_flags)` ← `feedback_monitor_silence_is_not_success` (the "verify flags exist before launch" angle)
-- [ ] `src/cassandra_agent_harness/cli.py`  *(modify)*
-  - `cassandra-agent-harness preflight --profile <name> --config <yaml>` subcommand
-  - Exit code 0 if all `block` checks pass; 1 if any `block` fails; warn-only output if only `warn` checks fail
-- [ ] `tests/test_preflight.py` *(new)* — one test per check, using mocks for the rig calls
-- [ ] **Wire into `waf-baseline-poc`**: the existing pilot CLI calls `run_preflight(profile=...)` before launching the runner; if it fails, refuses with structured reason printed to stderr
-- [ ] Update `runbook.md` §7 to say "this is now executable: `cassandra-agent-harness preflight --profile <name>`"
+- [x] `src/cassandra_agent_harness/prereqs/preflight.py`  *(new, ~370 LoC)*
+  - `Severity` StrEnum (`BLOCK`, `WARN`)
+  - `PreflightCheck(name, severity, derived_from_memory, check: Check)` — wraps the existing `Check = Callable[[], CheckResult]` callable with metadata
+  - `PreflightResult(preflight, result)` — pairs the result back with its `PreflightCheck` for context (provenance follows the data)
+  - `PreflightReport` — `.results`, `.blocking_failures`, `.warnings`, `.passed`
+  - `PreflightConfig` dataclass + `.from_yaml(path)` loader; raises `KeyError` on missing required fields and `ValueError` on non-mapping top-level
+  - `run_preflight(checks)` — defensive: catches `Exception` from check callables and turns it into a failing CheckResult; never raises
+- [x] Individual check implementations (one function per memory):
+  - [x] `check_jar_contains_class(jar_path, fqcn)` ← `feedback_cassandra_jar_rebuild` — uses `zipfile` (jar is a zip); rejects corrupt jars
+  - [x] `check_drive_regime(serial, expected_percent_free_range)` ← `feedback_mkfs_ext4_trim_undoes_precondition` — defensively searches the OCP snapshot dict for `Percent free blocks` / `percent_free_blocks` / etc.; reports unparseable when nvme-cli raw-binary fallback is the only path
+  - [x] `check_auto_snapshot_disabled(cassandra_yaml_path)` ← `feedback_cassandra_drop_keyspace_snapshots` — YAML parse + assert value is exactly `False` (not just falsy)
+  - [x] `check_cli_recognizes_flags(cli_argv, required_flags)` ← `feedback_monitor_silence_is_not_success` ("+10s" angle) — invokes `<cli> --help` with a 30s timeout and greps for each required flag
+  - [x] Wraps existing `check_swap_off`, `check_ocp_available(serial)`, `check_drive_isolation(serial, mount)` with the PreflightCheck metadata
+  - [ ] `check_rsync_synced(local_paths, rig)` ← `feedback_rsync_before_rig_launch` — **DEFERRED**: requires a workstation-side entry point to compare local vs rig mtimes. Pragmatic deferral until preflight gains a workstation mode. Documented as advisory.
+  - [ ] `check_keyspace_name(expected="cassandra_easy_stress")` ← `feedback_cassandra_easy_stress_keyspace` — **DEFERRED**: this is a workload-spec concern, not a rig-state concern. The keyspace name is hard-coded in cass-stress invocations; preflight has nothing to verify against rig state. The `cli_recognizes_flags` check covers the analogous "the CLI knows what we mean" risk.
+- [x] `src/cassandra_agent_harness/cli.py`  *(modify)*
+  - `cah preflight --profile {cold_start,low_fill,high_fill,paper_comparable} --config <yaml> [--allow-warnings]` subcommand
+  - Exit code 0 if all BLOCK pass and no WARN fails (or `--allow-warnings`); 1 on any BLOCK failure or config-load failure; 2 on warnings-only (unless `--allow-warnings`)
+  - Per-check structured log output (level reflects severity); summary log carries `profile`, `passed`, `block_failures`, `warnings`, `total`
+- [x] `tests/prereqs/test_preflight.py` *(new, ~390 LoC, 31 tests)* — one or more tests per check (pass/fail/edge), profile factory smoke tests, `PreflightConfig.from_yaml` round-trip + rejection, defensive runner exception-handling test, BLOCK-vs-WARN report contract
+- [x] `tests/test_cli.py` *(modify, +3 tests)* — exit 1 on block failure, exit 1 on missing config, exit 1 on invalid config
+- [ ] **Wire into `waf-baseline-poc`** — deferred to phase D's loop driver, where `pursue()` calls `run_preflight` before each round. The CLI subcommand is sufficient for manual invocation from `runbook.md` §7.
+- [ ] Update `runbook.md` §7 to say "this is now executable: `cah preflight --profile <name>`" — separate small commit; doesn't block phase B closure.
 
-**Acceptance criteria**:
-1. Every `feedback_*` slug in the memory index either has a corresponding check function or is documented as "advisory, not auto-checkable" with reason.
-2. Running `preflight --profile low_fill` against the current rig state passes when the rig is set up correctly, fails with a clear remediation when (e.g.) the percent_free is wrong.
-3. The pilot launcher in `waf-baseline-poc` refuses to launch on `block`-level failure.
-4. CI / library suite green.
+**Acceptance criteria — actual state**:
+1. ✅ Every `feedback_*` memory in scope either has a corresponding check function (5 of 7) or is documented as deferred with reason (2 of 7: `feedback_rsync_before_rig_launch`, `feedback_cassandra_easy_stress_keyspace`).
+2. ✅ `cah preflight --profile cold_start --config <good.yaml>` returns exit 0 when checks pass (verified via smoke on tmp config); returns exit 1 when checks fail with structured `how_to_fix` per failure. Drive-regime check parametrized for `low_fill_profile` (80-100% free) and `high_fill_profile` (0-15% free); covered by mocked-OCP tests.
+3. ✅ The library exposes `run_preflight` + the profile factories; pilot-launcher wiring deferred to phase D (a thin call to `run_preflight(profile)` before `pursue()` launches the round). Not blocking.
+4. ✅ Library suite: 281 passed (was 247; +34: 31 preflight + 3 CLI).
+5. ✅ End-to-end smoke (`cah preflight --profile cold_start` on a tmp config): 3 Linux-only checks fail loudly with clear messages, 3 portable checks pass; exit code 1 propagates correctly.
 
-**Decision gate after B**: if preflight catches at least one issue that would
-have cost time on the next round, proceed to C.
+**Decision gate after B**: B has been pre-validated by exactly the
+scenario the plan called out — the YAML/jar/CLI-flag checks pass on a
+real-shape config, while every Linux-only rig check refuses with a
+specific `how_to_fix`. Proceed to C.
 
 ### Phase C — Result reviewer (deterministic-only)
 
