@@ -14,6 +14,54 @@
 - No code changes yet. Awaiting user sign-off on the plan before phase
   A implementation starts.
 
+### 2026-05-29 — Phase C (deterministic result reviewer) landed
+
+Implementation: harness commit (next; staged locally).
+
+Files:
+- `src/cassandra_agent_harness/analysis/__init__.py` (new, re-exports)
+- `src/cassandra_agent_harness/analysis/review.py` (new, ~480 LoC)
+- `src/cassandra_agent_harness/cli.py` (`cah review` subcommand)
+- `tests/analysis/__init__.py` + `tests/analysis/test_review.py` (20 tests against real R5 fixtures + synthetic edge cases)
+- `tests/test_cli.py` (+3 review subcommand tests)
+- `tests/fixtures/runs/{T4,T16}-LF4h/.../cell.json` + `summary.json` rsync'd from rig as committed fixtures
+
+Design choices worth remembering:
+
+- **Deterministic-only.** Findings prose + investigation outlook are
+  rendered as `<!-- LLM, phase D -->` stubs. The phase C reviewer must
+  not fluently describe what a number "means" — that risks
+  fluent-but-wrong interpretations getting baked into the public Jira
+  writeup. Phase D's LLM call fills the stubs.
+- **f-strings, not Jinja.** One template, one renderer function.
+  Jinja would add a dependency and a templates directory for a single
+  template; the readability cost of f-string concat is small enough
+  to not pay it.
+- **Append-only safety by default.** CLI writes `review_draft.md`
+  next to the run; `--append-to` appends and never rewrites. The test
+  `test_review_command_appends_only_does_not_rewrite` verifies prior
+  content of an existing `results.md` is preserved verbatim.
+- **Multi-run round shape.** `review_round([T4, T16], round_id="R5")`
+  matches the actual investigation pattern — R5 was two run_dirs
+  treated as one round. `review_run(single)` is a thin wrapper.
+- **Real-R5 fixtures are the strongest acceptance signal.** The
+  rendered `## R5` stanza matches the human-written numbers to 4
+  decimal places. This is exactly what the
+  `feedback_fixture_test_against_real_output` lesson from Phase A
+  predicts: synthetic-only tests would have validated a parser
+  against my mental model of `cell.json`, not the real shape.
+
+End-to-end smoke output (`cah review T4-LF4h T16-LF4h --round-id R5
+--paper-ssd-waf-range 0.9,1.5 --paper-db-waf-range 1.0,4.0`):
+6 cross-checks all pass, single-replicate caveat surfaces correctly,
+prose stubs present.
+
+Library suite: 281 → 304 passing. Ruff clean on touched files.
+
+Next: Phase D (goal-driven loop) — the actual LLM-led piece, where
+agent/goals.py + agent/progress.py + agent/round_controller.py wire
+the watcher (A) + preflight (B) + reviewer (C) into pursue(goal).
+
 ### 2026-05-29 (late) — Phase B (preflight gatekeeper) landed
 
 Implementation: harness commit (next; staged locally).

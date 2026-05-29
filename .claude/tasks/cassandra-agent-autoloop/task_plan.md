@@ -155,30 +155,39 @@ templated with computed numbers slotted in.
 
 **Files to create / modify**:
 
-- [ ] `src/cassandra_agent_harness/analysis/__init__.py` *(new)*
-- [ ] `src/cassandra_agent_harness/analysis/review.py`  *(new, ~400 LoC)*
-  - `class CellReview` — parsed `cell.json` + computed fields (Δ PMUW, headline SSD/DB/Total WAF, p99, throughput, regime tag)
-  - `class CrossCheck` — name, ok, evidence
-  - Cross-check implementations:
-    - `check_workload_counts_consistent(cell)` ← `feedback_cross_check_workload_counts` (≥3 independent signals)
-    - `check_csv_not_authoritative(cell)` ← `feedback_cass_stress_csv_truncated` (prefer stdout summary)
-    - `check_paper_comparable_in_range(cell)` ← compare to PVLDB Table 1 ranges from `findings.md` §8
-    - `check_variance_vs_replicates(cells)` — if N replicates, std/mean < threshold
-  - `def review_run(run_dir, history_dir) -> RunReview`
-  - `def render_results_section(run_review) -> str` — emits the `## Rn` markdown stanza using a Jinja template (or just an f-string)
-- [ ] `src/cassandra_agent_harness/analysis/templates/results_rn.md.j2`  *(new)* — mirrors the existing R1–R4 sections in `results.md`
-- [ ] `src/cassandra_agent_harness/cli.py`  *(modify)*
-  - `cassandra-agent-harness review <run_dir> [--history <results_md>] [--append-to <results_md>]` subcommand
-- [ ] `tests/test_analysis_review.py` *(new)* — feed real R3 + R4 cell.json fixtures, assert the rendered stanza matches the on-disk one to within whitespace
-- [ ] **Carefully**: do not silently overwrite `results.md`. The CLI writes a draft to `<run_dir>/review_draft.md` by default; only with `--append-to` does it touch `results.md`, and even then it appends, never rewrites.
+- [x] `src/cassandra_agent_harness/analysis/__init__.py` *(new)* — re-exports the public API.
+- [x] `src/cassandra_agent_harness/analysis/review.py`  *(new, ~480 LoC)*
+  - Data model: `CellWaf`, `WorkloadSummary`, `CellReview`, `CrossCheck`, `RunReview` (all frozen dataclasses except RunReview)
+  - Parsers: `parse_cell(cell_json_path)`, `parse_run(run_dir)` — handles the real `cell.json` shape (`measurement.waf`, `measurement_workload_summary`, `cell` metadata block)
+  - Cross-check implementations (4 of the 4 planned):
+    - `check_workload_counts_consistent(cell, tolerance=0.01)` ← `feedback_cross_check_workload_counts` (BLOCK; writes+reads vs total)
+    - `check_csv_not_authoritative(cell)` ← `feedback_cass_stress_csv_truncated` (WARN; regression guard that writes_count came from stdout path)
+    - `check_paper_comparable_range(cell, ssd_waf_range, db_waf_range)` ← compare to caller-supplied PVLDB Table 1 ranges (WARN; out-of-range is informative not blocking)
+    - `check_inter_replicate_variance(cells, cv_threshold=0.10)` — std/mean across replicates of same `(workload, fill, ucs_t)` group (BLOCK at n≥2; informational at n=1)
+  - `review_run(run_dir)` / `review_round(run_dirs, round_id=...)` — bundles parsing + cross-checks into a `RunReview`
+  - `render_round_section(review, title=...)` — emits the `## Rn` markdown stanza using f-strings (Jinja considered overkill for one template). **Findings prose and investigation outlook are rendered as `<!-- LLM, phase D -->` placeholders** — the deterministic reviewer must not invent prose interpretations.
+- [x] `src/cassandra_agent_harness/cli.py`  *(modify)*
+  - `cah review <run_dir> [<run_dir>...] [--round-id Rn] [--title T] [--paper-ssd-waf-range lo,hi] [--paper-db-waf-range lo,hi] [--draft-file PATH] [--append-to PATH]` subcommand
+  - **Append-only safety**: default writes `<first-run_dir>/review_draft.md`; `--append-to` appends and never rewrites (the file's prior content is preserved verbatim).
+  - Exit code 0 on all-cross-checks-pass; 1 on any BLOCK failure or missing input.
+- [x] `tests/analysis/test_review.py` *(new)* — 20 tests:
+  - Real-R5 parsing of T4 + T16 cell.json with expected headline numbers
+  - Cross-checks pass against real R5 data (writes+reads exactly equals total on both cells; SSD WAF and DB WAF in paper-comparable range)
+  - Synthetic edge cases: divergent counts, zero total, zero writes, out-of-range paper comparable, single vs multi replicate variance
+  - Renderer: verifies `## R5` header, both cell IDs, real headline numbers, cross-check table, LLM stub markers
+- [x] `tests/test_cli.py` *(modify, +3 tests)* — review subcommand: writes draft for real R5 fixture; append-only safety against existing results.md; exit 1 on missing run_dir.
 
-**Acceptance criteria**:
-1. Fed the R3 run dir, produces a `## R3` stanza materially equivalent to the human-written one (numbers + cross-check table; allow stylistic difference in prose).
-2. Cross-check failures surface clearly (e.g. if workload counts diverge by > 5% across signals, the stanza includes a `### Caveats` block flagging it).
-3. The CLI never overwrites `results.md` without `--append-to`.
+**Acceptance criteria — actual state**:
+1. ✅ Fed the R5 T4+T16 run dirs, produces a `## R5` stanza whose numbers table matches the human-written R5 section to 4 decimal places (verified end-to-end). Cross-check rows + caveats are auto-generated; findings and outlook are deliberately `<!-- LLM, phase D -->` stubs.
+2. ✅ Cross-check failures surface clearly in the rendered Caveats section. The test `test_render_round_section_includes_failed_cross_checks_in_caveats` validates this with a deliberately-failing paper-range check.
+3. ✅ CLI never overwrites `results.md` without `--append-to`. The `test_review_command_appends_only_does_not_rewrite` test verifies the prior content of an existing `results.md` is preserved byte-for-byte and the new section is concatenated after it.
+4. ✅ Library suite: 304 passed (was 281; +23: 20 review + 3 CLI).
+5. ✅ End-to-end smoke: `cah review T4-LF4h T16-LF4h --round-id R5 --paper-ssd-waf-range 0.9,1.5 --paper-db-waf-range 1.0,4.0` produces a `## R5` stanza with 6 cross-checks all green, 0 blocking failures, single-replicate caveat surfaced correctly.
 
-**Decision gate after C**: if the reviewer-rendered R3/R4 stanzas pass a
-side-by-side reading with the originals, proceed to D.
+**Decision gate after C**: the reviewer-rendered R5 stanza matches the
+human-written one numerically. The deliberate stubs for findings +
+outlook are the right semantics (phase C reviewer must not invent
+prose interpretations). Proceed to D.
 
 ### Phase D — Goal-driven loop (LLM at branch points only, constrained)
 
