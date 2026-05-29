@@ -587,3 +587,23 @@ Drive end-state: percent_free 78 → 73 (during run) → 68 (post-run idle). Dat
 - +10s: prereqs all PASS, schema bootstrap started.
 - Expected completion ~01:55Z (T+4h35m).
 - Monitor re-armed on `T16-LF4h-*/launch.log`.
+
+### T16-LF4h cell — COMPLETED 2026-05-29T01:52:05Z (wall ~4h35m)
+
+Headline result:
+
+| metric | value | vs T4 |
+|---|---|---|
+| measurement window | 21:51:58Z → 01:52:05Z (4h exactly) | same |
+| host bytes written | 65,033,216,000 (65.0 GB) | **−36%** |
+| NAND bytes written (PMUW Δ) | 65,024,237,568 (65.0 GB) | −36% |
+| client payload bytes | 37,367,217,680 (37.4 GB) | same |
+| **SSD WAF** | **0.9999** | same |
+| **DB WAF** | **1.74** | **−36%** |
+| **Total WAF** | **1.74** | −36% |
+| OCP samples | 241 (1/min) | same |
+| errors | 0 | same |
+
+Prediction vs measured: estimated 1.9 (range 1.7–2.2). Actual 1.74 — bottom of range, ratio model wins.
+
+R5 investigation complete. results.md and summary.md updated with the two-cell steady-state results + the cold-start vs steady-state factor (1.36 → 2.72 at T4 = predicted doubling). Monitor stopped. Cassandra still up on rig (T16 keyspace ~24 GB on disk, available for ad-hoc inspection).

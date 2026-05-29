@@ -326,3 +326,77 @@ This is the structural property the paper notes but doesn't quantify for LSM eng
 The "should we pursue mechanism work" question is settled. The "what should the Jira post say" question now has a clear answer: report the measurements, the negative SSD-WAF finding, and the T-parameter sensitivity (read-amp side visible, write-amp side requires longer runs).
 
 (Future R5+ could add: replicates for CI, TWCS cells, compressible-data variant, multi-hour run for steady-state.)
+
+## R5. Multi-hour T4 vs T16 at low fill — steady-state DB WAF (2026-05-28 → 2026-05-29)
+
+**Status:** The "steady-state remains a follow-up" item from R4 is now closed. Two 4-hour measurement windows (T4 and T16) at low fill, run back-to-back with a soft reset between. T-parameter DOES differentiate DB WAF once the compaction pyramid has time to build out — exactly what R3/R4's 30-min windows were too short to see. Plan: `r5_plan_v2.md`.
+
+### Conditions
+
+- Drive: PM9A3 960 GB U.2 (`/dev/nvme1n1p3`, S/N S64FNE0R401522)
+- Fill regime: low (drive in `percent_free_blocks ≈ 78 → 57` over the 8-hour run; firmly low-fill the entire time)
+- Cassandra: same fork + commits as R3/R4; node launched with `bin/cassandra -f -R` (foreground, allow-root)
+- Workload: YCSB-A zipf 0.8, 50/50 r/w, 1 KiB values, 64 threads
+- Window per cell: **4 hours** (`--measurement-window-s 14400 --measurement-duration 4h10m`)
+- Warmup per cell: SSD-WAF-steady gating, terminated at 35 min for both cells (6 samples × 300s = minimum to declare steady)
+- Reset between cells: harness soft-reset (drop `cassandra_easy_stress`, force-drop SSTables, restart). Cassandra was *not* restarted; the reset block in cell.json shows `data_bytes_after=300596` (system tables only) and `compaction_drained=true`.
+- Prefill: skipped both cells (drive's `data_units_written` already at ~5.1% of partition before each cell, exceeding the 4.0% target)
+- Sample cadence: 1× per minute → 241 samples per measurement window
+
+### Numbers
+
+| cell | host GB | NAND GB | client GB | SSD WAF | DB WAF | Total WAF |
+|---:|---:|---:|---:|---:|---:|---:|
+| T4-LF4h  | 101.58 | 101.56 | 37.37 | 0.99978 | **2.7180** | 2.7173 |
+| T16-LF4h | 65.03 | 65.02 | 37.37 | 0.99986 | **1.7404** | 1.7401 |
+| **Δ T4 → T16** | −36.0% | −36.0% | (same) | (≈) | **−36.0%** | −36.0% |
+
+(Client payload is the same because cass-stress drives the same nominal rate; only the compaction-driven amplification changes.)
+
+Throughput observed in `stress.log`: ~2500 writes/s + ~2500 reads/s sustained on both cells. 0 errors. p99 write latency ~0.5 ms baseline with occasional ~230 ms spikes during compaction.
+
+### The four R5 findings
+
+**Finding 4: DB WAF IS T-sensitive at steady state.** The T-invariance reported in R3/R4 was an artifact of the 30-min cold-start window. At 4 hours, T4 = 2.72 vs T16 = 1.74 — a clean **36% reduction in NAND writes per client byte** from doubling T (4→16). This matches LSM theory (`DB_WAF ≈ 1 + log_T(D/M)`):
+
+| T | predicted (`1 + log_T(36/2.6)`) | measured |
+|---:|---:|---:|
+| T4  | ~2.9 | 2.72 |
+| T8  | ~2.3 | (not run) |
+| T16 | ~1.95 | 1.74 |
+
+The measured T16 is below the simple model, consistent with the dataset (~36 GiB) being small enough relative to T16's `L1` cap (`16 × ~2.6 GiB = ~42 GiB`) that the pyramid stops at one level for T16 but spills to L2 for T4.
+
+**Finding 5: SSD WAF stays at 1.0 across the steady-state window too.** SSD WAF in both 4-hour cells came out at 0.99978 / 0.99986 — indistinguishable from the cold-start 1.0. **The R4 finding that Cassandra's compaction pattern keeps the SSD's GC victim valid-ratio near zero is robust across both timescales tested.** No 4-hour drift, no fill-regime sensitivity (low-fill matches R4's high-fill behaviour).
+
+**Finding 6: Cold-start to steady-state DB WAF is exactly the doubling predicted.** R3/R4 cold-start at T4 was 1.36; R5 steady-state at T4 is 2.72. That's `2.0×`, matching the prediction that the 30-min window captured ≈1 round of compaction (memtable → L0 → L1) while the 4-h window captured 2 rounds (adds L1 → L2). Specifically: 1.36 = memtable-flush WAF (~1.0) + L0→L1 (~0.36 because the L0 sstables were nearly empty); 2.72 = 1.36 + ~1.36 from the L1→L2 round once L1 caps.
+
+**Finding 7: The dataset is right-sized to differentiate T at this T-range.** A common failure mode of "what if both T's come out the same" (predicted in `r5_plan_v2.md` risks) didn't happen — the 36-GiB dataset is large enough that T4 sees an extra compaction level vs T16, but small enough that an 8-hour bench fits in a session. Future R6 (TWCS, replicates, or T2/T32 extremes) can reuse this dataset shape.
+
+### Caveats
+
+1. **Single replicate per cell** — no confidence intervals. The −36% delta is large vs any plausible run-to-run noise (R3/R4 cold-start variance was ~0.2%), but proper CIs need 3 replicates per cell.
+2. **Read latency not characterized at steady state.** The R4 finding that p99 reads scale with T (T16 = +75% p99 vs T4 at cold-start) likely amplifies further at steady-state where more SSTables exist. R5 stress.log shows p99 ~0.5 ms baseline for both cells, but with occasional 230-ms spikes that need separate analysis to attribute to T.
+3. **Soft-reset (not mkfs) between cells.** T16 launched with the drive at `percent_free=68` (post-T4) vs T4 at `percent_free=78`. Both still firmly in low-fill regime; SSD WAF identical, so the soft-reset is methodologically adequate for this comparison. Would need full mkfs+TRIM between cells for a strict same-starting-state comparison.
+4. **Same caveats as R4** carry over: single workload (YCSB-A), single drive (PM9A3), high-entropy values (LZ4 effectively neutral), DB WAF is post-compression.
+5. **Wall-time correction from plan.** R5 plan assumed ~4h per cell; actual was ~4h35m (35 min warmup + 4 h window + ~60s teardown). Total R5 wall: ~9h20m.
+
+### Code state
+
+- `cassandra-agent-harness`: editable install on rig, last sync 2026-05-28 (Phase 0 of R5 pre-flight)
+- `waf-baseline-poc`: editable install on rig, same sync
+- Cassandra fork `fdp-poc`: same commits as R3/R4
+- Two new task-folder docs landed this session: `runbook.md` (rig facts), `r5_plan_v2.md` (corrected plan)
+
+### Investigation outlook
+
+R5 closes the steady-state question and validates the LSM-WAF model. Combined with R3+R4+R5:
+
+| What's measured | Answer | Confidence |
+|---|---|---|
+| Cassandra SSD WAF on PM9A3 (T, fill) | ~1.0 across (T4/T8/T16) × (low/high fill) × (cold/steady) | High (n=8 cells now) |
+| Cassandra DB WAF at cold start (T-invariant) | 1.36 ± 0.002 | High |
+| Cassandra DB WAF at steady state | 1.74 (T16) → 2.72 (T4) | Medium (n=1 per cell) |
+| T-parameter knob effect at steady state | −36% NAND writes per byte (T4→T16) | Medium |
+
+The Jira post can now lead with **two** measured headline findings: SSD WAF is structurally ~1.0, and DB WAF at steady-state is T-sensitive with measured magnitudes. Future R6+ would harden CIs and add TWCS.

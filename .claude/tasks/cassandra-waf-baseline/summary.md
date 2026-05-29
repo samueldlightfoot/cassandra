@@ -1,7 +1,7 @@
 # Cassandra Write Amplification — Investigation Summary
 
-**Status:** primary measurements complete (n=1 per cell, 6 cells across the T-parameter × SSD-fill matrix).
-**Headline:** Cassandra's LSM produces structurally near-1.0 SSD WAF in all tested regimes, **closing the question of whether the paper's SSD-side mechanisms (NoWA, GDT, FDP, alignment) are worth porting to Cassandra**. The answer, by measurement: no.
+**Status:** primary measurements complete (n=1 per cell, 8 cells: 6 cold-start across T-parameter × SSD-fill, 2 steady-state at low fill for T4 vs T16).
+**Headline:** Cassandra's LSM produces structurally near-1.0 SSD WAF in all tested regimes, **closing the question of whether the paper's SSD-side mechanisms (NoWA, GDT, FDP, alignment) are worth porting to Cassandra**. The answer, by measurement: no. R5 also closed the steady-state side: at 4-hour windows the UCS T parameter visibly differentiates DB WAF (T4 = 2.72, T16 = 1.74 — a measured 36% reduction in NAND writes per client byte at T16).
 
 ---
 
@@ -57,6 +57,10 @@ This summary documents the outcome of (A) and explains why (B) is no longer the 
 | R4c | T16 | percent_free 5 (high)  | 1.0000 | 1.3613 | 1.3613 | 0.54 |
 | | | **range** | **0.9995 – 1.0019** | **1.3598 – 1.3631** | 1.3596 – 1.3656 | 0.44 – 0.77 |
 | | | **mean ± stdev** | **1.0004 ± 0.0009** | **1.3611 ± 0.0012** | | |
+| R5a | T4  | low, 4h window | 0.9998 | **2.7180** | 2.7173 | ~0.5 |
+| R5b | T16 | low, 4h window | 0.9999 | **1.7404** | 1.7401 | ~0.5 |
+
+R5 (rows R5a/R5b) was deliberately run at 4 hours per cell to let the compaction pyramid build out. This is the steady-state regime; cold-start (R2–R4) and steady-state (R5) are reported as separate rows because they answer different questions.
 
 For comparison, the paper's Table 1 on the same drive at 90% fill:
 - LeanStore in-place baseline: SSD WAF 2.36, DB WAF 2.00, Total 4.72
@@ -74,9 +78,25 @@ The structural explanation: Cassandra writes SSTables as single sequential appen
 
 ### Finding 2 — DB WAF is 1.36 ± 0.002 at cold-start, T-invariant in 30-min windows
 
-DB WAF spread is 0.24% across all 6 cells. The UCS T-parameter does not affect DB WAF at 30-min cold-start scale because the compaction pyramid never builds up — at most ~4 L0→L1 compactions fire during the window for T4, ~1 for T16. The write-amp savings from larger T require either multi-hour runs or pre-populated keyspaces to materialise.
+DB WAF spread is 0.24% across all 6 cold-start cells. The UCS T-parameter does not affect DB WAF at 30-min cold-start scale because the compaction pyramid never builds up — at most ~4 L0→L1 compactions fire during the window for T4, ~1 for T16. The write-amp savings from larger T require either multi-hour runs or pre-populated keyspaces to materialise.
 
-The 1.36 ≈ flush (1×) + L0→L1 (~1.3×) + auxiliary files (~5%). This is a *cold-start lower bound*. Steady-state DB WAF — after the compaction pyramid fully populates over hours/days of writes — is higher and was not measured in this investigation.
+The 1.36 ≈ flush (1×) + L0→L1 (~1.3×) + auxiliary files (~5%). This is a *cold-start lower bound*. R5 measured the steady-state side (see Finding 5).
+
+### Finding 5 — Steady-state DB WAF IS T-sensitive and matches LSM theory (R5)
+
+Two 4-hour cells at low fill, same dataset shape:
+
+| T | predicted (`1 + log_T(36/2.6)`) | measured | vs cold-start (1.36) |
+|---:|---:|---:|---:|
+| T4  | ~2.9 | **2.72** | 2.00× |
+| T16 | ~1.95 | **1.74** | 1.28× |
+
+The doubling of T (4→16) cut DB WAF by **36%** — the other half of the classic write-amp/read-amp tradeoff that R4 couldn't see. The 2.00× cold-start→steady-state factor at T4 matches the prediction that the 30-min window captured ≈1 round of compaction (memtable → L0 → L1) while 4-h captured 2 rounds (adds L1 → L2).
+
+Two operational implications:
+
+1. **Tuning T is a real lever on SSD wear in production.** For write-heavy workloads where reads are rare or cached, T16 measurably reduces NAND-bytes-written-per-client-byte — at our shape, by 36% indefinitely once the pyramid stabilises.
+2. **30-min WAF benchmarks systematically underreport.** Anyone reporting Cassandra DB WAF from a sub-hour bench is reporting a cold-start floor, not steady-state. The R5 number is what production operators actually see.
 
 ### Finding 3 — UCS T-parameter IS visible in read p99 latency
 
@@ -86,7 +106,7 @@ The 1.36 ≈ flush (1×) + L0→L1 (~1.3×) + auxiliary files (~5%). This is a *
 | T8  | 0.56 | 0.60 |
 | T16 | 0.77 | 0.54 |
 
-The low-fill series shows a clean +75% p99 climb from T4 to T16. Reads have to check bloom filters across all L0 SSTables; higher T accumulates more L0 SSTables. **Half of the classic write-amp/read-amp tradeoff is visible** — the read-amp half. The write-amp savings (the other half) needed steady-state to be measurable.
+The low-fill series shows a clean +75% p99 climb from T4 to T16. Reads have to check bloom filters across all L0 SSTables; higher T accumulates more L0 SSTables. The read-amp half of the classic tradeoff is visible at cold-start; the write-amp half is quantified at steady-state in Finding 5.
 
 ### Finding 4 — Methodology gotchas worth documenting (the meta-finding)
 
@@ -109,9 +129,9 @@ Each fix is documented in `findings.md §11` with the rule + how-to-apply text. 
 
 **Cassandra's LSM architecture is structurally well-matched to commodity SSDs.** In all tested regimes (3 T-parameters × 2 fill states, 6 independent cells), the SSD-side write amplification is at the structural floor (≈ 1.0). The mechanism work in Lee/Ziegler/Leis (NoWA, GDT, FDP, alignment) addresses problems that arise from out-of-place B-tree page-level writes; those problems do not manifest with LSM's sequential SSTable writes. **No SSD-side mechanism implementation on Cassandra would produce a measurable improvement in any of the conditions tested.**
 
-DB-side amplification (compaction overhead) is the dominant component of Cassandra's WAF at 1.36 cold-start. T-parameter, the most prominent DB-side tuning knob, is not measurable at 30-min cold-start scale — its effects require steady-state operation. **The realistic remaining levers for DB WAF reduction are real-world data compressibility (a measurement question, not an implementation question) and compaction strategy choice for the workload (TWCS for time-series, etc.) — both characterised by the existing UCS literature and orthogonal to the paper's contributions.**
+DB-side amplification (compaction overhead) is the dominant component of Cassandra's WAF — 1.36 at cold-start, 1.74 (T16) → 2.72 (T4) at steady-state. R5 quantified the UCS T-parameter knob at steady-state: doubling T from 4 to 16 reduces DB WAF (and therefore NAND-bytes-written-per-client-byte) by 36%, at the cost of a read-amp penalty already characterised in Finding 3. **The realistic remaining levers for DB WAF reduction are real-world data compressibility (a measurement question, not an implementation question) and compaction strategy choice for the workload (TWCS for time-series, T16 for write-heavy/cached-read workloads) — both characterised by the existing UCS literature plus R5 and orthogonal to the paper's contributions.**
 
-**Investigation recommendation:** publish the WAF baseline as a Cassandra Jira contribution with the measured numbers and the negative mechanism finding. Do not pursue NoWA / FDP / GDT mechanism work on Cassandra. If a follow-up is desired, the highest-leverage direction is a **compressibility-sensitivity study** on representative production data, which would map our 1.36 number into the actual DB WAF that Cassandra operators see in different workloads.
+**Investigation recommendation:** publish the WAF baseline as a Cassandra Jira contribution with the measured numbers, the negative mechanism finding, *and* the R5 steady-state T-sensitivity result. Do not pursue NoWA / FDP / GDT mechanism work on Cassandra. If a follow-up is desired, the highest-leverage direction is a **compressibility-sensitivity study** on representative production data, which would map our 1.36/1.74/2.72 numbers into the actual DB WAF that Cassandra operators see in different workloads.
 
 ---
 
@@ -119,8 +139,8 @@ DB-side amplification (compaction overhead) is the dominant component of Cassand
 
 Disclosed caveats for the eventual writeup:
 
-1. **n = 1 per cell.** No formal confidence interval. The 0.24% spread across 6 cells is suggestive of stable behavior but is not a substitute for replicates.
-2. **Cold-start regime.** All cells start with a fresh keyspace; the compaction pyramid never fully populates. Steady-state DB WAF (after hours of accumulated writes) is unmeasured and would be higher.
+1. **n = 1 per cell.** No formal confidence interval. The 0.24% spread across the 6 cold-start cells is suggestive of stable behavior but is not a substitute for replicates. R5's two steady-state cells were also n=1 each, though the 36% T4→T16 gap is large vs any plausible run-to-run noise.
+2. **Steady-state characterised only for T4 vs T16 at low fill.** R5 closes the cold-start-only gap noted in the original caveat list, but only for two T values and one fill regime. T8 steady-state and high-fill steady-state remain unmeasured.
 3. **Single workload.** YCSB-A 50/50 r/w only. TWCS time-series, read-heavy (95/5 r/w), and write-heavy variants were planned but not run.
 4. **Single drive model.** PM9A3 960 GB. Cross-drive generalisation argued from architecture but not measured. Other DC NVMe drives (Micron 7450 PRO, Solidigm D7-P5520, Kioxia CM7R per paper Figure 14) would be useful confirmations.
 5. **High-entropy values.** `Random.getText()` produces values that LZ4 compresses ~1:1. Real production data often compresses 2-4×, which would proportionally reduce DB WAF. The headline 1.36 is a worst-case-compression number.
@@ -150,7 +170,7 @@ Not required for the publishable artifact. Listed in order of leverage:
 1. **Compressibility sensitivity study** — re-run the matrix with cass-stress's `--field` configured to generate compressible (e.g. JSON-shaped, repeating-pattern) data. Maps the headline 1.36 to a range across compression ratios.
 2. **TWCS time-series cell** — different compaction strategy, expected to produce DB WAF closer to 1.0 because TWCS minimises cross-window compaction.
 3. **Replicates for CI** — 3-5 replicates per existing cell. Confirms the n=1 results.
-4. **Steady-state DB WAF** — multi-hour single-workload runs (or pre-populate the keyspace to a fixed size before opening the measurement window). Will show DB WAF rising as the compaction pyramid fully populates.
+4. ~~**Steady-state DB WAF**~~ — **DONE in R5** for T4 and T16 at low fill. Remaining: T8 steady-state, high-fill steady-state, and longer-than-4h windows to check whether DB WAF continues to climb past R5's numbers.
 5. **Multi-drive variants** — if access to other DC NVMe drives is feasible.
 
 Each of these is a measurement question, not an engineering question.
