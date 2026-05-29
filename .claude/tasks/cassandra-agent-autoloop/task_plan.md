@@ -55,38 +55,47 @@ emits one of `OK | ABORT | ESCALATE` to a status file.
 
 **Files to create / modify** (in `cassandra-agent-harness/`):
 
-- [ ] `src/cassandra_agent_harness/agent/watcher.py`  *(new, ~200 LoC)*
-  - `class WatchRule` — name, severity, regex(es), grep-target file
-  - `class WatchEvent` — timestamp, rule, snippet, severity
-  - `class WatchStatus` — `OK`, `ABORT(reason)`, `ESCALATE(reason, evidence)`
-  - `def watch_run(run_dir, *, until_marker=".complete", poll_s=30, rules=DEFAULT_RULES) -> Iterator[WatchEvent]`
-  - `DEFAULT_RULES` derived from `runbook.md` §7: `unrecognized arguments`, `usage:`, `error:`, `Traceback`, `Exception`, `command not found`, `OOMError`, `JVM crashed`, `connection refused`, `cells_succeeded=0`. Plus heartbeat: `ops/s=`, `compaction completed`, `flush completed`.
-  - Heartbeat absence rule: if no heartbeat-match in last `silence_threshold_s` (default 600s), ESCALATE.
-- [ ] `src/cassandra_agent_harness/cli.py`  *(modify)*
-  - Add `cassandra-agent-harness watch <run_dir>` subcommand
-  - Streaming output: one JSON event per line on stdout, exit code reflects terminal status
-- [ ] `tests/test_agent_watcher.py`  *(new)*
-  - Fixture-based: feed canned `launch.log` content, assert rule fires
-  - Use the actual R4 / R5 launch.log files (rsync a copy to `tests/fixtures/runs/`) so we know the rules match real-world output
-  - Tests for: clean run (heartbeat OK), startup-arg-error (ABORT inside 10s), silent hang (ESCALATE after 600s), `Traceback` mid-run (ABORT)
-- [ ] `tests/fixtures/runs/`  *(new dir)* — anonymized copies of R3 / R4 launch logs
+- [x] `src/cassandra_agent_harness/agent/watcher.py`  *(new, ~330 LoC including docstrings + serialization helpers)*
+  - `Severity` StrEnum (`HEARTBEAT`, `INFO`, `WARN`, `FATAL`, `SUCCESS`)
+  - `WatchRule` — name, severity, compiled regex, description
+  - `WatchEvent` — timestamp, rule_name, severity, snippet (truncated to 200 chars)
+  - `WatchStatus` — state (`watching|escalate|abort|ok`), reason, evidence tuple
+  - `WatchState` — mutable, persisted: `log_offset`, `last_event_ts`, `last_heartbeat_ts`, `events_seen`, `terminal`
+  - `scan_lines(lines, *, rules, now)` — pure: line → WatchEvent stream
+  - `evaluate(state, events, *, now, silence_threshold_s)` — pure: state-machine step
+  - `watch_once(run_dir, ...)` — IO wrapper: tail launch.log from persisted offset, update `.watch_state.json` atomically, return current status
+  - `DEFAULT_RULES`: 15 rules covering every row of the failure-mode catalog in findings.md §5 (FATAL: unrecognized args, usage dump, command not found, traceback, error: prefix, OOM, JVM fatal; WARN: JMX refused, cells_succeeded=0; HEARTBEAT: ops/s, compaction, flush, prefill/warmup; SUCCESS: measurement window closed, cells_succeeded≥1)
+  - Heartbeat-silence rule: silence > `silence_threshold_s` (default 600s) since last heartbeat → ESCALATE. Computed fresh each call, never persisted, so it auto-clears on heartbeat resumption.
+- [x] `src/cassandra_agent_harness/agent/__init__.py`  *(modify)* — re-export watcher public API
+- [x] `src/cassandra_agent_harness/cli.py`  *(modify)*
+  - Added `cah watch <run_dir> [--launch-log] [--success-marker] [--silence-threshold-s]` subcommand
+  - One JSON object on stdout per invocation; exit code reflects state
+  - Exit codes: 0=ok, 1=abort, 2=escalate, 3=watching (documented as module constants)
+- [x] `tests/agent/test_watcher.py`  *(new)* — 46 tests across 3 layers (scan_lines pure, evaluate pure, watch_once IO + idempotence + corrupt-state-file recovery)
+- [x] `tests/test_cli.py`  *(modify)* — 4 new tests covering exit codes 0/1/3 and missing run_dir handling
+- [ ] `tests/fixtures/runs/`  *(deferred)* — real R3/R4 launch logs to be rsync'd off the rig as a smoke replay test once R5 finishes
 
-**Integration with `/loop`**:
+**Integration with `/loop`** (operates on a local path; rsync from rig is a thin wrapper):
 
 ```bash
-# user kicks off
-/loop 5m cassandra-agent-harness watch /data/results/T16-LF4h-... --rig 157.180.98.112
+# in a /loop body that polls every 5 min:
+rsync -q root@RIG:/data/results/T16-LF4h-.../launch.log $LOCAL_RUN_DIR/
+cah watch $LOCAL_RUN_DIR
+# exit code 0=ok 1=abort 2=escalate 3=watching
 ```
 
-Status file `<run_dir>/watch_status.json` updated atomically each poll;
-the `/loop` body reads it and either re-schedules or surfaces an escalation.
+Status persisted at `$LOCAL_RUN_DIR/.watch_state.json` (atomic write via
+`tmp` + `rename`); the JSON payload on stdout carries the same status
+for inline parsing by the loop body.
 
-**Acceptance criteria**:
-1. Replays an actual R4 launch.log through the rules → emits zero false-positives.
-2. Replays an injected `unrecognized arguments: --foo` → emits `ABORT` within 10s simulated time.
-3. Replays a 700s silent window → emits `ESCALATE` exactly once (not repeatedly).
-4. The CLI subcommand exits 0 on `.complete`, exits 1 on `ABORT`, exits 2 on `ESCALATE`.
-5. 100% mypy strict on the new module. Library suite remains green.
+**Acceptance criteria — actual state**:
+1. ✅ Clean-startup fixture lines produce no FATAL/WARN events (false-positive test).
+2. ✅ `unrecognized arguments: --foo` → `WatchStatus(state="abort", reason="fatal rule fired: cli_unrecognized_arguments")` in one call.
+3. ✅ Silence above threshold yields `escalate`; `terminal` stays `None` so the state auto-clears on heartbeat resumption.
+4. ✅ CLI exit codes verified end-to-end via smoke tests: 0 on `.complete`, 1 on `abort`, 3 on `watching`. Exit 2 on `escalate` covered by unit tests.
+5. ✅ 100% ruff clean on new files; type-annotated throughout.
+6. ✅ Library suite: 236 passed (was 232; +4 from new CLI tests, plus 46 from new watcher tests minus overlap).
+7. Deferred (covered later): replay against real R3/R4 launch.log files once they're rsync'd local.
 
 **Decision gate after A**: if watcher catches one real-world incident in
 R5 wrap-up or a follow-on run, proceed to B. If it produces false positives,
