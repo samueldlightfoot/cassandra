@@ -73,7 +73,7 @@ emits one of `OK | ABORT | ESCALATE` to a status file.
   - Exit codes: 0=ok, 1=abort, 2=escalate, 3=watching (documented as module constants)
 - [x] `tests/agent/test_watcher.py`  *(new)* — 46 tests across 3 layers (scan_lines pure, evaluate pure, watch_once IO + idempotence + corrupt-state-file recovery)
 - [x] `tests/test_cli.py`  *(modify)* — 4 new tests covering exit codes 0/1/3 and missing run_dir handling
-- [ ] `tests/fixtures/runs/`  *(deferred)* — real R3/R4 launch logs to be rsync'd off the rig as a smoke replay test once R5 finishes
+- [x] `tests/fixtures/runs/{T4-LF4h,T16-LF4h}/launch.log` — real R5 launch logs (T4 + T16, 4h cells, both `All 1 cells succeeded`) rsync'd from rig 2026-05-29 and committed as fixtures. Replay-tested via 6 new parametrized tests in `test_watcher.py` (no false positives; terminal `ok` driven by `all_cells_succeeded` rule; default silence threshold survives 4h cell).
 
 **Integration with `/loop`** (operates on a local path; rsync from rig is a thin wrapper):
 
@@ -94,8 +94,8 @@ for inline parsing by the loop body.
 3. ✅ Silence above threshold yields `escalate`; `terminal` stays `None` so the state auto-clears on heartbeat resumption.
 4. ✅ CLI exit codes verified end-to-end via smoke tests: 0 on `.complete`, 1 on `abort`, 3 on `watching`. Exit 2 on `escalate` covered by unit tests.
 5. ✅ 100% ruff clean on new files; type-annotated throughout.
-6. ✅ Library suite: 236 passed (was 232; +4 from new CLI tests, plus 46 from new watcher tests minus overlap).
-7. Deferred (covered later): replay against real R3/R4 launch.log files once they're rsync'd local.
+6. ✅ Library suite: 247 passed (was 232; watcher tests grew to 57 + 4 new CLI tests).
+7. ✅ R5 replay smoke (2026-05-29): both real T4 and T16 launch.logs replay-test green; CLI exits 0 with `all_cells_succeeded` evidence on both.
 
 **Decision gate after A**: if watcher catches one real-world incident in
 R5 wrap-up or a follow-on run, proceed to B. If it produces false positives,

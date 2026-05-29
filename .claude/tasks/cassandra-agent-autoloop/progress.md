@@ -14,6 +14,51 @@
 - No code changes yet. Awaiting user sign-off on the plan before phase
   A implementation starts.
 
+### 2026-05-29 (afternoon) — Phase A closed against real R5 logs
+
+R5 T16 finished (01:52Z, DB WAF 1.74, −36% vs T4). Pulled both
+launch.logs off the rig as fixtures in `tests/fixtures/runs/` and
+replayed the watcher against them — two real-world gaps exposed and
+fixed in the same loop:
+
+1. **Plain-English success message.** The wrapper's terminal line is
+   `All 1 cells succeeded` (English prose), not a JSON
+   `cells_succeeded: 1`. The original `cells_succeeded_nonzero` rule
+   only matched the JSON shape, so a fully-clean R5 cell would never
+   reach terminal `ok`. Added a new `all_cells_succeeded` SUCCESS rule
+   matching `r"All \d+ cells? succeeded"`.
+
+2. **launch.log is sparse by design.** A 4h cell only emits ~9 lines
+   to launch.log (transitions only); cass-stress per-tick output lives
+   in `stress.log`. The original 600s silence threshold would emit a
+   false-positive ESCALATE 10 minutes after prefill. Raised default
+   silence threshold from 600s → 18000s (5h, longer than max
+   measurement window). The CLI flag `--silence-threshold-s` now
+   documents the trade-off: lower it (e.g., 600s) when tailing
+   stress.log for tight monitoring.
+
+Also added four new HEARTBEAT rules to bridge the gaps between major
+transitions: `prereq_pass` (`[PASS]`), `bootstrap_schema`
+(bootstrapping schema / WAF baseline announce), `steady_state_reached`,
+and tightened `prefill_progress` to a word-boundary match so it
+doesn't fire on unrelated mentions of "prefill" in human prose.
+
+Tests added: 6 parametrized replay tests over both T4 and T16 cells
+(no false-positive FATAL/WARN; terminal `ok` driven by
+`all_cells_succeeded`; default silence threshold survives a 4h cell).
+Suite: 236 → 247.
+
+Plan acceptance criterion #7 (deferred at first landing) now closed.
+Phase A is done.
+
+Lesson surfaced (worth promoting to lessons.md): **fixture-test against
+real production output, not just synthetic.** Synthetic fixtures gave
+46 green tests, all of which would have happily passed on a watcher
+that mis-classifies every real R5 run. The synthetic shape ("ops/s=...")
+matched what the documentation suggested cass-stress emits; reality
+(in launch.log) is much sparser. The watcher would have shipped broken
+without the replay step.
+
 ### 2026-05-29 — Phase A (watcher) landed in cassandra-agent-harness
 
 Implementation lives at `cassandra-agent-harness@HEAD` (workstation
