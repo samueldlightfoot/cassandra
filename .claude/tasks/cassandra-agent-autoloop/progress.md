@@ -14,6 +14,88 @@
 - No code changes yet. Awaiting user sign-off on the plan before phase
   A implementation starts.
 
+### 2026-05-29 — Phase D-1 (deterministic core) landed
+
+Implementation: harness commit (next; staged locally).
+
+Files:
+- `src/cassandra_agent_harness/agent/stop_conditions.py` (~210 LoC, 5 stops + registry)
+- `src/cassandra_agent_harness/agent/goals.py` (~430 LoC, dataclasses + YAML loader + 11-rule validator)
+- `src/cassandra_agent_harness/agent/progress.py` (~215 LoC, `Gap`, `compute_gap`, `evaluate`)
+- `src/cassandra_agent_harness/agent/__init__.py` (re-exports public API)
+- `src/cassandra_agent_harness/cli.py` (`cah goal-validate`, `cah evaluate`)
+- `tests/agent/test_goals.py` (20 tests)
+- `tests/agent/test_progress.py` (11 tests)
+- `tests/agent/test_stop_conditions.py` (12 tests)
+- `tests/fixtures/goals/waf_baseline.yaml` (copied from this task folder's sketch)
+
+End-to-end demo (against R5 + the WAF baseline goal sketch):
+
+```
+$ cah goal-validate tests/fixtures/goals/waf_baseline.yaml
+# total_errors=0, blocking=0, advisory=0 → exit 0
+
+$ cah evaluate tests/fixtures/goals/waf_baseline.yaml \
+    --history tests/fixtures/runs/T4-LF4h tests/fixtures/runs/T16-LF4h
+{
+  "goal_met": false,
+  "terminal_stop": null,
+  "gap": {
+    "missing_cells": [
+      "ycsb_a_zipf_0.8+fill=0.04+T8",
+      "ycsb_a_zipf_0.8+fill=0.8+T4",
+      "ycsb_a_zipf_0.8+fill=0.8+T8",
+      "ycsb_a_zipf_0.8+fill=0.8+T16"
+    ],
+    "missing_replicates": {
+      "headline_paper_comparable": 3,
+      "headline_cold_start": 2
+    },
+    "unmet_variance": [],
+    "paper_comparable_status": "unmet"
+  }
+}
+# exit 3 (goal not met; gap present)
+```
+
+This is the exact shape phase D-LLM's `propose_next_round(history, gap, goal)`
+will consume. "Given gap X, pick a regime from {COLD_START_30M,
+LOW_FILL_4H, HIGH_FILL_4H, T_SWEEP, REPLICATE_FOR_VARIANCE, STOP}"
+becomes a tractable constrained question — the LLM is no longer
+re-deriving what we're going for, just choosing tactically.
+
+Design choices worth remembering:
+
+- **YAML kwargs are filtered at call time, not validated at load.**
+  `evaluate()` uses `inspect.signature` to drop unknown kwargs before
+  calling each stop fn. So a goal authored against a newer harness
+  version can have kwargs that older fns ignore, and vice versa. Avoids
+  brittle version coupling between goal configs and Python code.
+- **Stops that need round state take it as a parameter.** Two stops
+  (`max_rounds_reached`, `no_progress_detected`) can't be computed from
+  cell history alone — they need the loop driver's persisted state.
+  Threading those in via `evaluate(..., rounds_completed=N,
+  rounds_without_progress=N)` keeps `evaluate()` pure and stateless.
+- **Rule 11 is advisory-only.** `is_advisory(err)` returns True for
+  `rule==11`; `blocking_errors()` filters them out. The CLI emits WARN
+  for advisory errors but exits 0 if no blockers are present.
+- **`Goal` is a single concrete dataclass for now.** The plan called for
+  `Goal` as an ABC with `WafBaselineGoal` as the concrete; I collapsed
+  to one type because there's no second investigation yet. Refactor to
+  ABC when a second goal shape lands (e.g., `TwcsTimeseriesGoal`).
+- **Fixture copied, not symlinked.** `tests/fixtures/goals/waf_baseline.yaml`
+  is a copy of the fork's sketch. If the sketch is updated, the harness
+  fixture must be re-synced; the test `test_load_goal_round_trips_sketch_into_python_values`
+  will fail if it drifts.
+
+Library suite: 304 → 347 (+43: 20 goals + 11 progress + 12 stop_conditions).
+Ruff clean on all touched files.
+
+Next: Phase D-LLM (round_controller.py with `propose_next_round` LLM call +
+`pursue(goal)` loop driver). Estimated ~300 LoC + ~150 LoC tests. The LLM
+call has a constrained Pydantic output schema; tests use a fake LLM
+client to verify regime selection matches gap shape.
+
 ### 2026-05-29 — Phase C (deterministic result reviewer) landed
 
 Implementation: harness commit (next; staged locally).
