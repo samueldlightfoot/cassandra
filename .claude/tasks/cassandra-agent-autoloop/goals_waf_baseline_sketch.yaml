@@ -1,0 +1,143 @@
+# goals_waf_baseline_sketch.yaml
+#
+# Proposed structured goal for the cassandra-waf-baseline investigation
+# in its current state (post-R5). This is the sanity-check artifact for
+# the dataclass design in phase D of cassandra-agent-autoloop —
+# `agent/goals.py` must be able to load + validate this file before
+# we commit a real config to `waf-baseline-poc/goals/waf_baseline.yaml`.
+#
+# Read with: task_plan.md (Phase D) for the validation rules,
+# findings.md §7 for the rationale.
+
+name: "waf-baseline-pm9a3"
+investigation: "waf_baseline"
+
+# ============================================================
+# OUTCOMES — what makes this publishable. Each is falsifiable:
+# `check_fn` resolves to a Python function in the harness registry.
+# ============================================================
+outcomes:
+
+  # Paper-comparability anchor: the headline cell that the writeup
+  # cross-references against PVLDB 2026 Table 1 (LeanStore in-place,
+  # PM9A3, YCSB-A 80% fill — paper reports SSD WAF 2.36).
+  - id: "headline_paper_comparable"
+    description: "YCSB-A zipf 0.8 at 80% fill, UCS T4, replicated"
+    cell:
+      workload: "ycsb_a_zipf_0.8"
+      fill_fraction: 0.80
+      ucs_t: 4
+    replicates: 3
+    max_inter_replicate_cv: 0.10        # std/mean ≤ 10% on SSD WAF
+    check_fn: "headline_replicates_converged"
+
+  # Cold-start anchor: the regime where R2 found the 2.62 → 1.36
+  # headline drop after methodology fixes. Worth nailing as a
+  # second publishable point.
+  - id: "headline_cold_start"
+    description: "YCSB-A at low fill (cold start, freshly-mkfs'd drive), UCS T4, replicated"
+    cell:
+      workload: "ycsb_a_zipf_0.8"
+      fill_fraction: 0.04
+      ucs_t: 4
+    replicates: 3
+    max_inter_replicate_cv: 0.10
+    check_fn: "headline_replicates_converged"
+
+# ============================================================
+# COVERAGE — matrix breadth required for the writeup.
+# Each (workload, fill, T) triple in the cross-product must be
+# completed at least once and pass cross-checks.
+# ============================================================
+coverage:
+  workloads:
+    - "ycsb_a_zipf_0.8"                  # mandatory: paper-comparable
+    # twcs_timeseries — explicitly NOT required for this goal;
+    # call it a follow-up investigation if needed.
+  fill_fractions:
+    - 0.04                                # low-fill regime (R2, R3, R5)
+    - 0.80                                # high-fill regime (R1, R4)
+  ucs_t_values:
+    - 4                                   # T4 (default)
+    - 8                                   # T8
+    - 16                                  # T16
+  # Cross-product = 1 × 2 × 3 = 6 distinct cells. Plus 3 replicates
+  # of each headline → 6 + 2 × (3 − 1) = 10 cells minimum.
+
+# ============================================================
+# PAPER COMPARABILITY ANCHOR
+# ============================================================
+paper_comparable:
+  cell:
+    workload: "ycsb_a_zipf_0.8"
+    fill_fraction: 0.80
+    ucs_t: 4
+  expected_ssd_waf_range: [1.0, 4.0]     # LeanStore in-place was 2.36;
+                                          # LSM expected ≤ ~2 but anything in [1,4] is
+                                          # informative and worth publishing
+  source: "PVLDB 2026 Lee/Ziegler/Leis Table 1"
+
+# ============================================================
+# BUDGETS — soft terminals. validate_goal() rule 6 + 7 check
+# that estimated wall time + drive writes fit inside these.
+# ============================================================
+budgets:
+  max_rounds: 10                          # hard cap on round_controller iterations
+  max_wall_hours: 96                      # 4 days; one round ≈ 8–12h
+  max_drive_writes_tb: 5                  # PMUW headroom budget;
+                                          # PM9A3 endurance is ~7000 TBW so trivially safe
+
+# ============================================================
+# METHODOLOGY GATES — non-negotiable for publishable goals.
+# validate_goal() rule 4 enforces require_cross_checks_pass=True.
+# ============================================================
+methodology:
+  require_cross_checks_pass: true         # every cell must pass the
+                                          # feedback_cross_check_workload_counts rule
+                                          # (≥3 independent signals agree on writes_count)
+  require_paper_comparable_in_range: false # don't fail goal if LSM lands
+                                           # outside paper range — flag it for discussion
+                                           # in the writeup instead
+
+# ============================================================
+# STOP CONDITIONS — must all be present (rule 5). Each maps to a
+# Python class in agent/stop_conditions.py.
+# ============================================================
+stop_conditions:
+
+  - matrix_saturated:                     # headline finding established
+      window_cells: 6
+      max_std_over_mean: 0.02             # if 6 consecutive cells agree to within 2%
+                                          # → terminate, finding established
+
+  - variance_unreducible:                 # methodology has a problem we can't fix
+      max_replicates: 3
+      cv_threshold: 0.10                  # if a cell needs > 3 replicates to hit CV 10%
+                                          # → terminate, surface to human
+
+  - no_progress_detected:                 # 3 consecutive rounds with no gap reduction
+      consecutive_no_close_rounds: 3      # → terminate, the regime selector is failing
+
+  - max_rounds_reached: {}                # from budgets.max_rounds
+
+  - drive_lifetime_approached:
+      max_lifetime_fraction: 0.05         # 5% of PM9A3 7000 TBW = 350 TB; cap at 1.5% (~100 TB)
+                                          # for safety since we share with future investigations
+      override_to: 0.015
+
+# ============================================================
+# NOTES on the shape (for the dataclass design)
+# ============================================================
+# - All keys above must round-trip through `load_goal()` →
+#   `WafBaselineGoal` → `dump()` without loss.
+# - `outcomes[*].check_fn` is a string key into a registry in
+#   `agent/goals.py:CHECK_FN_REGISTRY`. Validation rule 2 requires
+#   it to resolve.
+# - `stop_conditions` is a list of dicts with exactly one top-level
+#   key (the StopReason class name in snake_case). The dict's value
+#   is kwargs for that class. Validation rule 5 requires all of
+#   {matrix_saturated, variance_unreducible, no_progress_detected,
+#    max_rounds_reached, drive_lifetime_approached} present.
+# - Anything outside `coverage` or `outcomes` is out of scope for
+#   this goal. If a future round wants TWCS, declare a new goal —
+#   don't mutate this one mid-investigation.
