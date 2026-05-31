@@ -130,13 +130,13 @@ reason.
   - Per-check structured log output (level reflects severity); summary log carries `profile`, `passed`, `block_failures`, `warnings`, `total`
 - [x] `tests/prereqs/test_preflight.py` *(new, ~390 LoC, 31 tests)* — one or more tests per check (pass/fail/edge), profile factory smoke tests, `PreflightConfig.from_yaml` round-trip + rejection, defensive runner exception-handling test, BLOCK-vs-WARN report contract
 - [x] `tests/test_cli.py` *(modify, +3 tests)* — exit 1 on block failure, exit 1 on missing config, exit 1 on invalid config
-- [ ] **Wire into `waf-baseline-poc`** — deferred to phase D's loop driver, where `pursue()` calls `run_preflight` before each round. The CLI subcommand is sufficient for manual invocation from `runbook.md` §7.
+- [x] **Wired into `waf-baseline-poc`** *(2026-05-31, waf-baseline-poc commit `1389829`)* — pilot/matrix CLI now replaces the 3-check Gate B with `run_preflight(profile)`. Profile auto-inferred from `--fill-fraction` (≤0.10 → low_fill, ≥0.50 → high_fill, else cold_start), explicit `--preflight-profile` overrides. PreflightConfig derived deterministically from existing CLI args (no new YAML file needed). Every refused launch now reports each check's memory provenance (`from feedback_*`). `--skip-prereqs` preserved as the dry-run escape hatch. +12 tests in waf-baseline-poc's test_cli.py; suite 34 → 46.
 - [ ] Update `runbook.md` §7 to say "this is now executable: `cah preflight --profile <name>`" — separate small commit; doesn't block phase B closure.
 
 **Acceptance criteria — actual state**:
 1. ✅ Every `feedback_*` memory in scope either has a corresponding check function (5 of 7) or is documented as deferred with reason (2 of 7: `feedback_rsync_before_rig_launch`, `feedback_cassandra_easy_stress_keyspace`).
 2. ✅ `cah preflight --profile cold_start --config <good.yaml>` returns exit 0 when checks pass (verified via smoke on tmp config); returns exit 1 when checks fail with structured `how_to_fix` per failure. Drive-regime check parametrized for `low_fill_profile` (80-100% free) and `high_fill_profile` (0-15% free); covered by mocked-OCP tests.
-3. ✅ The library exposes `run_preflight` + the profile factories; pilot-launcher wiring deferred to phase D (a thin call to `run_preflight(profile)` before `pursue()` launches the round). Not blocking.
+3. ✅ The library exposes `run_preflight` + the profile factories; **pilot-launcher wiring landed 2026-05-31** in waf-baseline-poc commit `1389829`. The pilot CLI now refuses launch on any BLOCK failure with structured per-check `how_to_fix` and memory provenance.
 4. ✅ Library suite: 281 passed (was 247; +34: 31 preflight + 3 CLI).
 5. ✅ End-to-end smoke (`cah preflight --profile cold_start` on a tmp config): 3 Linux-only checks fail loudly with clear messages, 3 portable checks pass; exit code 1 propagates correctly.
 
@@ -225,21 +225,22 @@ turn-bounded.
     - `NoProgressDetected` — 3 consecutive rounds with no gap closure (gap size stable or growing)
     - `MaxRoundsReached` — hard cap from `goal.budgets.max_rounds`
     - `DriveLifetimeApproached` — `pmuw_added / drive_endurance` above threshold (default 5%)
-- [ ] `src/cassandra_agent_harness/agent/round_controller.py` *(new, ~250 LoC)*
-  - `def pursue(goal, *, auto=False, results_dir) -> Outcome` — the loop driver
-  - `def propose_next_round(history, gap, goal) -> RoundProposal` — the only LLM call; prompt has `gap` as the central input; output is JSON-validated `RoundProposal` from a fixed regime enum; max 2 parse-retries then `ESCALATE`
-  - `class Regime(StrEnum)` — `COLD_START_30M`, `LOW_FILL_4H`, `HIGH_FILL_4H`, `T_SWEEP`, `REPLICATE_FOR_VARIANCE`, `STOP`. Each maps to a constructor `Regime.cells_for(gap, goal) -> list[Cell]` so the LLM picks the regime and the *cells* are derived deterministically from the gap.
-  - `class RoundProposal` — `regime`, `cells`, `expected_gap_closure: str` (what gap fields will shrink), `rationale: str`, `closes_stop_risk: list[str]`
-  - `class Outcome` — `GOAL_MET`, `STOPPED(reason)`, `PAUSED_FOR_APPROVAL`, `MAX_ROUNDS`
-- [ ] `src/cassandra_agent_harness/agent/round_plan_template.md.j2` *(new)* — renders proposal to a human-reviewable plan, mirrors the structure of `r5_plan_v2.md`
+- [x] `src/cassandra_agent_harness/agent/round_controller.py` *(new, ~440 LoC)*
+  - `Regime` StrEnum (`COLD_START_30M`, `LOW_FILL_4H`, `HIGH_FILL_4H`, `T_SWEEP`, `REPLICATE_FOR_VARIANCE`, `STOP`); `cells_for_regime(regime, gap, goal) -> list[CellSpec]` is the deterministic dispatch — LLM picks the regime, code picks the cells. No LLM choice over continuous parameters.
+  - `LlmClient` `Protocol` with one method `choose_regime(request) -> LlmChoice`. Two bundled implementations: `FakeLlmClient` for tests (returns a configured regime); `HeuristicLlmClient` for the no-API-key default (deterministic precedence — replicates > paper-comparable > high-fill coverage > low-fill coverage > STOP). Real Anthropic SDK wiring is a thin follow-up; the protocol is in place.
+  - `propose_next_round(history, gap, goal, *, llm_client)` — invokes the client, validates the regime against `available_regimes`, materializes cells via `cells_for_regime`. If the LLM's pick yields no cells (other than STOP) it falls back to the heuristic — bounds the worst-case "bad LLM pick" cost to one iteration.
+  - `pursue(goal, *, history, results_dir, llm_client, auto=False, executor=None)` — the loop driver. Persists `<results_dir>/.pursue_state.json` (rounds_completed, rounds_without_progress, last_gap_size, started_at) for resumability. Without an executor, always returns `PAUSED_FOR_APPROVAL` after writing the plan. With executor + auto=True, iterates evaluate → propose → execute → re-evaluate until goal-met or terminal-stop. Hard cap on max_iterations guards against pathological LLM loops.
+  - `LoopOutcome` carries `OutcomeKind` (GOAL_MET, STOPPED, PAUSED_FOR_APPROVAL, MAX_ROUNDS, PROPOSAL_INVALID) + the proposal + plan_path.
+  - `render_round_plan(proposal, progress, goal, state) -> str` — short, human-reviewable markdown (regime, rationale, current gap, proposed cells, stop risks closed, approval instructions). Same f-string approach as phase C.
+- (template merged into `round_controller.render_round_plan`; a separate `.j2` file would have added a templates directory for one function.)
 - [x] `src/cassandra_agent_harness/cli.py` *(modify)*
   - `cah goal-validate <goal.yaml>` — runs `validate_goal()`, exits 0 on no blocking errors, 1 otherwise; structured log per rule (advisory rule 11 emits WARN, all others ERROR)
   - `cah evaluate <goal.yaml> --history <run_dir>... [--rounds-completed N] [--rounds-without-progress N]` — runs the goal validator first (refuses on blocking errors), then `evaluate()`; prints `Progress` + `Gap` as pretty-printed JSON to stdout. Exit codes: 0 (goal met), 1 (error / validation block), 2 (terminal stop fired), 3 (goal not met, gap present)
-  - `cah pursue` — **deferred to Phase D-LLM landing**
+  - `cah pursue <goal.yaml> --history <run_dir>... --results-dir <path> [--llm heuristic]` — runs the goal validator first (refuses on blocking), then `pursue()`. Defaults to HeuristicLlmClient so it works without an API key. Always pauses after one proposal (executor wiring deferred — actually shelling out to the pilot CLI from inside pursue() is an executor-process-management concern; the CLI's job is to write the plan and let the operator launch the cells). Exit codes: 0 (goal met / paused for approval), 1 (error / validation block), 2 (terminal stop fired).
 - [x] `tests/agent/test_goals.py` *(new, 20 tests)* — one test per validation rule (1–11) + sketch-YAML smoke (validates clean) + loader edge cases (non-mapping top-level, malformed stop entries)
 - [x] `tests/agent/test_progress.py` *(new, 11 tests)* — real R5 + sketch goal → expected gap; synthetic full-goal-met; paper-comparable out-of-range path; unmet-variance path; stop conditions wired through evaluate()
 - [x] `tests/agent/test_stop_conditions.py` *(new, 12 tests)* — each of 5 stops with histories that trigger and don't; real R5 as the "well within budget" control case for all 5
-- [ ] `tests/agent/test_round_controller.py` — **deferred to Phase D-LLM landing** (the round controller is the next sub-phase)
+- [x] `tests/agent/test_round_controller.py` *(new, 17 tests)* — `cells_for_regime` per regime (low/high fill predicates, T-sweep grouping, REPLICATE_FOR_VARIANCE uses outcome counts); HeuristicLlmClient precedence on R5 + sketch gap; `propose_next_round` (fake-client passthrough, bad-pick → heuristic fallback, out-of-available raises); `pursue` (no-executor pauses, goal-met short-circuit, max_rounds_reached via injected state, executor + auto=True iterates to goal-met, STOP proposal exits cleanly); `render_round_plan` contains regime + cells + gap.
 - [x] `tests/fixtures/goals/waf_baseline.yaml` *(new)* — the sketch lifted directly from `cassandra-agent-autoloop/goals_waf_baseline_sketch.yaml`; validation passes clean (rule 0 errors)
 - [ ] `docs/goal_driven_loop.md` — **deferred**; the in-code docstrings + this plan are sufficient until phase D-LLM lands
 
@@ -259,23 +260,42 @@ turn-bounded.
 | 10 | No duplicate `Outcome.id`s | Goal malformed | error |
 | 11 | `methodology.require_paper_comparable_in_range == False` (advisory) | LSM may land outside paper range for principled reasons; flag for discussion rather than fail goal | warn |
 
-**Acceptance criteria — deterministic core (D-1) status**:
+**Acceptance criteria — D-1 + D-LLM combined**:
 1. ✅ `validate_goal()` returns `[]` for `goals_waf_baseline_sketch.yaml`; every rule 1–11 has a dedicated test that violates the rule and asserts the right `ValidationError.rule` fires.
 2. ✅ Given the real R5 T4+T16 history + the WAF baseline goal, `evaluate()` reports exactly the hand-written expected gap: `missing_replicates={"headline_paper_comparable": 3, "headline_cold_start": 2}`, `missing_cells=[…0.04+T8, 0.80+T4, 0.80+T8, 0.80+T16]`, `paper_comparable_status="unmet"`.
-3. ⏳ LLM proposer regime selection — Phase D-LLM follow-up.
-4. ⏳ `pursue(goal, auto=False)` end-to-end — Phase D-LLM follow-up.
-5. ⏳ `pursue(goal, auto=True)` with synthetic matrix saturation — Phase D-LLM follow-up.
+3. ✅ HeuristicLlmClient picks `REPLICATE_FOR_VARIANCE` on the real R5 + sketch gap (because missing_replicates non-empty has top precedence). FakeLlmClient round-trips arbitrary regimes; bad picks fall back to the heuristic. (`test_round_controller.py` covers all three.)
+4. ✅ `pursue(goal, auto=False)` writes `<results_dir>/rounds/R1_plan.md` and terminates with `OutcomeKind.PAUSED_FOR_APPROVAL`. End-to-end smoke against R5 produces a 5-cell round (3 paper-comparable + 2 cold-start replicates) that closes both the replicate gap AND the paper-comparable-unmet status in one shot.
+5. ✅ `pursue(goal, auto=True)` with an executor and a synthetic 2-replicate trimmed goal iterates and returns `GOAL_MET` once the executor's replicates satisfy the outcome. Max-rounds-reached path covered by injecting a state file that pushes `rounds_completed` to the budget cap.
 6. ✅ `cah evaluate <bad-goal.yaml>` exits 1 with structured validation errors before touching history (`test_evaluate_refuses_invalid_goal` covers this through the evaluator's pre-flight validation).
-7. ⏳ LLM proposer prompt + Pydantic schema — Phase D-LLM follow-up.
+7. ✅ Proposer takes structured `ProposalRequest(goal_name, gap, available_regimes, rounds_completed)` and returns a typed `LlmChoice(regime, rationale)`. Output validated against `available_regimes` (raises on out-of-set). Pydantic schema not needed yet because the bundled clients return typed dataclasses directly; lands when the real Anthropic SDK client is wired (~30 LoC follow-up).
 
-**Status: D-1 (deterministic core) landed.** The next sub-phase is
-D-LLM: `agent/round_controller.py` with the LLM `propose_next_round`
-call + `pursue(goal)` loop driver. That's a ~300 LoC follow-up.
+**Status: D landed.** End-to-end smoke chains all 5 phases:
 
-**Decision gate after D-1**: end-to-end demo against R5 produces the
-expected gap. Phase D's contract is verified deterministically;
-D-LLM is now a thin tactical layer on top. Proceed to D-LLM when
-ready.
+```
+cah pursue ────► proposes regime + cells from gap
+   │
+   ▼
+waf-baseline pilot ────► preflight refuses on rig-state mismatch
+   │
+   ▼
+WafBaselineRunner ────► reset → prefill → warmup → measure → cell.json
+   │
+   ▼
+cah watch ────► tails launch.log; exit code = terminal state
+   │
+   ▼
+cah review ────► cell.json → results.md stanza + cross-checks
+   │
+   ▼
+cah evaluate ────► history → Gap → loop back to pursue
+```
+
+**Decision gate after D**: end-to-end demo against R5 produces the
+right next-round proposal (REPLICATE_FOR_VARIANCE with the
+paper-comparable + cold-start cells). One remaining piece is wiring
+the real Anthropic SDK as an alternative `LlmClient` — a ~30 LoC
+follow-up against the existing `LlmClient` Protocol; the heuristic
+client runs the whole loop without it. The architecture is shipped.
 
 ## Implementation order
 

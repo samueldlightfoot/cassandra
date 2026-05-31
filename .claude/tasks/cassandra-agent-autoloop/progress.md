@@ -14,6 +14,103 @@
 - No code changes yet. Awaiting user sign-off on the plan before phase
   A implementation starts.
 
+### 2026-05-31 — Phase D-LLM (round_controller + pursue) landed; pilot CLI wired
+
+Two commits, two repos:
+- `cassandra-agent-harness@82fc961`: Phase D-LLM — `agent/round_controller.py`
+  (~440 LoC) + 17 tests. Closes the autoloop.
+- `waf-baseline-poc@1389829`: wired `run_preflight(profile)` into the
+  pilot/matrix CLI. The deferred Phase-B item is now closed.
+
+#### Phase D-LLM design choices worth remembering
+
+- **LLM picks a regime, code picks the cells.** `Regime` is a 6-value
+  StrEnum; `cells_for_regime(regime, gap, goal)` is the deterministic
+  dispatch. Continuous-parameter selection stays out of LLM hands.
+- **`LlmClient` Protocol with two bundled implementations.**
+  `FakeLlmClient` for tests; `HeuristicLlmClient` as the no-API-key
+  default (precedence: replicates > paper-comparable unmet > high-fill
+  coverage > low-fill coverage > STOP). The architecture is ready for
+  a real Anthropic SDK client without it being mandatory.
+- **Heuristic fallback bounds the worst-case bad LLM pick to one
+  iteration.** If the LLM picks a regime that yields zero cells (other
+  than STOP), `propose_next_round` falls back to the heuristic and
+  marks the rationale `(FALLBACK)`.
+- **`pursue` without an executor always pauses.** Actually shelling
+  out to the pilot CLI from inside the loop is an
+  executor-process-management concern; the MVP keeps the human in the
+  loop. With an executor + `auto=True`, the loop iterates evaluate →
+  propose → execute → re-evaluate. Hard cap on `max_iterations`
+  guards pathological cycles.
+- **State persistence is JSON in the results dir.** `.pursue_state.json`
+  carries `rounds_completed`, `rounds_without_progress`, `last_gap_size`,
+  `started_at`. Atomic write via tmp + rename. Resumability is free.
+
+End-to-end demo against R5 + the sketch goal:
+
+```
+$ cah pursue waf_baseline.yaml --history T4-LF4h T16-LF4h --results-dir /tmp/...
+
+regime: replicate_for_variance
+rationale: 5 replicates needed across 2 outcome(s)
+cells: 3× ycsb_a@0.80+T4 (paper-comparable) + 2× ycsb_a@0.04+T4 (cold-start)
+closes_stop_risk: variance_unreducible (more replicates raise CV confidence)
+```
+
+— exactly the right call: R5 left both headline outcomes
+under-replicated; the proposed round closes the replicate gap AND the
+paper-comparable-unmet status in one shot.
+
+#### Pilot CLI preflight wiring (waf-baseline-poc commit 1389829)
+
+Replaces the 3-check Gate B with the full Phase-B profile. Every
+`feedback_*` operational memory now refuses launch instead of becoming
+the next 4h-cost lesson re-learned:
+
+| memory | check |
+|---|---|
+| feedback_cassandra_drop_keyspace_snapshots | auto_snapshot_disabled |
+| feedback_cassandra_jar_rebuild | jar_contains_class (default `org.apache.cassandra.db.Keyspace`) |
+| feedback_mkfs_ext4_trim_undoes_precondition | drive_regime (profile-specific) |
+| feedback_monitor_silence_is_not_success | cli_recognizes_flags |
+
+Profile auto-inferred from `--fill-fraction`: ≤0.10 → `low_fill`,
+≥0.50 → `high_fill`, else `cold_start`. A matrix that spans low+high
+fills raises ValueError demanding `--preflight-profile` explicitly —
+silent choice between regimes was the wrong default.
+
+Each refused check logs `(from feedback_*)` provenance so an operator
+reading launch.log can trace any refusal back to its rule of origin.
+
+End-to-end smoke: `waf-baseline pilot --fill-fraction 0.04 ...` against
+a tmp checkout with valid jar/yaml but a bogus drive serial → 8
+structured PASS/FAIL lines, exit 2.
+
+#### Combined session arc
+
+| phase | what | tests |
+|---|---|---|
+| A | watcher (`agent/watcher.py`) | 57 |
+| B | preflight (`prereqs/preflight.py`) | 34 |
+| C | reviewer (`analysis/review.py`) | 23 |
+| D-1 | goals + progress + stop_conditions | 43 |
+| D-LLM | round_controller (Regime, pursue, LlmClient) | 17 |
+| **harness total** | | **174** |
+| pilot-wiring | waf-baseline-poc CLI preflight | 12 |
+
+Library suites: harness 116 → 364 (+248); waf-baseline-poc 34 → 46.
+All passing. Ruff clean across both repos.
+
+#### What's left
+
+- Real Anthropic SDK as an alternative `LlmClient` (~30 LoC,
+  optional dep). The protocol is in place; the heuristic client runs
+  the whole loop without it.
+- `docs/goal_driven_loop.md` (deferred; module docstrings + this plan
+  are sufficient until someone wants a one-page intro).
+- Push commits to remotes; rsync waf-baseline-poc to rig so next
+  bench launch gets preflight protection.
+
 ### 2026-05-29 — Phase D-1 (deterministic core) landed
 
 Implementation: harness commit (next; staged locally).
