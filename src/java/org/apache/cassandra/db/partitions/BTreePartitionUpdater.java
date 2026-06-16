@@ -71,16 +71,23 @@ public class BTreePartitionUpdater implements UpdateFunction<Row, Row>, ColumnDa
             onAllocatedOnHeap(BTreePartitionData.UNSHARED_HEAP_SIZE);
         }
 
+        boolean success = false;
         try
         {
             indexer.start();
 
-            return makeMergedPartition(current, update);
+            BTreePartitionData result = makeMergedPartition(current, update);
+            success = true;
+            return result;
         }
         finally
         {
             indexer.commit();
-            reportAllocatedMemory();
+            // CASSANDRA-21390 fix: only report allocation on success. A failed merge can
+            // leave heapSize transiently negative (deletes recorded, matching inserts not
+            // performed); reporting that via adjust(negative) drives allocator owns negative.
+            if (success)
+                reportAllocatedMemory();
         }
     }
 

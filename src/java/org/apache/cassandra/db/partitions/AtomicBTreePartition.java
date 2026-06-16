@@ -150,6 +150,7 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
 
         Updater addAll(final PartitionUpdate update)
         {
+            boolean success = false;
             try
             {
                 boolean shouldLock = shouldLock(writeOp);
@@ -162,13 +163,19 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
                         synchronized (this)
                         {
                             if (tryUpdateData(update))
+                            {
+                                success = true;
                                 return this;
+                            }
                         }
                     }
                     else
                     {
                         if (tryUpdateData(update))
+                        {
+                            success = true;
                             return this;
+                        }
 
                         shouldLock = shouldLock(heapSize, writeOp);
                     }
@@ -177,7 +184,16 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
             finally
             {
                 indexer.commit();
-                reportAllocatedMemory();
+                // CASSANDRA-21390 fix: report ownership only on success. On exception, the
+                // local heapSize accumulator may be transiently negative (e.g. shadowed
+                // cells decremented but matching inserts not yet performed). Reporting that
+                // partial value via adjust(negative) drives the allocator's owns counter
+                // negative because the "released" cells are still referenced by the partition
+                // tree (the failed merge never installed a new tree via CAS). Skip the
+                // report on failure; orphaned positive allocations from a partial merge
+                // become GC-tracked instead and are released at memtable discard.
+                if (success)
+                    reportAllocatedMemory();
             }
         }
 
