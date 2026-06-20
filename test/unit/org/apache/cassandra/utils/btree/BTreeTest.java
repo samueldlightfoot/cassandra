@@ -479,4 +479,90 @@ public class BTreeTest
             Arrays.fill(numberOfCalls, 0);
         }
     }
+
+    // CASSANDRA-21390 / CASSANDRA-21472: BTree.update must credit on-heap structure
+    // consistently with sizeOnHeapOf (which the memtable allocator uses to debit on release).
+    // The general (non-leaf-only) Updater path under-credited newly-built branch nodes, so the
+    // accumulated credit diverged from the true structure once a tree became multi-leaf, driving
+    // the memtable allocator's onHeap owns negative ("Negative released" at discard).
+
+    private static final class OnHeapTracker implements UpdateFunction<Integer, Integer>
+    {
+        long credited;
+        public Integer insert(Integer v) { return v; }
+        public Integer merge(Integer replacing, Integer update) { return update; }
+        public void onAllocatedOnHeap(long heapSize) { credited += heapSize; }
+    }
+
+    private static Object[] singletonTree(int v)
+    {
+        return BTree.build(Arrays.asList(new Integer[]{ v }), new OnHeapTracker());
+    }
+
+    /** Growing a tree via BTree.update: the summed on-heap credit must equal sizeOnHeapOf(tree). */
+    @Test
+    public void testUpdateOnHeapCreditAccumulatesToStructure()
+    {
+        java.util.Comparator<Integer> cmp = Integer::compare;
+        Object[] tree = BTree.empty();
+        long credited = 0;
+        for (int i = 0; i < 600; i++) // > MAX_KEYS so the tree becomes multi-leaf
+        {
+            OnHeapTracker f = new OnHeapTracker();
+            tree = BTree.update(tree, singletonTree(i), cmp, f);
+            credited += f.credited;
+        }
+        assertEquals(BTree.sizeOnHeapOf(tree), credited);
+    }
+
+    /** Overwriting existing keys in a branched tree: running on-heap credit must track sizeOnHeapOf. */
+    @Test
+    public void testUpdateOnHeapCreditTracksStructureUnderOverwrite()
+    {
+        java.util.Comparator<Integer> cmp = Integer::compare;
+        Object[] tree = BTree.empty();
+        long credited = 0;
+        for (int i = 0; i < 600; i++)
+        {
+            OnHeapTracker f = new OnHeapTracker();
+            tree = BTree.update(tree, singletonTree(i), cmp, f);
+            credited += f.credited;
+        }
+        for (int c = 0; c < 5000; c++)
+        {
+            OnHeapTracker f = new OnHeapTracker();
+            tree = BTree.update(tree, singletonTree((c * 31) % 600), cmp, f);
+            credited += f.credited;
+            assertEquals("overwrite " + c, BTree.sizeOnHeapOf(tree), credited);
+        }
+    }
+
+    /**
+     * Same accounting invariant for a SMALL collection that is multi-leaf only because
+     * cassandra.btree.branchshift is lowered (MAX_KEYS &lt; 6). This is the config under which a
+     * ~6-element Reaper seed_hosts (a "6-node cluster") crosses the leaf/branch boundary and hits
+     * the bug. Run with -Dcassandra.btree.branchshift=2 (e.g. -Dtest.jvm.args=...); skipped under
+     * the default branchshift since MAX_KEYS is read once at class init and cannot change at runtime.
+     */
+    @Test
+    public void testUpdateOnHeapCreditWithLoweredBranchShift()
+    {
+        org.junit.Assume.assumeTrue("requires -Dcassandra.btree.branchshift<=2 (MAX_KEYS<6)", BTree.MAX_KEYS < 6);
+        java.util.Comparator<Integer> cmp = Integer::compare;
+        Object[] tree = BTree.empty();
+        long credited = 0;
+        for (int i = 0; i < 8; i++) // <=8 elements: multi-leaf only because MAX_KEYS<6 ("6-node" scale)
+        {
+            OnHeapTracker f = new OnHeapTracker();
+            tree = BTree.update(tree, singletonTree(i), cmp, f);
+            credited += f.credited;
+        }
+        for (int c = 0; c < 2000; c++)
+        {
+            OnHeapTracker f = new OnHeapTracker();
+            tree = BTree.update(tree, singletonTree(c % 8), cmp, f);
+            credited += f.credited;
+            assertEquals("overwrite " + c, BTree.sizeOnHeapOf(tree), credited);
+        }
+    }
 }

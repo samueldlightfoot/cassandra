@@ -3454,8 +3454,18 @@ public class BTree
             assert ik == null;
             Object[] result = builder.completeBuild();
 
-            if (allocated > 0)
-                updateF.onAllocatedOnHeap(allocated);
+            // CASSANDRA-21390: report the true net structural delta so the BTree structure
+            // accounting telescopes correctly across tree-height transitions, matching the
+            // empty-existing (ColumnData) and leaf-leaf paths which already use
+            // sizeOnHeapOf(result) - sizeOnHeapOf(toUpdate). The previous internal `allocated`
+            // counter under-credited newly-built branch nodes (the branch Object[] and its
+            // sizeMap are allocated in BranchBuilder.drain/drainAndPropagate with no matching
+            // `allocated +=`), and the `if (allocated > 0)` gate additionally dropped any
+            // net-negative delta produced when a tree collapses height. Together this drove the
+            // memtable allocator's onHeap `owns` permanently negative (CASSANDRA-21390 "Negative
+            // released" at memtable discard) under concurrent SET-overwrite membership churn.
+            if (allocated >= 0)
+                updateF.onAllocatedOnHeap(sizeOnHeapOf(result) - sizeOnHeapOf(update));
 
             return result;
         }
