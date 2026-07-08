@@ -702,6 +702,8 @@ public enum CassandraRelevantProperties
     UCS_TARGET_SSTABLE_SIZE("unified_compaction.target_sstable_size", "1GiB"),
     UDF_EXECUTOR_THREAD_KEEPALIVE_MS("cassandra.udf_executor_thread_keepalive_ms", "30000"),
     UNSAFE_SYSTEM("cassandra.unsafesystem"),
+    /** Kill-switch for the io_uring native binding; when false the availability probe reports unavailable. */
+    URING_ENABLED("cassandra.native.uring.enabled", "true"),
     /** User's home directory. */
     USER_HOME("user.home"),
     /** When enabled, recursive directory deletion will be executed using a unix command `rm -rf` instead of traversing
