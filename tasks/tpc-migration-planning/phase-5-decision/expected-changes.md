@@ -34,4 +34,8 @@ symmetry and to register what the 2026-07-07/08 code sweeps add to phase 5's inp
    capture; tail gates at target throughput with characterized low-load cells). Also
    pre-answers "TPC hurts at low load" (yes, by design, bounded) and "hot partitions
    starve a core" (known shared-nothing ceiling; shared-something scope + skew stance
-   + backlog/misrouted instruments).
+   + backlog/misrouted instruments). The defers section cites ScyllaDB's shard-aware
+   drivers (connection-per-shard + deterministic shard-assignment port) as shipping
+   prior art for the deferred shard-aware client protocol — the deferral is a
+   sequencing choice with a known destination (`../findings-tpc-paper.md` §3 I5
+   prior-art note).

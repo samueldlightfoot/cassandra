@@ -49,6 +49,25 @@ Captured 2026-07-05 (sub-phase 0.1). Update whenever a fact is re-verified or ch
 - xfsprogs 5.13.0-1ubuntu2.1 installed
 - HWE kernel candidate: linux-generic-hwe-22.04 = **6.8.0-124.124~22.04.1** (not installed at capture)
 
+## Phase 1 execution facts (2026-07-08)
+- UAPI header used for constant verification: `/usr/src/linux-headers-6.8.0-124-generic/include/uapi/linux/io_uring.h`
+  (LINUX_VERSION 6.8; `/usr/include/linux/io_uring.h` from linux-libc-dev also present but the
+  running-kernel header is canonical). gcc present; probe binary left at /root/uring_probe.
+- ALL spec §1.2/1.3 constants verified — zero deviations (FSYNC=3, READ=22, WRITE=23,
+  DATASYNC=1, MAP_POPULATE=0x8000; params 120B features@20 sq_off@40 cq_off@80; SQE 64B, CQE 16B).
+- Live probe on rig: features=0x3fff, setup tier=SINGLE_ISSUER|DEFER_TASKRUN (top tier).
+- `sun.misc.Unsafe.putOrderedInt/getIntVolatile` present on rig JDK 17.0.19 (javap-verified).
+- ulimit -l = 8212268 KB (~7.8 GiB) re-confirmed for registered buffers.
+- IRQ environment (phase-0 0.1 step 2b): irqbalance ACTIVE; 26 nvme IRQ lines in
+  /proc/interrupts; kernel watchdog=1; cpufreq governor=powersave. Phase 2 preflight must
+  pin the steering stance (and consider performance governor) before A/B cells.
+- Build/test loop: rsync (form in Access above, verified working) → `ant jar` (12 s warm)
+  → `ant test -Dtest.name="Uring*"` (comma-separated test.name does NOT work; use glob).
+- Bench: `ant microbench -Dbenchmark.name=UringRawReadBench -Djmh.args="-p qd=8 ..."`
+  works; results land in build/test/output/jmh-result.json.
+- QD proof (recorded in progress.md session 6): sync QD1 8,234 IOPS vs batched QD64
+  225,694 IOPS = 27.41×, cold 4 KiB reads, 8 GiB file on / (nvme1n1p2, ext4).
+
 ## Phase 0 execution results (2026-07-05, post-reboot)
 - Kernel: **6.8.0-124-generic** (HWE; upgraded from 5.15.0-168) — meets ≥5.19 floor AND ≥6.1
   → Phase 1 top flag tier available (SINGLE_ISSUER|DEFER_TASKRUN); registered ring fds available.

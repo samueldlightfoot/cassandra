@@ -277,3 +277,74 @@ open, PoC sequential() not MPSC); roadmap.md items 5 and 7 fixed for the same dr
 
 **Next:** unchanged — Phase 1 execution (sub-phase 1.1); phase-0 0.1 now includes the
 IRQ environment capture.
+
+## 2026-07-08 — Session 5 (cont.): Scylla shard-aware drivers added as prior art
+
+findings-tpc-paper.md I5 section gained a "three steering strategies" prior-art note:
+client-side (ScyllaDB shard-aware drivers — connection-per-shard, handshake advertises
+SCYLLA_NR_SHARDS + shard-aware port 19042 with shard = source port % nr_shards, zero
+in-node hop; caveat: connection imbalance becomes shard imbalance), server-side message
+passing (Sphinx, our I1/I5 — pays the wake-up), NIC steering (research frontier).
+Phase-5 expected-changes item 5 + findings phase-5 section now cite it: the deferred
+shard-aware client protocol (roadmap item 13) has shipping prior art — a sequencing
+choice with a known destination, picked up only if post-I5 profiles show the
+netty→shard hop is the remaining bottleneck.
+
+## 2026-07-08 — Session 6: Phase 1 EXECUTED and complete (exit gate PASSED)
+
+**★ Headline (the number Phase 1 exists to produce): single-thread QD proof = 27.41×.**
+Cold 4 KiB reads over an 8 GiB file, one thread: sync QD1 = 8,234 IOPS (20k ops / 2,428 ms);
+batched QD64 = 225,694 IOPS (100k ops / 443 ms). Gate was >4×. PM9A3, ext4 (/), kernel 6.8.
+
+**Sub-phases, all acceptance green on rig (28 tests, 0 failures, 0 skipped):**
+- 1.1 ✅ Every ⚠ VERIFY constant confirmed against the rig's 6.8.0-124 UAPI header via a
+  compiled offsetof/sizeof C probe (FSYNC=3, READ=22, WRITE=23, DATASYNC=1,
+  MAP_POPULATE=0x8000, params features@20/sq_off@40/cq_off@80, SQE/CQE layouts — ZERO
+  deviations from spec §1.2/1.3). `Unsafe.putOrderedInt/getIntVolatile` javap-verified on
+  rig JDK 17.0.19. Empirical layout test reads kernel-written ring_entries/ring_mask back
+  through our offset constants on a live mmap'd ring. Probe reports **features=0x3fff,
+  tier=DEFER_TASKRUN** (top tier, as Phase 0 predicted for 6.8).
+- 1.2 ✅ UringRing sync facade (8 tests): offsets, non-zero position, write+fsync+read-back
+  via separate fd, EOF short, errno text surfaces, heap-buffer reject, closed-ring throws,
+  SQ wrap (10 full wraps on a 4-entry ring).
+- 1.3 ✅ UringRings registry (5 tests): thread-local identity, distinct per thread,
+  dead-thread sweep reclaim, closeAll idempotent+recoverable, no fd leak over 200
+  create/close cycles (/proc/self/fd delta < 10).
+- 1.4 ✅ Batched core (7 tests): 64 reads consumed by ONE enter; 100k sustained ops at
+  inFlight≈48 with zero slot-table corruption; both backpressure arms (slot capacity AND
+  SQ-full); short read passed through raw (2048 of 4096, position untouched); QD proof above.
+- 1.5 ✅ O_DIRECT + registered buffers (6 tests): FIXED vs non-FIXED byte-verified on tmp fs,
+  **/bench-ext4 AND /bench-xfs**; misaligned O_DIRECT read surfaces raw -EINVAL(-22);
+  registration rules (uniform capacity, no double-register, range validation,
+  unregister-refused-with-FIXED-in-flight). memlock headroom re-confirmed (ulimit -l ≈ 7.8 GiB).
+- 1.6 ✅ fsync semantics: sync+DATASYNC arms in 1.2's round-trip; batched write→await→fsync
+  ordering (caller-ordered, no IOSQE_IO_LINK) in UringBatchTest.
+- 1.7 ✅ UringRawReadBench skeleton runs on rig via
+  `ant microbench -Dbenchmark.name=UringRawReadBench` + `-Djmh.args` cell override
+  (smoke cell qd=8/batched/buffered/1GiB → 122,574 ops/s; jmh-result.json written).
+  Params qd∈{1,8,32,64} × mode∈{sync,batched} × direct∈{false,true} × dir (bench-mount
+  pointable) — matrix execution is Phase 2's.
+
+**Exit gate:** all acceptance green on rig from fresh `ant jar` (all 10 Uring classes
+verified inside the jar first) · QD proof recorded above · macOS run = SKIP not FAIL for
+all suites (availability test outcome-asserts the "not Linux" arm, runs 1/skips 1) ·
+`git diff --stat` clean: only new files under io/uring + tests + bench, plus the
+sanctioned +2-line CassandraRelevantProperties URING_ENABLED addition (expected-changes D-f).
+
+**Implementation notes (deviations/decisions within spec latitude):**
+- UringAvailability live probe: tier detection via raw setup with EINVAL step-down, THEN one
+  real READ round-trip through UringRing.create(4,8,tier) (explicit-tier package-private
+  overload avoids circular class-init) — D-a opcode-22 floor proven at probe time.
+- EBADR poisons the ring (poisoned flag permits close() despite phantom inFlight).
+- Dead-thread ring with in-flight ops: removed from registry but deliberately LEAKED
+  (unmapping under kernel writes is UB; owner dead = nobody can reap). Logged as warn.
+- checkstyle/RAT green for all new code (pre-existing rat complaint about
+  findings-tpc-paper.md is task-folder md, not code).
+- Rig checked: gcc present; header = linux-headers-6.8.0-124-generic UAPI (LINUX_VERSION 6.8).
+
+**IRQ environment snapshot (phase-0 0.1 step 2b, captured this session):** irqbalance
+ACTIVE, 26 nvme IRQ lines, kernel watchdog on, cpufreq governor = powersave. Phase 2
+preflight must decide the pinning/steering stance before any A/B cell (paper C1).
+
+**Next:** Phase 2 execution (phase-2-benchmark/spec.md) — fio cross-check + JMH matrix
+formalizing today's 27.4× under pinned methodology; UringRawReadBench is ready for it.

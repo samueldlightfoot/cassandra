@@ -207,9 +207,31 @@ Its KPI is **syscalls per op** — everything else is secondary:
   netty→shard hand-off; net win depends on the wake cost (C2) and on IRQ/loop
   affinity (C1) — which is why the rig environment capture is load-bearing for I5's
   A/B specifically. The large-message Stage fallback is aligned with their
-  payload-copy finding (item 3) — keep it. True shard-affine NIC steering
-  (their "hardware offload / programmable NICs" future work) is our deferred
-  shard-aware-client-protocol analogue — phase-5 defers list, not PoC.
+  payload-copy finding (item 3) — keep it.
+
+  **Prior art — the three steering strategies.** Getting a request onto its owning
+  core can happen (i) client-side, (ii) server-side, or (iii) in the NIC:
+  - *Client-side — ScyllaDB shard-aware drivers.* Scylla owns each client connection
+    on exactly one shard for its lifetime (no NTR-pool equivalent; the connection's
+    shard runs coordinator logic). Their forked drivers exploit this: the CQL
+    handshake advertises `SCYLLA_NR_SHARDS`, the sharding algorithm, and a
+    shard-aware port (19042) where shard assignment is deterministic
+    (`source port % nr_shards`); the driver opens one connection per shard per node,
+    computes token → shard with the server's algorithm, and sends each statement on
+    the owning shard's connection — zero in-node hop. Non-shard-aware clients land on
+    an arbitrary shard and Scylla pays an internal SMP-queue hop to the owner —
+    structurally the same hand-off as our I1. Caveat when citing as precedent:
+    connection-per-shard makes connection imbalance into shard imbalance; their
+    drivers spend real effort on connection distribution. Our keep-netty/keep-NTR PoC
+    dodges that skew class but always pays the one in-node hop.
+  - *Server-side message passing* — Sphinx, and our PoC (I1/I5): cheap to adopt
+    (no protocol change), pays the wake-up per steered request (C2).
+  - *NIC steering* — the paper's "programmable NIC offload" future work; flow-based
+    steering today can't see keys.
+  A shard-aware CQL protocol extension (Scylla's strategy on Cassandra) is the known
+  end-state for eliminating the in-node hop — it sits in the roadmap's conscious
+  defers (item 13), to be picked up only if post-I5 profiles show the netty→shard
+  hand-off is the remaining bottleneck.
 
 ### Phase 5 — decision / CEP
 
@@ -225,3 +247,10 @@ Its KPI is **syscalls per op** — everything else is secondary:
 - **Objection pre-answers:** "TPC hurts at low load" → yes, by design, characterized
   and bounded (C3). "Hot partitions starve a core" → shared-nothing ceiling is known
   (C4); shared-something scope + skew stance + backlog/misrouted instruments.
+- **Defers section gets prior art:** the deferred shard-aware client protocol is not
+  speculative — ScyllaDB ships it today (shard-aware drivers + deterministic
+  shard-assignment port; see the I5 prior-art note above). The CEP can state the
+  full steering ladder — PoC pays the in-node hop (server-side steering), the
+  protocol extension eliminates it (client-side), NIC offload is the research
+  frontier — and show the deferral is a sequencing choice with a known destination,
+  not an unsolved problem.

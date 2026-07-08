@@ -52,7 +52,12 @@ its upstream landing.
 ## Review section
 
 - Phase 0 outcome: COMPLETE 2026-07-05 — kernel 6.8.0-124 (HWE), /bench-xfs + /bench-ext4 live on nvme0n1, fstab reboot-proven, D1-D4 unchanged. See runbook.md + progress.md.
-- Phase 1 outcome: (pending)
+- Phase 1 outcome: COMPLETE 2026-07-08 — exit gate PASSED. Binding live in
+  `org.apache.cassandra.io.uring` (5 classes + 5 test suites + bench skeleton; only other
+  src change = URING_ENABLED property). 28 tests green on rig, SKIP-not-FAIL on macOS.
+  **Single-thread QD proof: 27.41×** (sync QD1 8,234 IOPS → batched QD64 225,694 IOPS,
+  cold 4 KiB reads, 8 GiB file). features=0x3fff, tier=DEFER_TASKRUN. See progress.md
+  session 6 + runbook.md Phase 1 facts.
 - Phase 2 outcome: (pending)
 - Phase 3 outcome: (pending)
 - Phase 4 (PoC) outcome: (pending — poc-verdict.md)

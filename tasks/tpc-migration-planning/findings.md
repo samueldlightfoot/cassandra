@@ -215,4 +215,13 @@ distilled into per-phase `expected-changes.md` files):
   no double-logging, same applyInternal), hostile-by-hostile touch table, extension-point
   census, the 9 new coexistence questions incl. the align-shardings option
 
-Rig live-capture facts: `runbook.md`. Phase 0 execution results: `progress.md`.
+Execution round (2026-07-08, Phase 1 built and gated):
+
+- `phase-1-uring-binding/findings-execution.md` — **the Phase 2 handoff doc**: binding
+  status + file inventory + API surface AS BUILT, rig-verified constants (zero deviations),
+  ★ QD proof 27.41× (sync QD1 8,234 IOPS → batched QD64 225,694 IOPS, cold 4 KiB, 8 GiB),
+  implementation decisions taken within spec latitude, execution gotchas (test.name glob,
+  jar tf, import order, rat pre-existing), Phase 2 pickup list (fio cross-check, IRQ/
+  governor stance, enters-per-op KPI, JNA-bias framing), test-methodology notes
+
+Rig live-capture facts: `runbook.md`. Phase 0/1 execution results: `progress.md`.
