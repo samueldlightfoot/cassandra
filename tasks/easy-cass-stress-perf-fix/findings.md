@@ -1,15 +1,31 @@
-# easy-cass-stress single-process throughput fix — findings
+# easy-cass-stress throughput investigation — findings (CORRECTED)
 
-**Date:** 2026-07-09. **Context:** TPC PoC (tasks/tpc-migration-planning) needs a load
-generator that can saturate Cassandra to measure throughput. `cassandra-easy-stress` capped
-at ~16–44k writes/s per process while **Cassandra stayed idle** (11µs applies), blocking any
-throughput claim. This is the investigation that found + fixed the cause.
+**Date:** 2026-07-09. **Context:** TPC PoC (tasks/tpc-migration-planning) needs to measure
+Cassandra throughput. The investigation chased a supposed load-gen ceiling — but the real
+finding is a **measurement-methodology error**, not a tool bug.
 
-## TL;DR
-**Root cause:** `Random.getText()` reconstructs a `RandomStringGenerator` (`.Builder().build()`)
-on **every write op**. Fix: build it once, reuse. **Result: single process 16k → 231k writes/s
-(14×)**; Cassandra went from idle to 61% CPU on the existing box. It was never connections,
-cores, processes, or the driver — just a per-op allocation in the value generator.
+## TL;DR (corrected — read this)
+- **The `Random.getText()` build-once change is NOT a meaningful fix.** Measured server-side,
+  back-to-back, same conditions: unfixed **132,326 w/s** vs fixed **139,606 w/s** = ~5% (noise),
+  NOT the "14×" first claimed. The bytecode confirms it: `generate(length)` does the real work
+  (per-char loop) and is unchanged by building the generator once; `build()` just allocates one
+  object. **Do not treat Random.kt as the answer.** (Rig left UNFIXED / clean.)
+- **The actual root problem was BAD MEASUREMENT:** easy-cass-stress **client-reported throughput
+  is ~2× inflated and unreliable** (250k reported vs 135k real). The earlier "16k, load-gen
+  limited, Cassandra idle" narrative was built on client-side numbers and offered-rate/ladder
+  artifacts. **Always measure server-side: `nodetool tablestats <ks> | Local write count` delta
+  over a fixed wall-clock window.**
+- **Reality with proper measurement:** the tool drives **~132–140k writes/s server-side** at
+  `--rate 2000000`, and Cassandra runs at ~61% CPU there (client cores ~97%). So Cassandra is
+  NOT trivially idle — it's genuinely loaded, though not yet saturated. Whether the remaining
+  ceiling is client or server needs the server-side method + a proper sweep (see task_plan.md).
+- **Net:** the multi-turn chase (connections/cores/processes/driver/value-gen) was mostly
+  measuring client-side noise. Restart clean with server-side throughput as ground truth.
+
+## Superseded (kept for the record, DO NOT trust the numbers)
+The sections below were written mid-investigation using unreliable client-side throughput and a
+now-retracted "14×" conclusion. The ruled-out table (connections/threads/rate/queue/io-size) is
+still directionally useful, but every throughput figure in it is client-reported and ~2× high.
 
 ## Environment
 - Rig `root@157.180.98.112` (key-auth SSH). Cassandra build `/root/repos/fork/cassandra-tpc`

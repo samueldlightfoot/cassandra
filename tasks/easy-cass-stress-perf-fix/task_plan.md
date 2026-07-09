@@ -1,46 +1,68 @@
-# Task: land the easy-cass-stress value-generator fix + re-baseline
+# Task: re-measure Cassandra throughput with correct (server-side) methodology
 
-**Status:** root cause found + fix validated (14×, see findings.md). Fix is applied but
-UNCOMMITTED on the rig (`feature/csv-latency`). This plan is the clean-context follow-up.
+**Status:** the "value-generator fix" chased in the parent session is a RED HERRING (server-side
+A/B: unfixed 132k vs fixed 139k w/s = noise, not 14×). The real finding: **client-reported
+throughput is ~2× inflated; must measure server-side.** See findings.md TL;DR. Rig is UNFIXED/clean.
 
 ## Why this matters
-The TPC PoC baseline (`tasks/tpc-migration-planning/phase-4-poc/poc-criteria.md` §8,
-`baseline_v1`) was captured with the BROKEN tool → every throughput number is
-load-generator-limited (Cassandra was idle), so it's **invalid for any throughput claim**.
-Latency-at-fixed-rate cells may survive but must be re-checked. The fix unblocks measuring
-Cassandra's real throughput.
+Every throughput number in `tasks/tpc-migration-planning/phase-4-poc/poc-criteria.md` §8
+(`baseline_v1`) and in the parent hurdle log A16 was **client-reported → ~2× inflated / unreliable**.
+The whole "load-gen limited to 16k, Cassandra idle" story was a measurement artifact. Server-side,
+the tool already drives ~132–140k w/s and loads Cassandra to ~61% CPU. Re-baseline from scratch
+with the correct method.
 
-## Phase 1 — land the fix properly
-- [ ] Apply the fix (the-fix.diff) to the user's fork `~/repos/fork/cassandra-easy-stress`.
-      NOTE branch skew: rig runs `feature/csv-latency`, local is `feature/mixed-ttl-workload`.
-      Put it on the branch(es) that matter; commit with a clear message.
-- [ ] **Thread-safety check:** confirm one shared `RandomStringGenerator` is safe across the 32
-      worker threads (commons-text default uses ThreadLocalRandom → safe; verify no shared
-      mutable state; a quick concurrent-generate test or doc cite suffices).
-- [ ] **Audit sibling generators** for the same per-call construction anti-pattern:
-      `generators/functions/{Book,FirstName,LastName,USCities,Gaussian}.kt` — do any rebuild
-      heavy objects in getText()/getInt()? Fix uniformly.
-- [ ] Consider upstreaming to easy-cass-stress (user said "we can contribute if broken").
+## Phase 1 — pin the methodology
+- [ ] **Ground-truth throughput = server-side only:** `nodetool tablestats <ks> | Local write
+      count` (and read count) delta over a fixed wall-clock window while load runs. NEVER trust
+      the client stdout "1min req/s" or Count/duration — it ran ~2× high here.
+- [ ] Cross-check with `nodetool proxyhistograms` (coordinator latency) + MutationStage/ReadStage
+      Active/Pending for saturation, and mpstat on the Cassandra fence for CPU.
+- [ ] Decide the honest offered-load model (the rate-ladder in the parent driver reported client
+      numbers — re-derive its rungs against server-side achieved).
 
-## Phase 2 — re-establish the load-gen ceiling (options 1 then 2, per user)
-- [ ] With the fixed tool, find how far load scales and whether Cassandra SATURATES
-      (MutationStage Active→ concurrent_writes=32 with Pending building, and/or Cassandra fence
-      cores ~100%). Sweep: 1 → N processes on client cores 8–11; watch client vs Cassandra CPU.
-- [ ] If client cores (8–11) cap before Cassandra saturates: **option 2 — more client cores.**
-      Re-pin Cassandra smaller (e.g. 0–5) and client wider (6–11), measure. Trade-off recorded
-      in parent hurdles.md A16: fewer Cassandra cores = less TPC-representative; decide with data.
-- [ ] Only if neither saturates Cassandra on the 12-core box → revisit an off-box load gen.
-      (Expectation from findings: one fixed process already gets Cassandra to 61%, so ~2 procs
-      or a modest core shift should saturate it — no new box likely needed.)
+## Phase 2 — find Cassandra's real ceiling (options per user: cheaper value, then more cores)
+- [ ] Sweep 1→N stress processes (client cores 8–11) at high `--rate`, measuring SERVER-side
+      write rate + Cassandra CPU + MutationStage. Find where Cassandra saturates (cores ~100% or
+      MutationStage Active→32 Pending building) vs where the CLIENT caps.
+- [ ] Is the value generator even worth touching? At ~135k w/s Cassandra is 61% CPU. Only if the
+      CLIENT is proven the cap (server has headroom, client cores pegged) is value-gen cost worth
+      revisiting — and measure it SERVER-side (the build-once change gave ~5%, likely not worth it).
+- [ ] Option 2 (more client cores by shrinking Cassandra) only if the client caps below Cassandra
+      saturation — trade-off in parent hurdles A16 (fewer Cassandra cores = less TPC-representative).
+- [ ] Off-box load gen only if the 12-core box genuinely can't saturate Cassandra server-side.
 
-## Phase 3 — RE-RUN the TPC baseline with the fixed tool
-- [ ] Re-capture `baseline_v1` throughput curves (parent `baseline_driver.sh`, rate-ladder) with
-      the fixed tool at a load level where Cassandra is actually the bottleneck. Update
-      poc-criteria.md §8; supersede the load-gen-limited numbers.
-- [ ] Re-confirm the read/write delta and the write-path characterization now that writes can be
-      driven hard (the earlier "write path serialization" was retracted as load-gen-limited —
-      re-examine whether a real server-side write ceiling exists once the client can push).
-- [ ] This closes Phase 4.1 for real → proceed to I0/I1.
+## Phase 3 — RE-BASELINE (correct, server-side method)
+- [ ] Re-capture `baseline_v1` curves (parent `baseline_driver.sh`) measuring SERVER-side
+      throughput; supersede the client-reported §8 numbers.
+- [ ] Re-examine the read/write delta and any real server-side write ceiling once load is driven
+      hard and measured correctly (the earlier "write path serialization" was already retracted).
+- [ ] Closes Phase 4.1 → I0/I1.
+
+## Known-good stress parameters (empirically settled 2026-07-09)
+Canonical invocation (throughput / saturation):
+```
+taskset -c <CLIENT_CORES> cassandra-easy-stress run KeyValue \
+  --host 127.0.0.1 --prometheusport 0 --no-schema \
+  --readrate <0.0..1.0> --partitions 2000000 --threads 32 \
+  --rate 2000000 --queue 2000000 --duration <D>s
+```
+- **`--prometheusport 0`** — MANDATORY for scripted/concurrent runs (else :9500 bind collisions,
+  hurdle A2 → silent rc=0 no-work failures).
+- **`--rate`** — DEFAULT is 5000 (a hard cap). For max/saturation set "unlimited" (`2000000`);
+  for a latency-at-target-load cell set it to the intended offered rate. A huge rate causes
+  coordinated omission → client p99 meaningless; get latency from `proxyhistograms` / rate-
+  controlled cells.
+- **`--queue`** — defaults to `rate*2`; set explicitly (`2000000`) when overriding rate.
+- **`--threads 32`** — fine; more did NOT help (not thread-bound).
+- **connections: LEAVE DEFAULT.** `--max-connections`(8)/`--max-requests`(32768) already give
+  262k in-flight; raising them does nothing (measured 18→130 conns, flat).
+- **Driver `NETTY_IO_SIZE`** not a flag; default `cores×2` fine (raising didn't help).
+- **`--no-schema`** to reuse a pre-populated keyspace; populate once with
+  `--populate $((TOTAL/threads))` (PER-THREAD, hurdle A3) + `--rate 2000000`.
+- **MEASURE SERVER-SIDE:** throughput = `nodetool tablestats <ks>` Local write/read count delta
+  over a fixed window. Client stdout throughput ran ~2× HIGH — do NOT use it.
+- **Single-client ceiling ≈ 132–140k w/s** at these params (client cores ~97%, Cassandra ~61%).
+  To load Cassandra harder: add processes / client cores — NOT connections or rate.
 
 ## Pointers
 - Full investigation + measurements: `findings.md` (this dir). The fix: `the-fix.diff`.
