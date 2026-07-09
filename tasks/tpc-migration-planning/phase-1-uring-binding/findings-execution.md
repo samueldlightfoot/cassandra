@@ -43,6 +43,9 @@ UringRing ring = UringRing.create(sqEntries, cqEntries);       // powers of 2, c
 
 // sync facade — NOT mixable with in-flight batched ops (throws IllegalStateException);
 // advances buf.position(); loops internally on short read/write; EOF returns short/0
+// FIXED 2026-07-09 (Phase 2): syncOp now wait-loops for its CQE — enter() returns a short
+// SUCCESS (not EINTR) when a signal lands after SQE consumption (man io_uring_enter);
+// pre-fix this threw "expected exactly 1 completion, drained 0" as a flaky failure.
 int  n = ring.readSync(fd, offset, directBuf);
 int  n = ring.writeSync(fd, offset, directBuf);                // 0-byte write => IOException
 ring.fsyncSync(fd, dataOnly);

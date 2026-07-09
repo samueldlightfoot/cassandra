@@ -299,3 +299,14 @@ sourced from the closest published analogue (Sphinx KV store A/B on commodity Li
    hard no-lock build with workload-precondition policy?
 7. **FlushItem/payload release audit** (I3 step 0) — sign off that it's a pre-code
    verification task, not a spec gap.
+8. **Foreground-read caching model** (added 2026-07-08, ../findings.md §5.1): buffered
+   ring reads keeping the page cache (I2b default) vs DIO reads + expanded ChunkCache
+   (Scylla model). PROVISIONAL — performance is the sovereign criterion; user: "if we
+   nerf performance by still including buffered io then it isn't an option." Adjudicated
+   by an I2b A/B variant cell on the PoC criteria; any DIO-compaction cell must measure
+   read p99 ACROSS a compaction boundary (outputs go cache-cold at switchover). Raw
+   asymmetry already priced by Phase 2: page-cache hit via ring ≈ 1.4 µs/op (syscall);
+   userspace-cache hit = memory read, no kernel entry. Background writers (commitlog,
+   compaction, flush, streaming, hints) target DIO in EITHER outcome — DIO+ring never
+   punts to iou-wrk on any fs, so G3's ext4 punt concern applies only to still-buffered
+   paths.

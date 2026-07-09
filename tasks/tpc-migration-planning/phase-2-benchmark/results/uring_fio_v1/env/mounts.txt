@@ -1,0 +1,2 @@
+/dev/nvme0n1p3 on /bench-ext4 type ext4 (rw,noatime,stripe=32)
+/dev/nvme0n1p2 on /bench-xfs type xfs (rw,noatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota)

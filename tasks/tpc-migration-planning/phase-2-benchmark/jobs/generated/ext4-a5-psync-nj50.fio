@@ -1,0 +1,16 @@
+# ext4-a5-psync-nj50 (generated — do not hand-edit)
+[global]
+ioengine=psync
+rw=randwrite
+bs=4k
+direct=1
+filename=/bench-ext4/uring-bench-randwrite.dat
+size=16g
+thread=1
+group_reporting=1
+norandommap=1
+randrepeat=0
+[job]
+iodepth=1
+numjobs=50
+io_size=328m

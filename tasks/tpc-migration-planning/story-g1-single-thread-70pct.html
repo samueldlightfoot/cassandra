@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The thread that had to feed a PM9A3 alone</title>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#f6f8fa; --panel2:#eef1f5; --ink:#1f2328; --muted:#59636e;
+    --accent:#0969da; --good:#1a7f37; --warn:#9a6700; --bad:#cf222e; --line:#d1d9e0;
+    --code:#f6f8fa;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:620px;margin:0 auto;padding:40px 24px 80px}
+  h1{font-size:28px;line-height:1.25;margin:0 0 6px}
+  h2{font-size:21px;margin:46px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  p{margin:11px 0}
+  .sub{color:var(--muted);margin:0 0 8px}
+  code,pre{font-family:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:13px;color:var(--ink);border:1px solid var(--line)}
+  .kicker{color:var(--accent);font-weight:600;font-size:13px;letter-spacing:.06em;text-transform:uppercase}
+  .muted{color:var(--muted)}
+  .pill{font-size:12px;color:var(--muted)}
+  .buf{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:14px 0;font-family:"SF Mono",ui-monospace,monospace;font-size:12.5px;white-space:pre;overflow:auto;color:var(--ink)}
+  .buf b{color:var(--good)}
+  .drive-diagram{margin:18px 0}
+  .drive-label{font-size:12px;color:var(--muted);margin-bottom:6px;font-weight:600;letter-spacing:.03em;text-transform:uppercase}
+  .block-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:3px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}
+  .block{aspect-ratio:1;border-radius:2px}
+  .block.c1{background:#1f6feb}
+  .block.c2{background:#d4730a}
+  .block.c3{background:#d1d9e0}
+  .drive-legend{display:flex;gap:16px;margin-top:8px;flex-wrap:wrap}
+  .legend-item{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted)}
+  .legend-swatch{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+  .drive-stat{font-size:13px;color:var(--muted);margin-top:6px}
+  .drive-stat b{color:var(--ink)}
+  details.check{background:#fffaeb;border:1px solid rgba(154,103,0,.35);border-left:4px solid var(--warn);border-radius:10px;padding:14px 18px;margin:18px 0}
+  details.check summary{cursor:pointer;font-weight:600;color:var(--warn);list-style:none}
+  details.check summary::before{content:"\2753  ";font-weight:400}
+  details.check summary .hint{display:block;font-weight:400;color:var(--muted);font-size:13px;margin-top:4px}
+  details.check[open] summary{margin-bottom:10px}
+  details.check .answer{border-top:1px dashed var(--line);padding-top:10px}
+  .killer{background:linear-gradient(135deg,rgba(207,34,46,.07),rgba(154,103,0,.04));border:1px solid rgba(207,34,46,.35);border-left:5px solid var(--bad);border-radius:10px;padding:18px 20px 16px;margin:24px 0;font-size:16.5px;font-weight:400;line-height:1.55}
+  .killer::before{content:"\26A1 THE KILLER";display:block;font-size:11px;letter-spacing:.14em;color:var(--bad);margin-bottom:8px;font-weight:700}
+  .killer .why{display:block;margin-top:8px;font-size:13px;font-weight:400;color:var(--muted)}
+  .formula{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px 20px;margin:16px 0;text-align:center}
+  .formula .eq{font-size:20px;font-weight:600;letter-spacing:.01em;color:var(--ink)}
+  .formula .eq .op{color:var(--muted);font-weight:400;margin:0 6px}
+  .formula .caption{font-size:12px;color:var(--muted);margin-top:6px}
+  .conditions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:16px 0}
+  .condition{padding:12px 14px;border-radius:8px;border:1px solid var(--line)}
+  .condition.low{background:#f0fff4;border-color:rgba(26,127,55,.25)}
+  .condition.high{background:#fff8f0;border-color:rgba(212,115,10,.25)}
+  .condition-label{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
+  .condition.low .condition-label{color:var(--good)}
+  .condition.high .condition-label{color:#d4730a}
+  .condition p{margin:0;font-size:13px;line-height:1.5;color:var(--ink)}
+  .result-stat{display:flex;align-items:center;gap:16px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 18px;margin:16px 0}
+  .result-stat .big{font-size:28px;font-weight:700;color:var(--bad);flex-shrink:0}
+  .result-stat .detail{font-size:13px;color:var(--muted);line-height:1.5}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="kicker">TPC migration &middot; Phase 2 &middot; gate G1 &middot; story edition</div>
+  <h1>The thread that had to feed a PM9A3 alone</h1>
+  <p class="sub">Why the benchmark pins ONE thread when TPC runs one per CPU, and why the bar is 70%
+  rather than 100% — traced through this evening's live numbers from the rig. Skimming? The setup and
+  the ⚡ boxes carry the spine. The general rule comes last.</p>
+
+  <h2>The setup</h2>
+  <ul>
+    <li>Rig: <b>12</b>-core Hetzner box, Samsung PM9A3 960&nbsp;GB datacenter NVMe, kernel 6.8, governor pinned to <code>performance</code>, irqbalance stopped.</li>
+    <li>Shape: 4&nbsp;KiB random reads, O_DIRECT (bypasses the page cache), cache-cold, 32&nbsp;GiB file — the sstable cache-miss shape.</li>
+    <li>QD (queue depth) — how many I/O ops are in flight at once. A synchronous <code>pread64</code> thread is always QD1: it sleeps until each read returns.</li>
+    <li>Contender A: <b>one thread pinned to core 2</b> + an io_uring ring, allowed up to QD64.</li>
+    <li>Contender B: 50 psync (pread64) threads floating over all 12 cores — today's Cassandra read-stage, idealized (fio does no locking, no parsing, no GC).</li>
+  </ul>
+  <p><strong>The governing law: under TPC a shard gets exactly one core, and whatever I/O the shard needs must be raised from that one core.</strong></p>
+
+  <h2>Chapter 1 &middot; One core, sixty-four slots</h2>
+  <p class="pill">covers: why the bench pins a single thread when TPC is one-thread-per-CPU</p>
+
+  <p>TPC on this box means 12 shards, each one thread on its own core, each owning a slice of the
+  token range, each with its own ring. Shards share nothing — so 12 shards perform like
+  12 × (one shard), until they collide at the device. The unit to measure is therefore
+  <b>one shard</b>: pin one thread to core 2 and ask what it can raise. Running 12 rings at once
+  would only measure the device's ceiling — a spec-sheet number — and tell us nothing about
+  whether a lone shard thread can cover its own cache misses.</p>
+
+  <p>At QD1 the thread reads like pread64 does: ask, sleep, repeat. Each round trip costs
+  ~65&nbsp;µs, so it raises <b>15,297 IOPS</b> — almost identical to a single psync thread
+  (15,389). The ring's escape hatch is depth: prepare 64 reads, submit them with one syscall,
+  reap completions as they land.</p>
+
+  <div class="buf">core 2, one thread, 120 s of 4 KiB cold reads
+QD1 :  ask→sleep 65 µs→ask     =  15,297 IOPS
+QD64:  64 in flight, 1 enter   =  <b>?</b></div>
+
+  <details class="check">
+    <summary>Checkpoint 1 &mdash; QD1 gave 15.3k. What does the same thread raise at QD64?
+      <span class="hint">Hint: 64 &times; 15.3k would be ~980k. But what else must this one core pay for, per op?</span></summary>
+    <div class="answer">
+      <p><b>260,103 IOPS — and the wall isn't the device, it's the core.</b> The cell ran at
+      100% CPU (18% user, 82% kernel): ~3.8&nbsp;µs of CPU per op for submission, ext4/block-layer
+      work, and completion handling. QD32 scored 258,099 — flat vs QD64 — the signature of CPU
+      saturation, not device saturation.</p>
+      <p class="muted">Depth stops helping the moment the submitting core, not the drive, becomes the bottleneck.</p>
+    </div>
+  </details>
+
+  <div class="killer">The single-thread cell is not a handicap, it is the experiment. <b>One shard's
+  I/O engine is the unit TPC scales by</b> — measure the unit, and N shards follow by symmetry.
+    <span class="why">12 rings at once would re-measure the PM9A3's spec sheet; one pinned ring measures the architecture.</span>
+  </div>
+
+  <h2>Chapter 2 &middot; Fifty threads, twelve cores, one bar</h2>
+  <p class="pill">covers: why the pass bar is 70% of the psync-50 baseline, not 100%</p>
+
+  <p>The baseline arm is deliberately unfair: 50 threads spread across <b>all 12 cores</b>,
+  presenting ~QD50 to the device the way today's read stage does — by thread count. It raised
+  <b>417,566 IOPS</b>. So the matchup the gate scores is one core versus the whole box:</p>
+
+  <div class="drive-diagram">
+    <div class="drive-label">Contender A — ring arm (each square = 1 core)</div>
+    <div class="block-grid">
+      <div class="block c3"></div><div class="block c3"></div><div class="block c1"></div><div class="block c3"></div><div class="block c3"></div><div class="block c3"></div><div class="block c3"></div><div class="block c3"></div><div class="block c3"></div><div class="block c3"></div><div class="block c3"></div><div class="block c3"></div>
+    </div>
+    <div class="drive-label" style="margin-top:10px">Contender B — psync arm</div>
+    <div class="block-grid">
+      <div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div><div class="block c2"></div>
+    </div>
+    <div class="drive-legend">
+      <div class="legend-item"><div class="legend-swatch" style="background:#1f6feb"></div>core 2: the measured shard (260,103 IOPS)</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#d4730a"></div>50 threads time-slicing (417,566 IOPS)</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#d1d9e0"></div>idle by design</div>
+    </div>
+    <div class="drive-stat">The gate asks: how far below <b>today's whole-box ceiling</b> may a single shard's ceiling fall?</div>
+  </div>
+
+  <p>First, where there is <em>no</em> problem: box-wide, submission is over-provisioned either
+  way. Twelve shards &times; 260k = 3.1M IOPS of submission capability against a device that tops
+  out near ~500k — the PM9A3 stays the limit, exactly as it is today. G1 exists for the one
+  scenario that arithmetic doesn't cover: <b>a hot partition lives on exactly one shard</b>, and
+  that shard's ring cannot be helped by the other eleven. Today a hot partition's cache misses
+  spread across the 50-thread pool and can draw the device's full 417,566; under pure TPC the
+  same partition tops out at what one core can raise — 260,103.</p>
+
+  <details class="check">
+    <summary>Checkpoint 2 &mdash; over 120 s, how many context switches did each arm pay?
+      <span class="hint">Hint: a sleeping pread64 thread must be woken for every completion. The ring polls a mmap'd completion queue.</span></summary>
+    <div class="answer">
+      <p><b>psync-50: 50,070,387 switches — exactly one per op. The ring: 1,744 total.</b>
+      Four orders of magnitude, measured by pidstat on the same box within the hour.</p>
+      <p class="muted">In real Cassandra that 50M/op cost class travels with friends fio can't
+      simulate — scheduler wake-ups landing on hot caches, lock handoffs, stage-to-stage hops.
+      Those are the costs TPC exists to delete, and this bench structurally cannot credit them.</p>
+    </div>
+  </details>
+
+  <p>Now the 70% fits in one sentence: <b>it caps how far the hot shard may fall</b>. Today that
+  partition can draw 417,566 IOPS. The gate tolerates its ceiling dropping to 70% of that —
+  <b>292,296 IOPS</b>. One core raised 260,103. Miss the line, and the PoC must add a helper
+  pool: a few I/O threads that any hot shard hands its cache-miss reads to.</p>
+
+  <p>Why tolerate any drop at all? Two buy-backs. The ring deletes the fifty-million-switch bill
+  you just saw, plus the friends fio can't simulate. And load that lands entirely on one shard is
+  the worst point of the distribution, not the normal one. Why exactly 70, and not 65 or 80?
+  Judgment, not math. Its force is that it was written down before the sweep ran — so today's
+  62% cannot argue its way to a pass.</p>
+
+  <p>One question left. The core ran flat-out at 100% — the thread could not have asked the
+  device for more. Why hold that against the ring? Because the bench hands the ring its best
+  possible deal: a whole core with nothing to do but I/O. A real shard thread lives differently.
+  It parses, merges, and serves with that same core.</p>
+
+  <details class="check">
+    <summary>Checkpoint 3 &mdash; a realistic shard spends 80% of its core on query work, leaving
+      20% for the ring. What read ceiling does that leave?
+      <span class="hint">Hint: 260,103 IOPS consumed 100% of the core — the cost is ~3.8 µs of CPU per op, and it scales.</span></summary>
+    <div class="answer">
+      <p><b>~52,000 IOPS — a fifth of the bench number.</b> The cost is per-op CPU, so the ceiling
+      shrinks with whatever core fraction the shard can spare: 0.2 &times; 260,103 ≈ 52k.</p>
+      <p class="muted">That is why CPU-bound matters: I/O submission and query execution compete
+      for the same core, and the helper pool is how a hot shard escapes the squeeze. It is also
+      the recoverable failure mode — 82% of the per-op cost is kernel work (page pinning, fd
+      lookup) that registered buffers and files attack; the annex cells test exactly that.
+      Device-bound would have been final.</p>
+    </div>
+  </details>
+
+  <div class="killer">The baseline gets twelve cores and pays fifty million context switches; the
+  ring gets one core and pays none. <b>70% bounds how far a hot shard may fall below today's
+  whole-box ceiling</b> before the helper pool stops being optional — fail the gate and TPC
+  proceeds anyway, with one design decision made for us by measurement.
+    <span class="why">And the gate can't be gamed by weak baselines: psync-50 here is a best case — fio does no Cassandra work at all.</span>
+  </div>
+
+  <h2>The rule you just watched</h2>
+
+  <div class="formula">
+    <div class="eq">G1 <span class="op">⇔</span> ring(1 core, QD≥32) <span class="op">/</span> psync(50 thr, 12 cores) <span class="op">≥</span> 0.70</div>
+    <div class="caption">both sides: 4 KiB random cold O_DIRECT reads, same file, same device, both filesystems</div>
+  </div>
+
+  <div class="conditions">
+    <div class="condition low">
+      <div class="condition-label">G1 passes (≥70%)</div>
+      <p>Per-shard I/O is not the TPC bottleneck. The PoC's shard threads own their reads via the
+      ring, as designed. → <strong>shard model, pure</strong></p>
+    </div>
+    <div class="condition high">
+      <div class="condition-label">G1 fails (&lt;70%)</div>
+      <p>Hurdle recorded, nothing killed: this hardware class can't feed a core from one thread,
+      so the PoC keeps a small I/O pool for cache-miss reads — 10994's compromise, now chosen by
+      measurement. → <strong>shard model + helper pool</strong></p>
+    </div>
+  </div>
+
+  <div class="result-stat">
+    <div class="big">62.3%</div>
+    <div class="detail">
+      preliminary, ext4: 260,103 / 417,566 (xfs: 62.4%) — the shortfall is <strong>core CPU
+      saturation</strong> at ~3.8 µs/op, 82% kernel-side.<br>
+      Annex cells (fixedbufs + registerfiles, which skip per-op page-pinning and fd lookup — our
+      binding supports both) will show how much is recoverable before the gate is adjudicated.
+    </div>
+  </div>
+
+  <p class="muted" style="margin-top:24px">Companion: phase-2-benchmark/spec.md §2.4 (gates) &middot;
+  data: results/uring_fio_v1 (sweep in progress) &middot; branch tpc-migration</p>
+
+</div>
+</body>
+</html>

@@ -37,6 +37,10 @@ p50/p99/p99.9, GC profile. Pin the workload set, the success margins (D9), and t
 rebase cadence for the fork. Also pinned HERE, not in an increment spec:
 expected-changes §8 item 5 (shard-thread CPU budget — accept oversubscription or
 shrink pools flag-on), because it shapes the honesty of every subsequent A/B.
+Also restate ../findings.md §5.1 in poc-criteria.md: the foreground-read caching model
+(page-cache buffered ring vs DIO + expanded ChunkCache) is PROVISIONAL and performance
+is the sovereign criterion — the criteria doc must name the A/B that settles it
+(expected-changes §8 item 8) so no increment silently hard-wires the buffered assumption.
 Acceptance: baseline numbers + criteria committed before any increment code exists.
 
 ### 4.2 Increment builds — I1 → I5, in order
@@ -57,7 +61,10 @@ the evidence). Pinned decomposition; deviating needs a hurdle-log rationale:
 - **I2a**: shard-routed reads on the `sequential()` executors (`shard_reads` flag).
   **I2b**: shard-loop replacement (drain-inbox + drive-ring) + ring at the
   ChannelProxy seam (`uring_reads` flag). I2b is the piece blocked on Phase 1/2
-  outputs; the split isolates that dependency.
+  outputs; the split isolates that dependency. I2b's default is buffered ring reads
+  (page cache retained) per findings §5.1 — provisional: its A/B set must include a
+  DIO-read variant cell (O_DIRECT + ChunkCache sized up) so the caching-model decision
+  (§8 item 8) is made by measurement, not inherited.
 - **I3**: step 0 FlushItem/payload release audit (pre-code); step 1 future plumbing
   (ReadCallback / AbstractWriteResponseHandler / BlockingReadRepair — inert flag-off,
   unit-testable alone); step 2 coordinator composition (fetchRows / mutate); step 3

@@ -1,0 +1,16 @@
+# xfs-a5-psync-nj1 (generated — do not hand-edit)
+[global]
+ioengine=psync
+cpus_allowed=2
+rw=randwrite
+bs=4k
+direct=1
+filename=/bench-xfs/uring-bench-randwrite.dat
+size=16g
+thread=1
+group_reporting=1
+norandommap=1
+randrepeat=0
+[job]
+iodepth=1
+io_size=16g

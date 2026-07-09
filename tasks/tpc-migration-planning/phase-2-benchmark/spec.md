@@ -131,6 +131,23 @@ cross-check lesson) before writing the verdict.
 
 ---
 
+### 2.5 Addendum (2026-07-08, mid-execution): target-I/O-state framing
+Per ../findings.md §5.1 (user-stated, PROVISIONAL pending perf tests): background
+writers (commitlog, compaction, flush, streaming, hints) target O_DIRECT; foreground
+reads keep the page cache AS A HYPOTHESIS — if buffered reads cost performance, the
+program shifts to the Scylla model (DIO + userspace cache). Consequences for this
+phase's analysis, no matrix change:
+- **G3 scope**: DIO+ring never punts to iou-wrk on any fs, so the ext4-vs-XFS punt
+  verdict governs only paths that REMAIN buffered. Report it as such — it is no longer
+  a filesystem-choice forcing function for background writers.
+- **Dual duty for buffered-vs-direct cells**: A1/A2/A3 (and their B twins) also price
+  the caching-model decision — record the hot-path asymmetry explicitly (A3 hot: a
+  page-cache hit through the ring still costs a kernel entry ≈ 1.4 µs/op; a userspace
+  cache hit costs none). Feed these numbers to phase-4 §8 item 8.
+- **Annex cells** (run-fio-annex.sh, outside the pinned matrix, labelled -annex-):
+  fixedbufs+registerfiles at QD64 to classify how much of the G1 single-core CPU
+  shortfall is recoverable per-op overhead.
+
 ## 3. Exit gate (Phase 2 → Phase 3)
 
 verdict.md exists with all four gates adjudicated · results dirs archived on rig AND

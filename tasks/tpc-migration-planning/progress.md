@@ -348,3 +348,152 @@ preflight must decide the pinning/steering stance before any A/B cell (paper C1)
 
 **Next:** Phase 2 execution (phase-2-benchmark/spec.md) — fio cross-check + JMH matrix
 formalizing today's 27.4× under pinned methodology; UringRawReadBench is ready for it.
+
+## 2026-07-08/09 — Session 7: Phase 2 EXECUTED and complete (exit gate PASSED)
+
+**★ Headline: G1 fails narrowly and diagnostically — one pinned core drives 260k IOPS
+(62% of the 50-thread/12-core baseline's 418k; 67% with fixed buffers), CPU-saturated at
+~3.8 µs/op — so the PoC keeps a small I/O pool for cache-miss reads, chosen by
+measurement.** Full adjudication in phase-2-benchmark/verdict.md; data tables in
+findings.md §8/§9.
+
+- Level A: 32 pinned fio cells + annex, 3 iters, 0 failures, spreads ≤5%. Level B: 30
+  JMH cells, 0 failures. Both under pinned stance (governor performance, irqbalance
+  stopped, per-cell IRQ snapshots, samplers on CPU 0, bench on CPU 2).
+- Gates: G1 FAIL-narrow (62%/67% vs 70%) · G2 FAIL-attributed (B/A 0.66–0.70 on the G1
+  shape; profile: 25–35% JNA trampoline+syscall stub, GC≈0 → hand-JNI is Phase 3 cost
+  line) · G3 FAIL-and-premise-inverted (XFS punts ≤32 iou-wrk, ext4 ≤2; throughput
+  0.99×; moot for DIO-bound background writers) · G4 PASS both levels.
+- Counter-headline: the binding BEATS native fio 1.77–1.84× on hot batched reads
+  (1.37M cached reads/s/core) and 1.68–1.72× on DIO batched writes (288k w/s,
+  iostat-verified) — the SINGLE_ISSUER|DEFER_TASKRUN tier fio 3.28 can't set is worth
+  real money. QD1 B/A = 1.00 everywhere.
+- Syscall KPI: pread 1.00/op, ring sync 1.00 enter/op, batched qd64 0.25 enter/op
+  (strace2 whole-run method; attach method deprecated in runbook).
+- **Binding bug found+fixed:** syncOp treated io_uring_enter's documented
+  signal-after-submit short-SUCCESS as corruption ("drained 0") — flaky-failure class
+  on I2a's exact path. Wait-loop fix mirrors awaitCompletions; 28/28 tests green on rig.
+  UringRing.java change is uncommitted on tpc-migration.
+- Environment finds: cpufreq was powersave (drivers now pin performance + restore);
+  ~17% of kernel CPU is Intel IOMMU DMA mapping (intel_iommu=pt = future rig lever);
+  fio "cold buffered" time_based cells are cache-fill profiles (recorded).
+- Session also (user-driven): target-I/O-state pinned PROVISIONAL — page cache for
+  foreground reads, DIO for background writers, full-Scylla fallback if buffered nerfs
+  performance (findings §5.1, memory, phase-2 §2.5, phase-3/4 expected-changes §8 item 8).
+  G1-gate story explainer written (story-g1-single-thread-70pct.html) + story-explain
+  skill gained rules 9/10 from two writing corrections.
+
+**Next:** Phase 3 (execution-model design docs) per phase-3-execution-model/spec.md —
+inputs now include verdict.md consequences: I/O-pool-for-misses in the shard model,
+hand-JNI cost line, DIO+ring for background writers.
+
+## Phase 2 → Phase 3 handoff (2026-07-09, for a fresh context)
+
+Read first: phase-3-execution-model/spec.md + expected-changes.md (the plan — not
+restated here), phase-2-benchmark/verdict.md (gate outcomes + consequences),
+findings.md §5.1/§8/§9, phase-1-uring-binding/findings-execution.md (binding API).
+
+**1. Deviations from the Phase 2 plan (all recorded in verdict.md/spec §2.5):**
+- Matrix grew: +a5-psync-nj1 per fs (so every JMH sync-write cell has a 1-thread native
+  twin) → 32 fio cells; +4-cell annex OUTSIDE the pinned matrix (fixedbufs+registerfiles,
+  ids `*-annex-*`) to classify the G1 shortfall.
+- JMH read bench gained a third mode `pread` (FileChannel.read positional — the psync
+  twin) beyond the planned sync/batched.
+- strace attach method (strace-window.sh) abandoned — perturbs timing, gave one garbage
+  window; strace-window2.sh (whole-run `strace -c -f` around a `-f 0` JMH run) is the
+  method of record.
+- G2 attribution used `-Dprofiler.opts="event=cpu;output=collapsed"` (flamegraph default
+  isn't machine-readable).
+
+**2. As-built interfaces Phase 3/4 consume:**
+- Binding API: unchanged from phase-1 findings-execution.md §3 EXCEPT syncOp semantics
+  hardened (see 3). Ring creation `UringRing.create(int sqEntries, int cqEntries)`;
+  batched: `prepareRead/Write[Fixed](…) → submit() / submitAndWait(min) →
+  drainCompletions(handler) / awaitCompletions(min, handler)`; sync facade
+  `readSync/writeSync(int fd, long offset, ByteBuffer direct)`, `fsyncSync(fd, dataOnly)`.
+- Bench params (UringRawReadBench): `-p file=<path> -p qd={1,32,64} -p
+  mode={pread,sync,batched} -p direct={true,false} -p cold={true,false}`.
+  UringRawWriteBench: `-p file -p qd -p mode={pwrite,sync,batched} -p bs -p
+  pattern={seq,rand} -p direct`; buffered arms fsync DATASYNC every 64 MiB
+  (FSYNC_INTERVAL_BYTES) through the API under test.
+- Scripts (phase-2-benchmark/jobs/): gen-fio-jobs.sh → generated/manifest.tsv
+  (id\tfs\tjobfile\tkind\tcache); run-fio-cells.sh / run-jmh-cells.sh (env pinning +
+  samplers + per-cell snapshots, restore-on-exit trap); make-bench-file.sh (idempotent
+  bench files: read 32g pseudo-random SHARED fio↔JMH, seqwrite 32g, randwrite 16g
+  prealloc, on both /bench-*); parse-results.py (medians, spreads, B/A twins, gate
+  numbers; skips partial JSONs); strace-window2.sh; run-fio-annex.sh.
+- Results layout: `<cell>.json` (+`-iter<n>` for fio) + `<cell>.d/`{iostat,pidstat,
+  iouwrk-count,iouwrk-psr,meminfo}.log + interrupts/governor/irqbalance snapshots;
+  sweep-level `env/` (smart-before/after, interrupts-start/end, stance.txt).
+
+**3. Code changed this session (uncommitted on tpc-migration):**
+- `UringRing.java` syncOp: after `enter(1,1,GETEVENTS)` + drain, now loops
+  `while (drained == 0) { enter(pendingSubmissions(), 1, GETEVENTS); drained += … }` —
+  io_uring_enter returns the submit count as short SUCCESS (not EINTR) when a signal
+  lands after SQE consumption (man-documented); pre-fix syncOp threw "expected exactly 1
+  completion, drained 0" as a FLAKY failure. 28/28 Uring tests green on rig post-fix.
+  The `drained != 1` tripwire retained (still fires on real corruption).
+- `UringRawReadBench.java` rewritten per phase-2 expected-changes §1.1 (shared file, in
+  bench drop_caches cold, deterministic full-file priming for hot, pread mode);
+  `UringRawWriteBench.java` NEW. Both compile+checkstyle clean; matrix-proven on rig.
+
+**4. Tested / deferred / broken:**
+- Tested: full A+B matrix (0 failed cells), 28 unit tests post-fix, syscall KPI, all
+  headlines double-signaled (iostat/pidstat/score-arithmetic).
+- Deferred: hand-JNI (Phase 3 cost line, attacks the profiled 25–35% JNA share);
+  `intel_iommu=pt` rig lever (untested, ~17% of kernel CPU is IOMMU DMA mapping);
+  bench-loop submit()-every-pass shape (0.25 enter/op instead of ~1/64 — bench-only).
+- Broken: nothing known. Old strace/ dir on rig contains the garbage sync attach window
+  — ignore it, strace2/ is canonical.
+- Level B percentile caveat: `-bm sample` divides by @OperationsPerInvocation(64) —
+  batched "latency" percentiles are smoothed batch-time/64; op-level tails come from fio
+  clat only.
+
+**5. Decisions made (don't re-litigate):**
+- Steering stance: irqbalance STOPPED during sweeps (static > daemon-moved), governor
+  performance, bench/single-job cells on CPU 2, samplers CPU 0, nj50 cells unpinned
+  (today's-architecture arm). Recorded per cell; restore-by-trap.
+- Gate consequences applied as pre-committed (verdict.md): I/O pool for cache-miss reads
+  in the PoC; G1 rests on Level A with B as supporting evidence; hand-JNI = cost line
+  NOT Phase 2/3 work; G3 recorded, not re-architected around.
+- Target I/O state (user, findings §5.1): PROVISIONAL — page cache for foreground reads,
+  DIO for ALL background writers; performance sovereign; full-Scylla fallback
+  (DIO + expanded ChunkCache) if buffered reads nerf perf. Phase 4 §8 item 8 owns the
+  A/B; poc-criteria.md must restate it (phase-4 spec 4.1 updated).
+- A4 fsync-policy mismatch (JMH interval vs fio end_fsync) accepted — punt detection was
+  the point.
+
+**6. Assumptions Phase 3 treats as given (all measured this session):**
+- One pinned core drives ~260k cold 4k DIO read IOPS (278k fixed-bufs) = 62–67% of the
+  50-thread whole-box baseline (418k); CPU-bound (~3.8 µs/op, 82% sys), NOT device-bound.
+  A busy shard raises proportionally less (20% core ≈ 52k) — the I/O-pool rationale.
+- The binding's flag tier is worth real perf: beats fio 1.77–1.84× hot batched reads
+  (1.37M/s/core), 1.68–1.72× DIO batched writes (288k w/s). QD1 through the binding is
+  free (B/A 1.00). Page-cache hit via ring ≈ 1.4 µs/op (syscall) vs userspace-cache hit
+  ≈ 0 — the §5.1 asymmetry.
+- Buffered ring writes: no throughput win at any QD (writeback-bound), terrible
+  completion tails (p99 14–20 ms), and XFS (not ext4) punts to iou-wrk on 6.8 —
+  background writers must go DIO+ring (never punts, any fs).
+- Syscalls/op: sync facade = 1.00 enter/op (a shard doing sync misses pays a syscall per
+  miss — I2a's readSync-blocks-shard warning stands); batched ≤0.25 enter/op achievable
+  without trying.
+- Rig env: PM9A3 ~500k 4k read ceiling near QD50; 12 cores; kernel 6.8; fio 3.28 lacks
+  SINGLE_ISSUER/DEFER_TASKRUN (understates the binding's kernel path).
+
+## 2026-07-09 — Session 8: Phase 2 CLOSED; Phase 3 started
+
+- Stopped the two wedged Phase 2 rig monitors (fio/JMH sweep watchers; both sweeps had
+  completed Jul 8 but the monitors' poll loops swallow SSH failure silently). Lesson
+  added to tasks/lessons.md: phase closeout stops its monitors; poll loops emit on
+  transport failure.
+- **User reiteration at close (recorded in findings.md §5.1 + memory):** goal is optimal
+  performance; the small I/O pool (G1 consequence) must be tested, but the expected
+  end-state is "similar to ScyllaDB" — full-Scylla arm (DIO + expanded ChunkCache) is
+  the prior, not the fallback. Both arms stay first-class in Phase 3 designs.
+- phase-3 spec updated with Phase 2 outcomes before design work: status header carries
+  the G1/G2/G3 consequences; I2 increment reflects I/O-pool-default with pure-shard-ring
+  as A/B comparator; 3.5 gains the hand-JNI cost line; stale `StorageProxy.java:1995`
+  corrected to `:1918→:2025`.
+- Phase 2 closure commit made (results, jobs, verdict, syncOp fix, spec patches).
+- Phase 3 begun per spec §4: 3.1 design-target.md drafted first (sub-agent + adversarial
+  review), then 3.2/3.3 in parallel, 3.4/3.5 last by main agent.

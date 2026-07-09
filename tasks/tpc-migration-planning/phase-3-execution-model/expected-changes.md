@@ -186,7 +186,11 @@ Paper-sourced evidence lines each design doc must absorb:
   taxonomy — per-shard memtable shard / commitlog manager / OpOrder / allocator
   (shared-nothing slices) atop shared SSTables, chunk cache, and maintenance pools.
   One-line pre-answer to "why not full shared-nothing like Scylla": skew ceiling +
-  Cassandra's page-cache reliance. Skew stance (3.1 item 4) cites the paper's
+  Cassandra's page-cache reliance — CAVEAT (2026-07-08, ../findings.md §5.1): the
+  page-cache stance is PROVISIONAL pending perf tests; performance is the sovereign
+  criterion, and if buffered foreground reads underperform, the model shifts toward
+  Scylla's (DIO + userspace cache via ChunkCache expansion). The skew-ceiling half of
+  the pre-answer stands either way. Skew stance (3.1 item 4) cites the paper's
   shared-nothing hot-core ceiling instead of re-deriving it.
 - **Shard loop (3.1 item 2) — the wake-up is the unit of steering cost** (their #1
   held-back-by finding; wake ≈ µs vs enqueue ≈ tens of ns). Two consequences for the

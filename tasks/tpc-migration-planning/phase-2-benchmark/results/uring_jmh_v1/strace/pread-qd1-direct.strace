@@ -1,0 +1,33 @@
+strace: Process 290723 attached with 24 threads
+strace: Process 290723 detached
+strace: Process 290726 detached
+strace: Process 290727 detached
+strace: Process 290728 detached
+strace: Process 290729 detached
+strace: Process 290730 detached
+strace: Process 290731 detached
+strace: Process 290732 detached
+strace: Process 290733 detached
+strace: Process 290734 detached
+strace: Process 290735 detached
+strace: Process 290736 detached
+strace: Process 290737 detached
+strace: Process 290738 detached
+strace: Process 290739 detached
+strace: Process 290740 detached
+strace: Process 290741 detached
+strace: Process 290742 detached
+strace: Process 290743 detached
+strace: Process 290749 detached
+strace: Process 290750 detached
+strace: Process 290751 detached
+strace: Process 290753 detached
+strace: Process 290754 detached
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 86.59   19.382037       16342      1186       590 futex
+ 10.85    2.428158          14    162956           pread64
+  2.54    0.568941       94823         6         6 restart_syscall
+  0.02    0.004202          13       308           getrusage
+------ ----------- ----------- --------- --------- ----------------
+100.00   22.383338         136    164456       596 total

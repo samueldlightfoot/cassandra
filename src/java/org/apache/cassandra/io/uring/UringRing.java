@@ -330,13 +330,22 @@ public final class UringRing implements Closeable
         long opId = enqueueSqe(opcode, fd, fileOffset, addr, len, opFlags, 0);
         slots[slotIndex(opId)] = new Op(opId, null, len, false);
         inFlight++;
-        enter(1, 1, UringConstants.IORING_ENTER_GETEVENTS);
         SyncResult result = new SyncResult();
-        int drained = drainCompletions((completedId, res) -> {
+        CompletionHandler handler = (completedId, res) -> {
             if (completedId != opId)
                 throw new IllegalStateException("sync op demux mismatch: expected " + opId + ", got " + completedId);
             result.res = res;
-        });
+        };
+        // A signal arriving after the SQE is consumed makes enter return the submit count as a
+        // short SUCCESS with the wait skipped (man io_uring_enter), not EINTR — so the CQE may
+        // not be there yet; keep waiting like awaitCompletions does.
+        enter(1, 1, UringConstants.IORING_ENTER_GETEVENTS);
+        int drained = drainCompletions(handler);
+        while (drained == 0)
+        {
+            enter(pendingSubmissions(), 1, UringConstants.IORING_ENTER_GETEVENTS);
+            drained = drainCompletions(handler);
+        }
         if (drained != 1)
             throw new IllegalStateException("sync op expected exactly 1 completion, drained " + drained);
         return result.res;

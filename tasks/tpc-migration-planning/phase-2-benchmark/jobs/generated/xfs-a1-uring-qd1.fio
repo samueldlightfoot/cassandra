@@ -1,0 +1,17 @@
+# xfs-a1-uring-qd1 (generated — do not hand-edit)
+[global]
+ioengine=io_uring
+direct=1
+cpus_allowed=2
+rw=randread
+bs=4k
+filename=/bench-xfs/uring-bench-read.dat
+thread=1
+group_reporting=1
+norandommap=1
+randrepeat=0
+time_based=1
+runtime=120
+ramp_time=5
+[job]
+iodepth=1

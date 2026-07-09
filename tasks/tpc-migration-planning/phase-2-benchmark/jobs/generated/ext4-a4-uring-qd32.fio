@@ -1,0 +1,14 @@
+# ext4-a4-uring-qd32 (generated — do not hand-edit)
+[global]
+ioengine=io_uring
+rw=write
+bs=256k
+direct=0
+filename=/bench-ext4/uring-bench-seqwrite.dat
+size=32g
+end_fsync=1
+thread=1
+group_reporting=1
+cpus_allowed=2
+[job]
+iodepth=32

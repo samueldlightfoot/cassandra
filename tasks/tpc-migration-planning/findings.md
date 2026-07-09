@@ -80,6 +80,48 @@ The io_uring cost/benefit is **inverted vs ScyllaDB**:
 
 So the specific I/O objection written into 10989 is genuinely obsolete.
 
+### 5.1 Target I/O state (user-stated 2026-07-08 — PROVISIONAL, pending performance tests)
+
+**Decision rule (user, verbatim intent): the primary goal is squeezing performance. All of
+the below is pending perf tests — if keeping buffered I/O for foreground reads nerfs
+performance, it is not an option, and we mimic Scylla/Seastar: DIO everywhere + userspace
+caches.** The split below is the starting hypothesis because it avoids building a cache
+tier, not because the page cache is sacred.
+
+**Reiterated at Phase 2 close (user, 2026-07-09): the goal is optimal performance; the
+small I/O pool for cache-miss reads (G1 consequence) MUST be tested, but the expected
+end-state is "similar to ScyllaDB" — i.e. the full-Scylla arm (DIO + expanded ChunkCache)
+is the user's prior, not the fallback long-shot. Phase 3 designs must keep both arms
+first-class; the Phase 4 A/B stays the adjudicator.**
+
+What adjudicates it: Phase 2 already prices the raw asymmetry — a page-cache hit through
+the ring costs a syscall (~1.4 µs/op, A3 hot: ~700k/core inline) while a userspace-cache
+hit (ChunkCache today) costs a memory read with no kernel entry at all; misses compare as
+buffered-ring vs DIO-ring cells. The Cassandra-level adjudication is a Phase 4 A/B
+(ChunkCache-heavy + DIO reads vs page-cache-heavy buffered reads) on the PoC criteria
+(p99 ≤ trunk at throughput ≥ trunk). Note Cassandra already owns a userspace cache seam
+(ChunkCache) — the Scylla road is an expansion of that tier plus eviction/sizing work,
+not greenfield.
+
+Per-path split (the hypothesis under test; config facts verified in tree,
+Config.java:130/416/486/487):
+- **Page-cache residency** for the foreground read path: sstable data reads (buffered ring
+  reads, I2b) and index mmap. The page cache remains Cassandra's main data cache; the ring
+  replaces the blocking syscall only. NOT Scylla's DIO+userspace-cache model.
+- **Direct I/O** for background sequential writers: commitlog, compaction (reads and writes),
+  flush, and other background writes (streaming, hints). Their pages don't benefit from
+  residency; buffered versions evict the read-hot set and inflate writeback/WAF. The
+  `background_write_disk_access_mode` lever exists on this fork (project deferred — see
+  memory: don't build `auto` until default can resolve to direct without opt-in).
+- Synthesis with TPC: O_DIRECT + io_uring never punts to iou-wrk on any filesystem, so
+  G3's ext4 buffered-punt question stops mattering for whatever goes DIO; the punt probe
+  stays relevant only for paths that remain buffered.
+- Known nuance to A/B when DIO compaction lands: compaction outputs hold the same live rows
+  that were cache-hot in the inputs — DIO output + input deletion makes previously-hot data
+  cache-cold at sstable switchover. Any DIO-compaction cell must measure read p99 ACROSS a
+  compaction boundary, not just during the write. (Flush loses some cache-warming under DIO
+  too; commitlog has no residency value at all outside replay.)
+
 ## 6. Honest reality check — I/O was never the 95%
 
 | Blocker | Status post-io_uring |
@@ -152,6 +194,82 @@ on 2026-03-21 (still tracked upstream, not tombstoned).
 5. Sequencing inversion made explicit: 2016 chose non-blocking-first/ownership-later and
    its POC lost the tail; this plan is ownership-first (I1 before I3) — consistent with
    Ellis's "threadsafe memtables" comment and usable as the answer to "DSE tried this".
+
+## 8. Phase 2 outcomes — Level A (fio ground truth), 2026-07-08
+
+Pinned matrix executed clean: 32 cells x 3 iterations, zero failures, spreads <=5%
+(most <=2%). Environment per cell: governor performance, irqbalance stopped, single-job
+cells pinned CPU 2, samplers CPU 0. Raw: phase-2-benchmark/results/uring_fio_v1/ (local)
++ /data/results/uring_fio_v1 (rig). Parser: jobs/parse-results.py.
+
+**The A1 curve (4k randread O_DIRECT cold, 32 GiB file, median IOPS):**
+
+| cell | ext4 | xfs | note |
+|---|---|---|---|
+| uring qd1 (1 thread) | 15,297 | 15,276 | = pread latency, ~65 µs/op |
+| uring qd8 | 111,844 | 111,592 | scaling with depth |
+| uring qd32 | 258,099 | 260,944 | **core saturates: usr+sys=100%, 82% sys** |
+| uring qd64 | 260,103 | 260,749 | flat vs qd32 → CPU-bound at ~3.8 µs/op |
+| annex qd64 +fixedbufs+registerfiles | 277,774 | 280,025 | +7% — recoverable per-op overhead |
+| psync nj1 | 15,389 | 15,347 | |
+| psync nj50 (12 cores) | 417,566 | 417,840 | device's ~QD50 curve; 50M ctx switches (1/op) vs ring's ~1,700 total |
+
+**Gate readings at Level A (G2 pends Level B):**
+- **G1 = FAIL, narrow + diagnosed**: 1-thread QD>=32 = 61.8–62.5% of psync-50 (needs 70%);
+  67.0% with fixed buffers. Shortfall is single-core CPU saturation, ~1/3 recoverable
+  per-op overhead (page pinning/fd lookup), rest inherent kernel path. Pre-committed
+  consequence: PoC keeps a small I/O pool for cache-miss reads (hot-shard scenario;
+  aggregate submission is over-provisioned either way — 12x260k >> device ~500k).
+  Caveat for verdict: fio 3.28 lacks SINGLE_ISSUER/DEFER_TASKRUN (binding has them);
+  Level B batched cells are the remaining evidence.
+- **G3 = FAIL as specified, and the 5.19 punt story is INVERTED on 6.8**: buffered 256k
+  seqwrite+end_fsync — XFS punts hard (iou-wrk up to 32 = one/queued op) while ext4 stays
+  ~inline (<=2); throughput identical engines/fs (0.99x, ~1.3–1.5 GB/s, writeback-bound;
+  QD buys nothing). Ring buffered-write completion tails terrible (p99 14–20 ms vs psync
+  123 µs ext4). Under the §5.1 target state this only governs still-buffered paths —
+  strengthens DIO-for-background-writers.
+- **G4 = PASS (harness honest)**: hot page-cache QD1 ring = 84.4/84.8% of pread64
+  (702k/751k vs 832k/886k) — ring syscall path costs more than plain pread, as expected.
+  Also the §5.1 asymmetry priced: page-cache hit via ring ≈ 1.4 µs/op; userspace hit = 0 syscalls.
+- **A5 (DIO randwrite — the background-writer shape)**: 1-thread ring QD32 = 168k/172k =
+  2.3x one psync thread (74k), 46% of psync-50 (369k). Same one-core-vs-box shape as reads.
+- **A2 methodology note**: "cold buffered" time_based cells are cache-fill profiles (file
+  fully cached in ~20 s; psync-nj50 reads 4.5M IOPS = 18 GB/s from page cache on 12 cores
+  vs ring 504k on one). Comparison valid within-shape; absolute numbers are mixed miss/hit.
+
+## 9. Phase 2 outcomes — Level B (JMH through the binding), 2026-07-08/09
+
+30 cells (15/fs), zero failures, run overnight under the same pinned stance (bench JVM
+on CPU 2). Raw: results/uring_jmh_v1/. Every cell has a fio twin; B/A per shape:
+
+**G2 (JVM tax) = FAIL on the gate shape, but the tax is shape-specific:**
+
+| shape | B/A ext4 | B/A xfs | reading |
+|---|---|---|---|
+| ALL qd1 cells (pread/sync/batched, cold+hot) | 0.96–1.07 | 0.96–1.10 | tax invisible at device latency |
+| batched qd32/64 direct cold (**the G1 shape**) | **0.66/0.70** | **0.66/0.69** | FAIL (<0.8): 181k vs fio 260k = ~5.5 µs/op vs 3.8 — CPU-bound is where the JVM boundary bites |
+| batched qd32 buffered HOT | **1.77** | **1.84** | binding BEATS native fio: 1.24M/1.37M cached reads/s on one core |
+| batched qd32 DIO randwrite (A5) | **1.72** | **1.68** | 288k w/s vs fio 168k — verified at device via iostat (fio's own window never exceeded 175k) |
+| b4 buffered writes | 0.71–0.74 | 0.88–0.91 | approximate by design (different fsync policies); not gate-bearing |
+
+- The >1 ratios are NOT "Java faster than C": the binding runs SINGLE_ISSUER|DEFER_TASKRUN
+  (top tier) which fio 3.28 cannot set, and fio carries its own per-op engine overhead
+  (~0.1–0.2 µs, visible in b3-pread beating a3-psync 1.07–1.10x). Flag-tier value is real
+  and measured. Caveat on b5: JMH bursts (5 s iters) vs fio continuous 16 GiB passes —
+  device-state differs, but fio's max never approached the binding's sustained rate.
+- **Headline 2 (Level-B TPC question): one JVM thread + binding = 43.3–43.4% of the
+  50-thread native psync baseline** (181k vs 418k).
+- **G4 Level B = PASS**: ring sync hot qd1 = 75.3–76.5% of FileChannel pread (684k/733k
+  vs 894k/973k ops/s) — slower, as it must be.
+- Pre-committed G2 consequence applies: G1's verdict rests on Level A; hand-JNI goes into
+  the Phase 3 effort estimate as a cost line. Attribution profiling pass: see verdict.md.
+- **Binding bug found and fixed during the strace windows** (the windows earn their keep):
+  `syncOp` treated io_uring_enter's documented signal-after-submit short-SUCCESS return
+  (man io_uring_enter) as ring corruption ("expected exactly 1 completion, drained 0").
+  Sync cells passed 30/30 in the sweep — the failure needs a signal to land mid-wait, so
+  it would have surfaced in the PoC as an unexplained flaky read error on I2a's exact
+  path. Fix: syncOp now wait-loops like awaitCompletions (UringRing.java syncOp); all 28
+  Uring tests re-run green on the rig 2026-07-09. Phase-1 handoff doc updated.
 
 ## Sources
 - CASSANDRA-10989 — https://issues.apache.org/jira/browse/CASSANDRA-10989

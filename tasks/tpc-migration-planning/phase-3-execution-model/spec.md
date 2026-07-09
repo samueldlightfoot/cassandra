@@ -1,7 +1,10 @@
 # Phase 3 Spec — Execution-Model Rewrite Scoping (SEDA → TPC)
 
-**Status:** Ready to execute once Phase 2 completes. Its gates classify the PoC's I/O
-shape (phase-2 spec §3) — no Phase 2 outcome blocks this phase.
+**Status:** Phase 2 COMPLETE (verdict.md 2026-07-09); its gate consequences are inputs
+here: G1 FAIL-narrow → the PoC carries a small I/O pool for cache-miss reads (must be
+tested; user's stated prior at Phase 2 close is a full-Scylla end-state — DIO + expanded
+ChunkCache — see ../findings.md §5.1); G2 → hand-JNI is a Phase 3 cost line (§3.5);
+G3 → background writers go DIO+ring on any fs.
 **Nature of this phase:** unlike Phases 1–2, the deliverables are DESIGN DOCUMENTS and an
 EFFORT MODEL, not code. The exit artifacts are the build plan for Phase 4's PoC; the CEP
 (Phase 5) reuses them later with PoC evidence attached. Audience = the implementing
@@ -190,13 +193,18 @@ increment). Both levels gate on tail latency per the rule below. Pinned candidat
 sequence (the sub-phase validates/amends, with evidence):
 - **I1 — Shard-routed mutation apply:** route LOCAL mutation apply to a per-shard
   single-thread executor keyed by `ShardBoundaries` (replaces
-  `Stage.MUTATION.maybeExecuteImmediately` for local applies, `StorageProxy.java:1995`).
+  `Stage.MUTATION.maybeExecuteImmediately` for local applies, `StorageProxy.java:1918→2025`
+  — the `:1995` site is the batchlog overload; expected-changes §3.1 item 5).
   Memtable per-shard lock contention → ~0 (observable via existing
   contended/uncontended counters, `TrieMemtable.java:553-563`). Smallest real TPC step;
   measurable; touches no wire protocol.
 - **I2 — Shard-routed local reads:** same for `LocalReadRunnable`
-  (`AbstractReadExecutor.java:168`) + per-shard io_uring ring for cache-miss chunk reads
-  (Phase 1 API; `ChunkReader` seam from Phase 0 §2.3).
+  (`AbstractReadExecutor.java:168`) + ring-backed cache-miss chunk reads (Phase 1 API;
+  `ChunkReader` seam from Phase 0 §2.3). Phase 2 G1 verdict applies: a single busy shard
+  cannot drive the device (62–67% of baseline at 100% core; proportionally less when the
+  core does query work) → misses dispatch to a SMALL I/O POOL by default; the pure
+  per-shard-ring shape is the A/B comparator, not the default. Both arms tested (user
+  directive 2026-07-09).
 - **I3 — Non-blocking coordinator** (3.2 design).
 - **I4 — Per-shard commitlog** (3.3 decision) + per-shard writeOrder.
 - **I5 — Inbound shard dispatch:** internode small-message routing straight from netty
@@ -212,6 +220,9 @@ candidates — this is the hedge that de-risks the whole program).
 ### 3.5 Effort bands + risk register → `effort.md`
 - Per increment: S/M/L/XL (S≤2wk, M≤6wk, L≤3mo, XL>3mo single-engineer-equivalent),
   justified against the file inventories above; sum → program bands (optimistic/likely).
+- **Hand-JNI cost line (Phase 2 G2 consequence):** a distinct banded row — replacing the
+  JNA trampoline (profiled 25–35% of per-op CPU on the G1 shape) with hand-written JNI;
+  not scheduled work, priced so Phase 4/5 can pull it if B/A ratios matter to the verdict.
 - Risks: mixed-version clusters (all increments are node-local — verify none leak into
   wire formats), JMX/metrics compat (stage pool metrics change meaning), Accord
   interaction (now a REQUIRED design section — 3.1 item 6; the register tracks residual

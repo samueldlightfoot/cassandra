@@ -1,0 +1,34 @@
+building: ant jar + build-test (22:38:22)
+sweep: 30 JMH cells, start 2026-07-08T22:38:58Z
+DONE ext4-b1-pread-qd1-direct-cold 22:40:15
+DONE ext4-b1-sync-qd1-direct-cold 22:41:32
+DONE ext4-b1-batched-qd1-direct-cold 22:42:48
+DONE ext4-b1-batched-qd32-direct-cold 22:44:05
+DONE ext4-b1-batched-qd64-direct-cold 22:45:22
+DONE ext4-b3-pread-qd1-buffered-hot 22:47:06
+DONE ext4-b3-sync-qd1-buffered-hot 22:48:54
+DONE ext4-b3-batched-qd1-buffered-hot 22:50:41
+DONE ext4-b3-batched-qd32-buffered-hot 22:52:29
+DONE ext4-b4-pwrite-qd1 22:56:27
+DONE ext4-b4-sync-qd1 23:00:22
+DONE ext4-b4-batched-qd32 23:04:18
+DONE ext4-b5-pwrite-qd1 23:05:27
+DONE ext4-b5-sync-qd1 23:06:35
+DONE ext4-b5-batched-qd32 23:07:44
+DONE xfs-b1-pread-qd1-direct-cold 23:09:00
+DONE xfs-b1-sync-qd1-direct-cold 23:10:17
+DONE xfs-b1-batched-qd1-direct-cold 23:11:33
+DONE xfs-b1-batched-qd32-direct-cold 23:12:50
+DONE xfs-b1-batched-qd64-direct-cold 23:14:07
+DONE xfs-b3-pread-qd1-buffered-hot 23:15:50
+DONE xfs-b3-sync-qd1-buffered-hot 23:17:34
+DONE xfs-b3-batched-qd1-buffered-hot 23:19:17
+DONE xfs-b3-batched-qd32-buffered-hot 23:21:01
+DONE xfs-b4-pwrite-qd1 23:24:51
+DONE xfs-b4-sync-qd1 23:28:40
+DONE xfs-b4-batched-qd32 23:32:29
+DONE xfs-b5-pwrite-qd1 23:33:38
+DONE xfs-b5-sync-qd1 23:34:46
+DONE xfs-b5-batched-qd32 23:35:55
+SWEEP COMPLETE 2026-07-08T23:35:55Z
+environment restored (governor=powersave irqbalance=active)

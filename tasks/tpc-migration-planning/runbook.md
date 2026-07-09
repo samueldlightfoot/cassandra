@@ -68,6 +68,37 @@ Captured 2026-07-05 (sub-phase 0.1). Update whenever a fact is re-verified or ch
 - QD proof (recorded in progress.md session 6): sync QD1 8,234 IOPS vs batched QD64
   225,694 IOPS = 27.41×, cold 4 KiB reads, 8 GiB file on / (nvme1n1p2, ext4).
 
+## Phase 2 execution facts (2026-07-08)
+- fio: **3.28** (apt, preinstalled); io_uring + psync engines confirmed via `fio --enghelp`.
+- Reverse rsync (pull results, expected-changes §4.2):
+  `rsync -az -e "sshpass -p 'uum5BURBX7q_Nc' ssh -o StrictHostKeyChecking=accept-new" root@157.180.98.112:/data/results/uring_fio_v1/ tasks/tpc-migration-planning/phase-2-benchmark/results/uring_fio_v1/`
+  (same form for uring_jmh_v1)
+- Live bench mount options (expected-changes §4.3): /bench-ext4 `rw,noatime,stripe=32`;
+  /bench-xfs `rw,noatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=256,swidth=256,noquota`.
+- Readahead /dev/nvme0n1 = 512 sectors (256 KB). SMART baseline pre-sweep: 38°C, 4% used,
+  44.8 TB written, spare 100%.
+- CPU split (expected-changes §4.4): bench/single-job fio on CPU 2, samplers on CPU 0,
+  numjobs=50 fio cells unpinned (today's-architecture arm). Steering stance: governor
+  performance + irqbalance STOPPED during sweeps, both restored by driver trap; per-cell
+  /proc/interrupts + governor + irqbalance snapshots in each cell's .d/ dir.
+- Bench files (make-bench-file.sh, idempotent): <mnt>/uring-bench-read.dat 32g pseudo-random
+  (shared by fio and JMH), uring-bench-seqwrite.dat 32g (overwrite target),
+  uring-bench-randwrite.dat 16g (preallocated). On BOTH /bench-ext4 and /bench-xfs.
+- Results dirs on rig: /data/results/uring_fio_v1/ and /data/results/uring_jmh_v1/
+  (per-cell JSON + <cell>.d/ sampler dirs + env/ snapshot + sweep.log).
+- A stray idle Gradle daemon (easy-cass-stress) was running on the rig — kill before
+  sweeps; drivers preflight-fail on any java process.
+- **IOMMU tax (profiled 2026-07-09):** ~17% of the O_DIRECT-read kernel CPU on this rig
+  is Intel IOMMU per-op DMA mapping (xas_find/clflush/iommu_map in collapsed profile).
+  `intel_iommu=pt` (or off) on the kernel cmdline is an untested lever that would lower
+  the per-op floor for BOTH fio and the binding — consider before any Phase 4 A/B rig.
+- strace method: attach (`-p`) windows perturb timing and gave a garbage sync window
+  (and exposed the syncOp signal bug — see phase-1 findings-execution). Use
+  strace-window2.sh (whole-run `strace -c -f` around a `-f 0` JMH run; ops from score).
+- async-profiler: `ant microbench-with-profiler` self-installs 2.9 into
+  build/async-profiler (rig has internet); `-Dprofiler.opts="event=cpu;output=collapsed"`
+  writes collapsed-cpu.csv under build/test/profiler/<benchmark-params-dir>/.
+
 ## Phase 0 execution results (2026-07-05, post-reboot)
 - Kernel: **6.8.0-124-generic** (HWE; upgraded from 5.15.0-168) — meets ≥5.19 floor AND ≥6.1
   → Phase 1 top flag tier available (SINGLE_ISSUER|DEFER_TASKRUN); registered ring fds available.

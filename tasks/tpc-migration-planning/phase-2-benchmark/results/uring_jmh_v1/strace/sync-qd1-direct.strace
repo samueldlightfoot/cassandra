@@ -1,0 +1,36 @@
+strace: Process 290943 attached with 24 threads
+strace: Process 290983 attached
+strace: Process 290984 attached
+strace: Process 290985 attached
+strace: Process 290986 attached
+strace: Process 290987 attached
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ------------------
+ 59.56    0.027888         112       248        22 futex
+ 34.95    0.016362        2045         8         1 restart_syscall
+  2.27    0.001065           4       240           gettid
+  0.76    0.000358          14        25           mmap
+  0.74    0.000346           6        57           rt_sigprocmask
+  0.61    0.000284          14        20           mprotect
+  0.50    0.000234          29         8           write
+  0.42    0.000196          14        14           madvise
+  0.19    0.000089           7        12           pread64
+  0.00    0.000000           0        12           read
+  0.00    0.000000           0         2           close
+  0.00    0.000000           0        12           lseek
+  0.00    0.000000           0         1           munmap
+  0.00    0.000000           0         1           access
+  0.00    0.000000           0         1           shutdown
+  0.00    0.000000           0         1           getsockopt
+  0.00    0.000000           0         3         1 unlink
+  0.00    0.000000           0         1           getrusage
+  0.00    0.000000           0         5           prctl
+  0.00    0.000000           0        13           sched_getaffinity
+  0.00    0.000000           0         4           clock_nanosleep
+  0.00    0.000000           0         2         2 openat
+  0.00    0.000000           0         5           set_robust_list
+  0.00    0.000000           0         1           statx
+  0.00    0.000000           0         5           rseq
+  0.00    0.000000           0         5           clone3
+------ ----------- ----------- --------- --------- ------------------
+100.00    0.046822          66       706        26 total

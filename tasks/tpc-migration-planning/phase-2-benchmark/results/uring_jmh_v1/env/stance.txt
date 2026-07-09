@@ -1,0 +1,1 @@
+governor=performance irqbalance=stopped(prev=active) bench_cpu=2 sampler_cpu=0

@@ -1,0 +1,14 @@
+# xfs-a4-psync-nj1 (generated — do not hand-edit)
+[global]
+ioengine=psync
+rw=write
+bs=256k
+direct=0
+filename=/bench-xfs/uring-bench-seqwrite.dat
+size=32g
+end_fsync=1
+thread=1
+group_reporting=1
+cpus_allowed=2
+[job]
+iodepth=1
