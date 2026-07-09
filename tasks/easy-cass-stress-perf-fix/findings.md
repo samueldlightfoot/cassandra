@@ -4,23 +4,22 @@
 Cassandra throughput. The investigation chased a supposed load-gen ceiling — but the real
 finding is a **measurement-methodology error**, not a tool bug.
 
-## TL;DR (corrected — read this)
-- **The `Random.getText()` build-once change is NOT a meaningful fix.** Measured server-side,
-  back-to-back, same conditions: unfixed **132,326 w/s** vs fixed **139,606 w/s** = ~5% (noise),
-  NOT the "14×" first claimed. The bytecode confirms it: `generate(length)` does the real work
-  (per-char loop) and is unchanged by building the generator once; `build()` just allocates one
-  object. **Do not treat Random.kt as the answer.** (Rig left UNFIXED / clean.)
-- **The actual root problem was BAD MEASUREMENT:** easy-cass-stress **client-reported throughput
-  is ~2× inflated and unreliable** (250k reported vs 135k real). The earlier "16k, load-gen
-  limited, Cassandra idle" narrative was built on client-side numbers and offered-rate/ladder
-  artifacts. **Always measure server-side: `nodetool tablestats <ks> | Local write count` delta
-  over a fixed wall-clock window.**
-- **Reality with proper measurement:** the tool drives **~132–140k writes/s server-side** at
-  `--rate 2000000`, and Cassandra runs at ~61% CPU there (client cores ~97%). So Cassandra is
-  NOT trivially idle — it's genuinely loaded, though not yet saturated. Whether the remaining
-  ceiling is client or server needs the server-side method + a proper sweep (see task_plan.md).
-- **Net:** the multi-turn chase (connections/cores/processes/driver/value-gen) was mostly
-  measuring client-side noise. Restart clean with server-side throughput as ground truth.
+## TL;DR (FINAL — supersedes everything below)
+- **`cassandra-easy-stress` output is RELIABLE.** Verified: at sane offered rates the client count
+  matches `nodetool` Local write/read count **to the digit** (40k/50k/100k rungs = ratio 1.00). The
+  mid-investigation "client ~2× inflated" claim was WRONG — it only breaks at `--rate 2000000`
+  (extreme overload). (Also: the tool is `cassandra-easy-stress`, not "easy-cass-stress".)
+- **The `Random.getText()` build-once change is NOT a fix** (server-side A/B: ~5%, noise, not 14×).
+  Bytecode confirms `generate()` does the real work and is unchanged by building once. Dead end.
+- **The REAL issue was too-low `--rate`.** The tool delivers only ~0.1–0.25× of nominal `--rate`,
+  so `baseline_v1`'s rungs (offered 10k–130k) put only ~5–30k ops/s on the server and MutationStage
+  stayed IDLE — Cassandra was never loaded. Achieved-vs-offered (server-side writes): 40k→5k,
+  200k→27k, 800k→98k, 2M→231k. So the "16k write" is an accurate LOW-LOAD point, not capacity.
+- **Fix = re-run with much higher `--rate` (or multiple client processes)** until Cassandra
+  actually loads (MutationStage/CPU climb). Cross-check throughput server-side (client is fine
+  except under extreme overload). Action: `../tpc-migration-planning/phase-4-poc/REBASELINE-HANDOFF.md`.
+- **Net:** the multi-turn chase (connections/cores/processes/driver/value-gen/"2× inflated") was a
+  string of measurement mistakes on my part. The tool was fine; the offered load was too low.
 
 ## Superseded (kept for the record, DO NOT trust the numbers)
 The sections below were written mid-investigation using unreliable client-side throughput and a

@@ -226,16 +226,17 @@ common thread: **`rc=0` / "it ran" is not evidence of success** — verify at th
     a real secondary factor, but value-gen CPU is the dominant cost.)
   - **Confound to control:** large duration-dependent decay (20s→44k, 60s→16k) — likely client GC
     from value-gen allocation + server flush — swamped several knob tests; not fully isolated.
-  - **RE-RESOLVED 2026-07-09 — the real issue was MEASUREMENT, not the value generator:** a
-    server-side back-to-back A/B (the only trustworthy method) showed the `Random.getText()`
-    build-once change gives ~5% (132k→139k w/s), NOT the "14×" first claimed — that was an
-    artifact of comparing non-comparable runs. **easy-cass-stress client-reported throughput is
-    ~2× inflated/unreliable** (250k reported vs 135k real); the whole "16k, load-gen limited,
-    Cassandra idle" narrative was client-side noise. Measured server-side (`Local write count`
-    delta), the tool already drives **~132–140k w/s** and loads Cassandra to ~61% CPU. So A16's
-    magnitude was overstated throughout: Cassandra was NOT trivially idle. **baseline_v1's
-    throughput numbers are client-reported → invalid; re-baseline server-side.** Full corrected
-    writeup + known-good params: `tasks/easy-cass-stress-perf-fix/` (findings.md TL;DR).
+  - **FINAL RESOLUTION 2026-07-09 (two wrong turns corrected): client output is RELIABLE; the bug
+    was too-low `--rate`.** (1) The `Random.getText()` build-once "14× fix" was a measurement
+    artifact (server-side ~5%). (2) The "client is ~2× inflated" claim was ALSO wrong — verified:
+    at sane rates the client count matches `nodetool` Local write/read count to the digit (40k/50k/
+    100k rungs = ratio 1.00); it only breaks at `--rate 2M` overload. The REAL issue: **the tool
+    delivers ~0.1–0.25× of nominal `--rate`, so baseline_v1's low offered rates (10k–130k) delivered
+    only ~5–30k w/s and Cassandra's MutationStage stayed IDLE at every point.** Achieved-vs-offered
+    (server-side writes): 40k→5k, 200k→27k, 800k→98k, 2M→231k, MutationStage idle to ~100k+. So the
+    "16k write" etc. are accurate LOW-LOAD points, not Cassandra's capacity. **Re-run baseline with
+    much higher `--rate` (or multi-process) so Cassandra is actually loaded** — see
+    `REBASELINE-HANDOFF.md`. Cassandra was never near saturated in baseline_v1.
 - **Lesson:** never infer a server bottleneck from throughput ÷ concurrency — MEASURE server
   apply latency (tablestats/proxyhistograms) and check whether the SERVER stage is actually
   saturated (tpstats Active/Pending) and whether a resource is pegged. Idle CPU + idle disk +

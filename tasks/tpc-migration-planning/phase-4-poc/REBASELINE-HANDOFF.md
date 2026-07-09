@@ -3,16 +3,25 @@
 **Write date:** 2026-07-09. **Read this first, act on §6.** Self-contained: you should not
 need the originating session's context.
 
-## 1. Why we're re-running
-The committed baseline (`poc-criteria.md` §8, `baseline_v1`) measured throughput from the
-easy-cass-stress **client stdout**, which was discovered to be **~2× inflated and unreliable**
-(server-side back-to-back A/B: client reported ~250k w/s while `nodetool` counted ~135k). So all
-`baseline_v1` throughput figures (clean_max write ~15k / bal ~22k / read ~73k, the ladder curves,
-and the 50%/80% operating points derived from them) are **not trustworthy** and must be
-re-captured measuring **server-side**. Full corrected investigation (what was ruled out, the ~2×
-discovery, the retracted "14× value-gen fix"): `../../easy-cass-stress-perf-fix/findings.md`.
+## 1. Why we're re-running (CORRECTED premise)
+`cassandra-easy-stress` client output is **reliable** — verified: at sane offered rates the client
+count matches `nodetool` Local write/read count **to the digit** (40k, 50k, 100k rungs all ratio
+1.00). The earlier "client is ~2× inflated" claim was WRONG — it was an artifact of driving the
+tool at `--rate 2000000` (extreme overload), where the client's periodic reporting breaks down.
+Client numbers are trustworthy at non-overload rates.
 
-**This is a scoped redo of the NUMBERS, not the framework.**
+**The real problem: `baseline_v1`'s offered `--rate` was far too low, so Cassandra was never
+loaded.** The tool delivers only ~0.1–0.25× of the nominal `--rate`, so the baseline's rungs
+(offered 10k–130k) delivered only ~5–30k w/s and MutationStage stayed idle at every point — the
+"clean_max write ~16k / bal ~22k / read ~73k" figures are accurate LOW-LOAD points, NOT Cassandra's
+capacity. Achieved-vs-offered measured (server-side, writes): 40k→5k, 200k→27k, 800k→98k, 2M→231k;
+MutationStage idle throughout up to ~100k+. So re-run with **much higher `--rate` (or multiple
+client processes)** to actually push Cassandra toward saturation, and pick gate operating points
+where Cassandra — not the client — is the thing under test.
+
+**This is a scoped redo of the NUMBERS + offered-load levels, not the framework.** Full corrected
+load-gen investigation: `../../easy-cass-stress-perf-fix/findings.md` (note: its "14× value-gen
+fix" is a DEAD END — ignore).
 
 ## 2. What's INVALID (redo) vs VALID (keep)
 | Invalid → redo | Valid → keep as-is |
@@ -52,17 +61,20 @@ taskset -c 8-11 cassandra-easy-stress run KeyValue \
 - `--threads 32` (more doesn't help). `--no-schema` to reuse the keyspace.
 - populate (if needed): `--populate $((2000000/32))` (PER-THREAD! A3) `--rate 2000000 --drop`.
 
-## 5. THE measurement rule (this is the whole point)
-**Throughput = SERVER-side only.** Client stdout throughput is ~2× high — never use it.
+## 5. Measurement rule
+Client stdout throughput is FINE at non-overload rates (matches server exactly). But **cross-check
+with server-side** and use it as the authority when pushing hard (client reporting degrades under
+extreme overload, e.g. `--rate 2M`):
 ```
 lwc(){ nodetool tablestats cassandra_easy_stress | awk '/Local write count/{print $NF}'; }
-# during a running load cell, after ~8s warmup:
-B=$(lwc); sleep 30; A=$(lwc); echo "server write rate = $(( (A-B)/30 ))/s"
+B=$(lwc); <run cell>; A=$(lwc); echo "server write rate = $(( (A-B)/duration ))/s"   # brackets the run
 ```
-Also capture, per cell: `nodetool proxyhistograms` (coordinator R/W latency = server-side truth,
-µs), `nodetool tpstats | grep -E '^(Mutation|Read)Stage'` (Active/Pending = saturation signal),
-mpstat on Cassandra cores 0–7 (CPU headroom). Client-side `--csv-latency`/`--hdr` may be kept for
-CO-corrected client latency, but LABEL it client-observed and defer to proxyhistograms.
+Per cell also capture: `nodetool proxyhistograms` (coordinator R/W latency, µs — server truth),
+`nodetool tpstats | grep -E '^(Mutation|Read)Stage'` (Active/Pending = the SATURATION signal — the
+baseline never got these off idle), mpstat on Cassandra cores 0–7 (CPU headroom). The offered rate
+must be high enough that MutationStage/ReadStage actually build and/or Cassandra CPU climbs — that's
+the whole point of the re-run. Keep client `--csv-latency`/`--hdr` for latency but avoid overload
+rates where latency becomes coordinated-omission noise.
 
 ## 6. WHAT TO RE-RUN (the action)
 **Step A — bottleneck map (new, load-bearing).** For each mix (write r=0, balanced r=0.5, read

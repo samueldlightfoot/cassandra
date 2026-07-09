@@ -195,29 +195,15 @@ A14; offered shown for reproducibility). p99 in ms (client, CO-corrected).
 | **read** ach | 5.5k | 11k | 22.2k | 33.6k | 50.1k | 72.9k | overload(3040ms, 2.6% err) | **72.9k** @ 47ms p99 |
 | **read** w/r p99 | .26/.24 | .28/.27 | .44/.34 | 16.8/22 | 1.6/2.2 | 47/25 | — | |
 
-**Reading — the throughput numbers are LOAD-GENERATOR-LIMITED, not Cassandra-limited
-(re-diagnosed 2026-07-09 after an initial wrong call; hurdle A16).** write ~16k, balanced ~22k,
-read ~73k achieved. What the SOURCE metrics actually show:
-- **Server write apply is ~11µs** (`tablestats` Local write latency 0.011ms), coordinator
-  write 17µs median / 770µs p99 (`proxyhistograms`) — fast, exactly as expected for periodic
-  commitlog (no per-write fsync) + in-memory memtable. An earlier "~2ms apply" figure was a
-  Little's-Law *derivation* (32 ÷ 16k), NOT measured — it is RETRACTED.
-- **Cassandra is not the bottleneck:** MutationStage idle at sustainable rates (Active=1);
-  CPU ~27%, commitlog disk 1.6% util. Server write capacity ≈ 32 threads / 11µs ≈ millions/s.
-- **Proof it's the client, not the server:** server write apply (11µs) is ~20× FASTER than
-  server read (0.223ms Local read latency), yet write THROUGHPUT (16k) is LOWER than read
-  (73k). Impossible if server-limited — only possible if the load generator caps it. The
-  client's per-WRITE cost (random value generation + larger payload through its 32-thread /
-  rate-limited async pipeline) exceeds its per-read cost, so it emits fewer writes/s. Raising
-  client threads 32→128 didn't help (pipeline/rate-limiter bound, not thread bound).
-- **Methodology consequence (important):** this single-box, co-located easy-cass-stress setup
-  cannot saturate Cassandra's write path, so these are NOT Cassandra's throughput ceilings and
-  the baseline **cannot demonstrate server-side throughput headroom**. A/B LATENCY-at-fixed-
-  offered-rate comparisons remain valid (both arms share the identical client limit), but any
-  TPC THROUGHPUT gain will be invisible until the load generator can outrun the server —
-  needs a more efficient / multi-process / off-box load generator (tracked: hurdle A16, must
-  resolve before throughput claims). The read/write delta itself is benign: it's the client's
-  per-op cost difference.
+> **⚠ SUPERSEDED — these numbers are accurate but at TOO-LOW LOAD; re-run required (2026-07-09).**
+> The client counts here are RELIABLE (verified client==server to the digit at sane rates), but the
+> offered `--rate` was far too low: `cassandra-easy-stress` delivers only ~0.1–0.25× of nominal
+> `--rate`, so these rungs put ~5–30k ops/s on the server and **MutationStage stayed idle at every
+> point** — Cassandra was never loaded. So "clean_max write ~16k / bal ~22k / read ~73k" are
+> low-load operating points, NOT Cassandra's capacity (server-side writes go to ~231k at `--rate
+> 2M`, still MutationStage-idle at ~100k). **Re-run at much higher `--rate` / multi-process per
+> `REBASELINE-HANDOFF.md`.** All the mid-investigation "load-generator-limited / client-CPU-bound /
+> ~2× inflated / 14× value-gen fix" conclusions were WRONG turns — see hurdles A16 final resolution.
 
 ### 8.2 Operating points — p99 at fixed offered rate, 3-iter noise band (Phase B) → the gate reference
 p99 median [min–max across 3 iters], ms. **50% points are STABLE; 80% points sit near the knee
