@@ -573,6 +573,111 @@ cells; user prior = full-Scylla, recorded.
 **Phase 4 is unblocked.** Next: /phase-start tasks/tpc-migration-planning/phase-4-poc
 → 4.1 baseline + poc-criteria.md (both pins restated there), then I0/I1.
 
+## 2026-07-09 — Session 9: Phase 4 model policy + 4.1 baseline staged (PAUSED mid-setup)
+
+**Model policy (committed `ae53c542dc`):** phase-4 spec D11 + per-increment `Model`
+rows in increments.md. Opus is default (builds/bench/docs); Fable metered to I3,
+I4b/I4a, every adversarial spec+patch review, tail-gate-FAIL root-causing, the 4.4
+verdict. Also fixed spec 4.2's stale I4 order (a→b→c → b→a→c, matching increments.md).
+
+**4.1 kickoff — poc-criteria.md written (methodology + criteria PINNED; baseline
+numbers ⟨TBD⟩).** Informed by BOTH runbooks (tpc runbook + the flush-pacing-poc
+RUNBOOK the user pointed to). Key methodology decisions now pinned in the doc:
+- Baseline build = `tpc-migration` HEAD = trunk-equivalent on the serving path
+  (verified: `git diff trunk...tpc-migration -- src/` = only `io/uring/*` +2 inert
+  `CassandraRelevantProperties` lines). ONE build is both the trunk baseline AND every
+  increment's flag-off arm (same lineage, no cross-build confound).
+- Config pins: trie memtable, periodic commitlog, disk_access_mode standard,
+  auto_snapshot false, RF=1 single-node, G1 16G heap.
+- Device separation (flush-PoC): data → /data/tpc-poc (nvme1n1p3), commitlog →
+  /commitlog/tpc-poc (nvme0n1p1).
+- Workloads: KeyValue ×3 mixes (w/rw/r) = the gate; BasicTimeSeries secondary.
+- 3 signals: stress stdout (authoritative) + `--hdr`/`--csv-latency` (true pctiles) +
+  nodetool proxyhistograms; GC log overlay (GC-dominates-tail lesson — raw p99 is
+  G1-noise on this NVMe, attribute before filing).
+- CPU fence: Cassandra cores 0–9, easy-cass-stress cores 10–11, mpstat headroom proof.
+- Launch discipline folded in: setsid detached, `pkill 'Cassandra[D]aemon'` self-excl,
+  verify-ready-from-fresh-conn, uptime-first (box auto-reboots), failure-covering greps.
+- Oversubscription (§8-5) + caching-model provisional (§8-8/§5.1) restated verbatim;
+  rebase cadence = each increment boundary + re-baseline trigger on serving-path drift.
+
+**Rig staged (nothing running):** rsync'd HEAD → /root/repos/fork/cassandra-tpc;
+`ant jar` fresh (15:59, verified TrieMemtable+StorageProxy+UringRing in jar);
+governor→performance (was powersave); dirs created; dedicated conf at
+/data/tpc-poc/conf with all pins applied + verified (no dup keys); heap/GC pinned in
+cassandra-env.sh; G1 confirmed active for JDK17. Key-auth SSH works (dropped password).
+easy-cass-stress on `feature/csv-latency`, jar built.
+
+**PAUSED before starting the node** (user request). Next: start CPU-fenced node,
+verify "ready" from fresh conn, smoke a short KeyValue cell (validate connect + HDR +
+csv-latency + GC log + proxyhistograms), then launch the 3-iteration baseline capture,
+fill poc-criteria.md §8, commit.
+
+### 2026-07-09 — Session 9 (cont.): node up, --hdr resolved, baseline sweep LAUNCHED
+- Node started CPU-fenced (cores 0–9), self-daemonized, "Startup complete" on 9042.
+  Verified: heap 16G, disk_access_mode=standard, commitlog periodic, auto_snapshot=false,
+  RF=1, and **trie memtable ACTIVE** (definitive: `type=TrieMemtable` MBeans on the
+  keyvalue table — the exact I1 Contended/Uncontended-puts counters). 30s smoke: connects,
+  0 errors, HDR triplet + csv-latency + GC log + proxyhistograms all produced.
+- **--hdr investigated (subagent, kept out of main context):** NOT broken. Writes
+  `<prefix>-{mutations,reads,deletes}.txt` (ms, CO-corrected same value as --csv-latency
+  and stdout; rig branch byte-identical). Only caveat: populate contaminates -mutations.txt
+  within ONE invocation → driver populates separately so measured cells are clean. Memory
+  saved (feedback_easy_cass_stress_hdr_semantics); poc-criteria §4 updated; optional
+  upstream fix (gate collect on populatePhase) noted, not required.
+- **Baseline sweep launched** (baseline_driver.sh, setsid-detached, ~50min): populate 5M →
+  90s warmup → 3 saturation cells (find max/mix) → 9 reference cells (3 mixes w/rw/r ×
+  3 iters @ 70% max), 240s steady each, per-cell env+mpstat+proxyhist+tpstats+GC capture.
+  Background poller watching for SWEEP_COMPLETE / FATAL / stall.
+- Uncommitted locally: poc-criteria.md, baseline_driver.sh, the two model-policy docs
+  already committed (ae53c542dc). Commit poc-criteria + driver + fill §8 when sweep lands.
+
+### 2026-07-09 — Session 9 (cont.): baseline debugging — 12 hurdles found, documented, fixed
+First sweep produced GARBAGE (completed in ~1min, all cells empty, rc=0). Root-caused a
+cascade of bring-up hurdles; ALL now documented in **phase-4-poc/hurdles.md §A** (the 4.3
+deliverable, structured to seed the user's centralised Cassandra runbook) + 2 memories
+(easy_cass_stress_scripted_run_gotchas, _hdr_semantics). The load-bearing ones:
+- **A2 Prometheus :9500 collision** — every stress run binds :9500; a leftover run → all
+  subsequent runs BindException→exit rc=0 with no work. Fix: `--prometheusport 0`.
+- **A12 default `--rate 5000` throttle** — "no --rate" caps at 5000/s, NOT unlimited.
+  Saturation cells delivered ~1.3k/s with BOTH fences idle (concurrency <1). `--rate 500000`
+  → **~46k ops/s** (35×). THE reason nothing saturated. ~46k is the client ceiling on 4
+  cores (bumping connections gave +4%); label saturation as client- vs server-limited via
+  mpstat.
+- **A3 `--populate N` is PER THREAD** (total=N×threads) — 5M×48=240M rows, ETA 130h.
+  Fix: `--populate T/threads`.
+- **A1 rc=0 ≠ success** — added fail-fast gates (populate error grep + first-cell ops>0).
+- **A9 CPU-fence** — client on 2 cores was bottleneck; re-pinned Cassandra 0–7 (live
+  taskset), client 8–11 (4 cores); mpstat proves headroom.
+- Also A4 heap-set-too-late, A5 ssh-hang-on-`-f`, A6 pkill self-match (exit 255), A7 zombie
+  JVMs, A8 gradle daemon in the fence, A10 prove-trie-via-MBean, A11 tool gotchas.
+- Driver hardened for every one (preflight clean-slate + port assert, prometheus off,
+  per-thread populate + watchdog, high sat rate, fail-fast, bracket-trick pkills, mpstat on
+  client cores). md5-verified deploys.
+- **Relaunched (validated):** populate now ~72k/s (2M in ~27s); sweep running under monitor.
+  Config all proven (trie MBeans, 16G, standard, periodic, RF=1). Next: sweep lands → fill
+  poc-criteria §8 → commit criteria+driver+hurdles.
+
+### 2026-07-09 — Session 9 (cont.): baseline_v1 CAPTURED (clean) — 4.1 done pending commit
+Took 5 launches; launches 2–4 caught by the /loop (every 10min) BEFORE wasting full runtime.
+Two more hurdles found+fixed after the earlier 13: **A13** open-loop unlimited `--rate` =
+coordinated-omission meltdown (25–60M errors, multi-sec p99) not saturation → rewrote to a
+rate-ladder model; **A14** achieved ≈ 0.53× nominal rate even when clean (don't gate on
+achieved<offered; use errors+p99); **A15** stress rows are `|`-separated column GROUPS so awk
+field indices shift (reads=$5/$6, errors=$13, not $4/$5/$10) — this caused a false 165222ms
+"read p99" FATAL; fixed + VERIFIED against real cells before relaunch. **15 hurdles total** in
+hurdles.md §A.
+- **baseline_v1 (0 errors everywhere, valid):** clean sustainable max (achieved) = write
+  **~14.7k/s** (p99 knee 9ms), balanced **~22.2k/s**, read **~72.9k/s**. Write ceiling is
+  Cassandra-side (single-node commitlog-periodic+flush), NOT client (same client drives 73k
+  reads → hurdle A9 client-limit worry settled). 50%-of-clean_max operating points are stable
+  (sub-ms to few-ms p99) = the gate reference; 80% near-knee points are noisy (~8× p99 spread)
+  = shape only. Curves + noise band in poc-criteria.md §8/§5.
+- User created `~/repos/agent-common/CLAUDE.md` + task CLAUDE.md pointing to it (their
+  centralised Cassandra runbook) — my hurdles.md §A should be ported there next.
+- Next: commit (criteria+driver+hurdles+progress); then port hurdles to agent-common; then
+  4.1 gate = criteria committed before increment code → begin I0/I1.
+
 ## 2026-07-09 — Session 8 (cont.): Scylla end-game directive folded in
 
 User directive (generalizing the I/O prior): every design area treats ScyllaDB's
