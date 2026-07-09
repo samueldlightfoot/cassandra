@@ -195,10 +195,24 @@ A14; offered shown for reproducibility). p99 in ms (client, CO-corrected).
 | **read** ach | 5.5k | 11k | 22.2k | 33.6k | 50.1k | 72.9k | overload(3040ms, 2.6% err) | **72.9k** @ 47ms p99 |
 | **read** w/r p99 | .26/.24 | .28/.27 | .44/.34 | 16.8/22 | 1.6/2.2 | 47/25 | — | |
 
-**Reading:** the write path caps at **~16k ops/s** (achieved), balanced at ~22k, read-heavy
-at ~73k. The write ceiling is Cassandra-side (single-node commitlog-periodic + memtable/flush),
-NOT the client — the same 4-core client drives 73k reads/s, so it has ample headroom (settles
-hurdle A9's client-limit worry: not client-bound).
+**Reading — the read/write delta is a stage-concurrency × latency limit, NOT a resource ceiling
+(diagnosed 2026-07-09):** write ~16k, balanced ~22k, read ~73k achieved. Mechanism, proven:
+- `concurrent_writes = concurrent_reads = 32` (default). Throughput per path = 32 ÷ per-op
+  latency. Write apply ≈ 2.0ms (32/16k) vs cached read ≈ 0.44ms (32/73k) → the ~5× throughput
+  delta is exactly the ~5× latency delta. Durable write apply (commitlog append + memtable
+  insert) is ~4.5× a cached read.
+- At the write plateau **nothing is saturated**: Cassandra cores ~27% busy, client cores ~47%,
+  commitlog device (nvme0n1) **1.6% util** (30 MB/s, 1.74ms await), data device idle. Raising
+  the CLIENT to 128 threads did NOT raise write throughput (32→34k in a 25s burst) — the gate
+  is the SERVER's MutationStage (Active=32, Pending=84 mid-run), not the client or hardware.
+- **This is the TPC opportunity, not an anomaly:** the write path is serialization/latency-
+  bound (~2ms apply on idle CPU/disk = lock/commitlog contention through a 32-thread SEP
+  stage) — precisely what I1 (shard-routed apply, no memtable lock) and I4 (per-shard
+  commitlog/writeOrder, no global CAS) attack. Cutting apply latency raises throughput at the
+  same concurrency. The client is NOT the limit (settles hurdle A9).
+- **Duration-sensitive:** writes did 33k in a 25s burst but ~16k over 60s (MemtableFlushWriter
+  active mid-run) — flush backpressure builds, so the 60s figure is the honest steady state;
+  a longer cell may settle lower still. Read/balanced are not flush-sensitive at these rates.
 
 ### 8.2 Operating points — p99 at fixed offered rate, 3-iter noise band (Phase B) → the gate reference
 p99 median [min–max across 3 iters], ms. **50% points are STABLE; 80% points sit near the knee
