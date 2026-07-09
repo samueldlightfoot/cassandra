@@ -572,3 +572,15 @@ cells; user prior = full-Scylla, recorded.
 
 **Phase 4 is unblocked.** Next: /phase-start tasks/tpc-migration-planning/phase-4-poc
 → 4.1 baseline + poc-criteria.md (both pins restated there), then I0/I1.
+
+## 2026-07-09 — Session 8 (cont.): Scylla end-game directive folded in
+
+User directive (generalizing the I/O prior): every design area treats ScyllaDB's
+model as end-game influence, not gospel. Added design-target §10 — per-decision
+Scylla reference map (ALIGNED: per-shard commitlog, strict ownership;
+TRANSITIONAL-with-destination: I/O pool→continuations, node-global→per-shard
+admission/memory/cache, inbox hop→shard-aware protocol; DIVERGENT-with-measurement:
+Netty ~1%, maintenance pools vs shard-owned scheduling groups — the latter now has
+a named revisit trigger). Pointers added in increments.md §10 + effort.md §4;
+memory saved (scylla-endgame-influence). CEP framing line: adopted, destined, or
+diverged-with-evidence — never by accident.

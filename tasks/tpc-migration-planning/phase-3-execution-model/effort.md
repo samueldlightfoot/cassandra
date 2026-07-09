@@ -61,8 +61,12 @@ increment (QD1 parity through JNA is already free — B/A 1.00).
 measured PoC; every step flag-gated, tail-gated, and revertible; the riskiest
 engineering (commitlog coverage protocol, async coordinator) is now designed to
 code-level with its failure modes named by adversarial review. Carries a real hedge:
-I3 and I4c stand alone if the program stops. The cost is discipline — five
-increments, each with an A/B, is slower than a branch-and-rewrite.
+I3 and I4c stand alone if the program stops. Its end-game is Scylla-referenced per
+decision (design-target §10): aligned where their model is proven (per-shard
+commitlog, strict ownership), transitional-with-destination where we migrate
+(I/O pool → continuations, global → per-shard budgets), divergent-with-measurement
+where Cassandra's facts differ (Netty, maintenance pools). The cost is discipline —
+five increments, each with an A/B, is slower than a branch-and-rewrite.
 
 **DSE-6-style full TPC (adopt/port the 2016-era architecture).** Rewrites the
 scheduler, I/O, and every hot path in one arc; the 2016 POC's own numbers (+15%

@@ -206,3 +206,8 @@ Ranked; this is the program's de-risk (spec §3.4 requirement):
   this is what keeps mixed-version risk at "node-local" (effort.md register).
 - **Flags are startup-pinned** (`CassandraRelevantProperties`, read-once static
   final — hot-swap creates mixed-writer windows; phase-4 §0).
+- **Every CEP-era item above has a Scylla reference** (user directive 2026-07-09:
+  influence, not gospel) — design-target §10 is the per-decision map; when a
+  CEP-era item is picked up, consult its row first (e.g. read continuations, not
+  pool growth; per-shard admission; scheduling groups as the maintenance
+  direction).

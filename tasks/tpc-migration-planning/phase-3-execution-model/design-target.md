@@ -469,3 +469,33 @@ plain executors behind existing seams (`ChannelProxy.read`;
 `SecondaryIndexManager`/`TriggerExecutor` call sites). Arm A/arm B divergence is
 confined to the I/O mode at the I2 seam and ChunkCache sizing — the shard model ships
 identical bytes for both (§2), which is what makes the Phase 4 A/B a fair adjudicator.
+
+---
+
+## 10. Scylla as the end-game reference (user directive 2026-07-09: influence, not gospel)
+
+Scylla/Seastar is the shipped, at-scale instance of thread-per-core on this data
+model. Per-decision map — where this design ALIGNS Scylla is CEP citation material
+(proven operationally); where it DIVERGES the divergence must stay a conscious,
+evidenced choice with a revisit trigger; where it is TRANSITIONAL, Scylla's answer
+is the recorded destination. Phase 4/5 extend this table as decisions are revisited.
+
+| Decision here | Scylla's answer | Status + influence taken |
+|---|---|---|
+| D2 I/O arms | DIO everywhere + userspace cache (row cache + their cache tier); page cache bypassed entirely | **Arm B IS the Scylla model** and the user's prior; adjudicated at I2b's pool×A/pool×B cells. Aligned-if-B-wins. |
+| §3 small I/O pool | No pool exists — per-shard ring holds many in-flight I/Os via continuations, arbitrated by the Seastar I/O scheduler (priority classes, per-shard concurrency) | **TRANSITIONAL.** The pool's terminal-size-zero note (§3 item 5) is exactly Scylla's shape; influence = CEP-era effort goes to chunk-level read continuations (shrinking the pool to zero), NOT to growing/tuning the pool. |
+| D3 maintenance off-shard (pools kept) | **DIVERGENT — Scylla runs compaction/streaming/repair ON shard threads** under Seastar scheduling groups + I/O priority classes; no maintenance pools at all. Isolation comes from the scheduler, not from separate threads | Pools are the right MIGRATION answer (10994 consensus; zero new scheduler machinery; maintenance can't steal a shard's core). The Scylla-informed end-game candidate: once I2b's custom shard loop exists, scheduling groups on shard threads can absorb maintenance — full shard ownership of the disk, no pool/shard core competition. **Revisit trigger:** A/B cells showing maintenance-pool vs shard-thread core interference under the accepted oversubscription stance, or arm B winning (DIO compaction wants ring/scheduler integration anyway). CEP frames pools as stage 1, scheduling groups as the recorded direction. |
+| D6 strict ownership, no stealing | Same — no work stealing; hot-partition = hot-shard ceiling accepted | **ALIGNED (cite).** Their mitigation is also config-shaped (tablets/resharding); our per-table `shards` lever is the analogue. |
+| §0 routing ceiling (one inbox hop) | Shard-aware drivers: connection-per-shard, `SCYLLA_NR_SHARDS` handshake, zero in-node hop | **TRANSITIONAL (already recorded).** The protocol extension is the known destination (roadmap item 13); shipped prior art, sequencing choice. |
+| D3 item 2: Netty stays | **DIVERGENT — Seastar owns networking** (userspace TCP option, DPDK lineage) | Conscious, evidenced divergence: 10993 measured netty-queue overhead ~1% at saturation; the win is storage-path affinity. This row is the exemplar of "influence, not gospel". Revisit only if post-I5 profiles contradict the ~1%. |
+| H2 commitlog option (a): per-shard managers (design-hostiles §2) | **Scylla runs a commitlog PER SHARD** — same shape, proven at scale for years | **ALIGNED (cite in CEP).** Strong external validation for (a) over (b); their per-shard log + shard-owned fsync also foreshadows N sync threads if W-SYNC fires. |
+| H4 memory: per-shard allocators, global cap (design-hostiles §3) | **Static per-shard memory partition** — Seastar splits ALL memory at boot, per-shard allocator, no global pool; LSA per shard | **TRANSITIONAL.** Step 1 (allocator-per-shard) + step-2 slack batching walk toward Scylla's shape; the global cap/cleaner is the deliberate residual (avoids per-shard OOM imbalance while writers can still be off-shard). End-game candidate once routing is total: per-shard memtable budgets. Sphinx LSMA (already cited) is the same lineage. |
+| I3 admission: node-global ops limiter (design-async §4) | **Per-shard admission control** — reader concurrency semaphore + memory-based admission, per shard | **TRANSITIONAL.** Node-global 1024 is right while completion lives on RR/requestExecutor; when completions move to shard inboxes (the CEP-era executor swap, §8.2 hop 7), the limiter's natural end-game is per-shard, Scylla-shaped. |
+| H5 shared ChunkCache/BufferPool (deferred) | **Per-shard cache** — Scylla's row/data cache is part of each shard's memory slice | **ALIGNED-ON-TRIGGER (already recorded):** arm B winning reopens H5 as the per-shard cache design — that IS the Scylla model; §2's arm-B addendum and design-hostiles §4's un-defer trigger already say so. |
+| D7 Accord coexistence | No analogue (no Accord); nearest: their raft/tablet services run as Seastar services on shards | No influence available — this is the program's genuinely novel surface, which is why it leads the CEP's external-review risk. |
+
+One-line summary for the CEP: **where Scylla has an answer, this design either
+adopts it (per-shard commitlog, strict ownership, arm B candidate), records it as
+the explicit destination of a transitional form (I/O pool → continuations, global
+→ per-shard admission/memory/cache, inbox hop → shard-aware protocol), or diverges
+with a measurement attached (Netty, maintenance pools) — never by accident.**
