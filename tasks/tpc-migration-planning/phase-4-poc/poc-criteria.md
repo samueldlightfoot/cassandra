@@ -195,24 +195,29 @@ A14; offered shown for reproducibility). p99 in ms (client, CO-corrected).
 | **read** ach | 5.5k | 11k | 22.2k | 33.6k | 50.1k | 72.9k | overload(3040ms, 2.6% err) | **72.9k** @ 47ms p99 |
 | **read** w/r p99 | .26/.24 | .28/.27 | .44/.34 | 16.8/22 | 1.6/2.2 | 47/25 | — | |
 
-**Reading — the read/write delta is a stage-concurrency × latency limit, NOT a resource ceiling
-(diagnosed 2026-07-09):** write ~16k, balanced ~22k, read ~73k achieved. Mechanism, proven:
-- `concurrent_writes = concurrent_reads = 32` (default). Throughput per path = 32 ÷ per-op
-  latency. Write apply ≈ 2.0ms (32/16k) vs cached read ≈ 0.44ms (32/73k) → the ~5× throughput
-  delta is exactly the ~5× latency delta. Durable write apply (commitlog append + memtable
-  insert) is ~4.5× a cached read.
-- At the write plateau **nothing is saturated**: Cassandra cores ~27% busy, client cores ~47%,
-  commitlog device (nvme0n1) **1.6% util** (30 MB/s, 1.74ms await), data device idle. Raising
-  the CLIENT to 128 threads did NOT raise write throughput (32→34k in a 25s burst) — the gate
-  is the SERVER's MutationStage (Active=32, Pending=84 mid-run), not the client or hardware.
-- **This is the TPC opportunity, not an anomaly:** the write path is serialization/latency-
-  bound (~2ms apply on idle CPU/disk = lock/commitlog contention through a 32-thread SEP
-  stage) — precisely what I1 (shard-routed apply, no memtable lock) and I4 (per-shard
-  commitlog/writeOrder, no global CAS) attack. Cutting apply latency raises throughput at the
-  same concurrency. The client is NOT the limit (settles hurdle A9).
-- **Duration-sensitive:** writes did 33k in a 25s burst but ~16k over 60s (MemtableFlushWriter
-  active mid-run) — flush backpressure builds, so the 60s figure is the honest steady state;
-  a longer cell may settle lower still. Read/balanced are not flush-sensitive at these rates.
+**Reading — the throughput numbers are LOAD-GENERATOR-LIMITED, not Cassandra-limited
+(re-diagnosed 2026-07-09 after an initial wrong call; hurdle A16).** write ~16k, balanced ~22k,
+read ~73k achieved. What the SOURCE metrics actually show:
+- **Server write apply is ~11µs** (`tablestats` Local write latency 0.011ms), coordinator
+  write 17µs median / 770µs p99 (`proxyhistograms`) — fast, exactly as expected for periodic
+  commitlog (no per-write fsync) + in-memory memtable. An earlier "~2ms apply" figure was a
+  Little's-Law *derivation* (32 ÷ 16k), NOT measured — it is RETRACTED.
+- **Cassandra is not the bottleneck:** MutationStage idle at sustainable rates (Active=1);
+  CPU ~27%, commitlog disk 1.6% util. Server write capacity ≈ 32 threads / 11µs ≈ millions/s.
+- **Proof it's the client, not the server:** server write apply (11µs) is ~20× FASTER than
+  server read (0.223ms Local read latency), yet write THROUGHPUT (16k) is LOWER than read
+  (73k). Impossible if server-limited — only possible if the load generator caps it. The
+  client's per-WRITE cost (random value generation + larger payload through its 32-thread /
+  rate-limited async pipeline) exceeds its per-read cost, so it emits fewer writes/s. Raising
+  client threads 32→128 didn't help (pipeline/rate-limiter bound, not thread bound).
+- **Methodology consequence (important):** this single-box, co-located easy-cass-stress setup
+  cannot saturate Cassandra's write path, so these are NOT Cassandra's throughput ceilings and
+  the baseline **cannot demonstrate server-side throughput headroom**. A/B LATENCY-at-fixed-
+  offered-rate comparisons remain valid (both arms share the identical client limit), but any
+  TPC THROUGHPUT gain will be invisible until the load generator can outrun the server —
+  needs a more efficient / multi-process / off-box load generator (tracked: hurdle A16, must
+  resolve before throughput claims). The read/write delta itself is benign: it's the client's
+  per-op cost difference.
 
 ### 8.2 Operating points — p99 at fixed offered rate, 3-iter noise band (Phase B) → the gate reference
 p99 median [min–max across 3 iters], ms. **50% points are STABLE; 80% points sit near the knee

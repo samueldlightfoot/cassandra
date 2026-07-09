@@ -197,6 +197,26 @@ common thread: **`rc=0` / "it ran" is not evidence of success** — verify at th
 - **Prevention:** parse_cell documents the layout; verify any stress-output parser against a
   real row before trusting a gate built on it. (Consider `-F'[|[:space:]]+'` to drop pipes.)
 
+### A16. Baseline throughput is LOAD-GENERATOR-limited, not Cassandra-limited  · `blocks-PoC`
+- **Symptom:** write throughput caps ~16k/s while CPU (~27%), commitlog disk (1.6% util), and
+  MutationStage (Active=1) are all idle. Initially (wrongly) attributed to a Cassandra write-
+  path serialization limit with a *derived* "~2ms apply" (Little's Law 32÷16k). A user
+  challenge ("periodic commitlog + in-memory memtable shouldn't be 2ms") prompted measurement.
+- **Cause:** measured server write apply is **11µs** (tablestats Local write latency), 17µs
+  coordinator — Cassandra is nowhere near saturated. The cap is the co-located easy-cass-stress
+  load generator (per-op value generation + 32-thread rate-limited async pipeline). PROOF:
+  server write apply (11µs) is 20× faster than server read (223µs) yet write throughput (16k)
+  < read throughput (73k) — impossible if server-bound; the client's per-write cost simply
+  exceeds its per-read cost. 128 client threads didn't raise it (pipeline-bound, not thread-bound).
+- **Fix / open action:** to make Cassandra the bottleneck (required before any THROUGHPUT
+  claim), the load generator must outrun the server — options: multiple easy-cass-stress
+  processes, an off-box generator, more client cores, or a lighter value generator. Until then,
+  only LATENCY-at-fixed-offered-rate A/Bs are valid (both arms share the identical client cap).
+- **Lesson:** never infer a server bottleneck from throughput ÷ concurrency — MEASURE server
+  apply latency (tablestats/proxyhistograms) and check whether the SERVER stage is actually
+  saturated (tpstats Active/Pending) and whether a resource is pegged. Idle CPU + idle disk +
+  idle stage = the limit is upstream (client), not the server.
+
 ### A11. Minor tool gotchas  · `rig-op`
 - `--hdr <prefix>` writes `<prefix>-{mutations,reads,deletes}.txt` (NOT `<prefix>.hdr`);
   values are ms, CO-corrected (same as `--csv-latency`/stdout). `-mutations.txt` is
