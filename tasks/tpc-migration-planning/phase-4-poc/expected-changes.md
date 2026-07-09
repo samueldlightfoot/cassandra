@@ -39,7 +39,7 @@ inert until routed to; gate = tests green + shutdown-before-commitlog ordering.
 | File (CREATE) | Responsibility |
 |---|---|
 | `concurrent/MutationShardExecutors.java` (working name; serves reads too — consider `concurrent/ShardExecutors.java`) | Node-global singleton. N = `AbstractShardedMemtable.getDefaultShardCount()` (= cores) single-thread executors via `executorFactory().localAware().withJmx("request").sequential("Shard-"+i)` — buys ExecutorLocals propagation, thread naming, ThreadPoolMetrics JMX free. Owner registry (`Thread[] owners` set by thread factory). API: `static boolean enabled()`, `static void execute(int shardId, Runnable)`, `static boolean isOwner(int shardId)`, `static int currentShardId()` (−1 off-shard). Shutdown drains BEFORE commitlog stops (wire like `Stage` shutdownBeforeCommitlog, `Stage.java:163-184`). |
-| `db/MutationShardRouting.java` | Routing predicate + shard computation: `static int shardIdFor(Mutation)` → −1 when not routable. Checks: every updated table's current memtable is `AbstractShardedMemtable`; boundary agreement across tables (per-table `shards` option can differ); `!viewManager.updatesAffectView(mutation, false)`; not local-system keyspace. Per-(table,key): `shardId = memtable.getShardBoundaries().getShardForKey(key)` mapped `% N`. |
+| `db/MutationShardRouting.java` | Routing predicate + shard computation: `static int shardIdFor(Mutation)` → −1 when not routable. Checks: every updated table's current memtable is `AbstractShardedMemtable`; boundary agreement across tables (per-table `shards` option can differ); `!viewManager.updatesAffectView(mutation, false)`; not local-system keyspace; **not `cdc=true`** (CommitLog.add runs inline in beginWrite — `throwIfForbidden` can block/throw on CDC space, design-target §3 item 4); **no legacy-2i (`CassandraIndex`) on any updated table** (index puts are value-token = systematically off-owner + full write-path blocking budget, design-target §5). Plus a **startup check: routing flag-on requires `commitlog_sync: periodic`** (batch/group park the shard thread inside add — flag-on+batch disables routing with a log line, design-target §3 item 4). Per-(table,key): `shardId = memtable.getShardBoundaries().getShardForKey(key)` mapped `% N`. design-target §5's exclusion list is this predicate's normative source (folded 2026-07-09 per design-target §9). |
 
 PINNED: node-global N threads (boundaries are per-table — a global boundary object is
 impossible; findings-i1 §2); `sequential()` executors for the PoC, custom
@@ -151,25 +151,27 @@ FlushItem.release) — the one unpinned piece; schedule as I3-spec step 0.
 
 ## 5. I4 — per-shard commitlog + writeOrder (+ allocator)
 
-DESIGN: phase-3 3.3 chooses (a) N per-shard managers vs (b) log-writer core. Evidence
-strongly favors (a): position-before-put contract (`CassandraKeyspaceWriteHandler.java:47-53`,
-`accepts :101-108`) forces (b) into an async beginWrite restructure; the global static
-segment-id allocator (`CommitLogSegment.java:70-92`) gives (a) union-sortable ids and
-**unchanged replay** for free. Both inventories below so the choice is between concrete
-lists.
+**DECIDED (design-hostiles §2, 2026-07-09): option (a) N per-shard managers.** The
+inventory below is amended by design-hostiles' review-forced coverage protocol —
+"unchanged replay for free" was INCOMPLETE (file-sort survives, coverage does not):
+(a) requires **manager-banded segment ids + per-manager memtable bound vectors + N
+per-manager intervals in the existing IntervalSet sstable metadata**; see
+design-hostiles §2.2-i for the full design (single conservative CL-bound pair and
+id-terminated discard both RETRACTED as silent-data-loss). Option (b) inventory kept
+for the record only.
 
 **Option (a) inventory**
 
 | File | Change |
 |---|---|
-| `db/commitlog/CommitLog.java` | `AbstractCommitLogSegmentManager[] shardManagers` (flag-gated); `add()` picks manager by `ShardExecutors.currentShardId()`, fallback token-hash%N (startup writes — first `add` is `persistLocalMetadata`, `CassandraDaemon.java:325`, before TCM; selection must not depend on ShardBoundaries); `discardCompletedSegments` `:354-385` fans out per-manager with per-manager terminator (the `:382` early-break is the ONE single-sequence assumption); `sync()`/`getCurrentPosition()`/`forceRecycleAll()` aggregate; `metrics.attach` aggregation (`:135`); `recoverSegmentsOnDisk` UNCHANGED (id-sorted union works). |
+| `db/commitlog/CommitLog.java` | `AbstractCommitLogSegmentManager[] shardManagers` (flag-gated); `add()` picks manager by §0 attribution (design-hostiles §0: currentShardId → token-hash%N → threadId%N; first `add` is `persistLocalMetadata`, `CassandraDaemon.java:325`, before TCM — selection must not depend on ShardBoundaries); `discardCompletedSegments` fans out per-manager keeping TODAY'S `contains` terminator (design-hostiles §2.2-i — the id-terminated variant is retracted); no-arg `getCurrentPosition()` REMOVED → per-manager `getCurrentPosition(int)` with the caller disposition table (design-hostiles §2.2-i); per-band `replayLimitId` (`CommitLog.java:82`); `sync()`/`forceRecycleAll()` iterate N; `metrics.attach` aggregation (`:135`); `recoverSegmentsOnDisk` UNCHANGED (id-sorted union works — band-major order). |
 | `db/commitlog/AbstractCommitLogSegmentManager.java` | Instantiable ×N; **shared size accounting** for the cap (`:105, :447-453` — otherwise N managers each assume the full budget = N× overshoot); `awaitNewBarrier` `:371` → composite barrier; one AllocatorRunnable per manager (N threads, acceptable for PoC). |
-| `db/commitlog/CommitLogSegment.java` | NO change (global id allocator already shared; per-segment CAS becomes single-writer under routing — keep CAS for PoC). |
+| `db/commitlog/CommitLogSegment.java` | Manager-banded id allocation replaces the shared static counter: `id = (managerIndex << 56) \| counter`, per-band seeding generalizing the `:83-92` scan (band 0 continues the legacy sequence — no migration); per-band `shouldReplay` filter (`:227-230`). Per-segment `allocatePosition` CAS + `appendOrder` KEPT (near-single-writer under routing; fallback guard). (Amended per design-hostiles §2.2-i — was "NO change".) |
 | `db/commitlog/CommitLogSegmentManagerCDC.java` | CDCSizeTracker shared across instances. |
 | `db/commitlog/AbstractCommitLogService.java` (+3 mode subclasses) | ONE sync service for all managers — sync thread iterates every manager's segments (same fsync count as today; N sync threads is a later, phase-2-data-informed option); waiter path unchanged (per-segment syncComplete already). |
 | `db/commitlog/CommitLogArchiver.java`, `CommitLogReplayer/Reader`, tools | NO change. |
 | `metrics/CommitLogMetrics.java` | attach-N variant, aggregating gauges. |
-| `db/memtable/AbstractMemtableWithCommitlog.java` | PINNED for PoC: keep the single (min,max) CL-bound pair — safe under the shared id namespace (flush barrier covers all shard logs; markClean over-coverage harmless), conservative segment reclamation accepted; per-shard bound pairs = CEP-era refinement. |
+| `db/memtable/AbstractMemtableWithCommitlog.java` | **Per-manager bound VECTORS** (`commitLogUpperBound`/`lowerBound`/`approximate…` become N-slot arrays; `accepts`/`mayContainDataBefore` select the slot by the position's band — public signatures unchanged; flush seal loops slots per band). The previously-pinned single conservative pair is RETRACTED as silent-data-loss — full loss chain and design in design-hostiles §2.2-i; sstable flush records N intervals via the existing `IntervalSet.Builder` loop (no format change). |
 | Failure policy | Stays GLOBAL (`handleCommitError`, `CommitLog.java:577-580`) — per-shard isolation would change semantics. |
 
 **Option (b) inventory (for the record):** new `CommitLogWriterCore` (MPSC inbox,
@@ -184,14 +186,17 @@ otherwise avoids.
 | File | Change |
 |---|---|
 | `db/Keyspace.java:100-102` | `writeOrder` → `ShardedOpOrder` wrapper (N orders): `start(shard)`, `newCompositeBarrier()`, `awaitNewBarrier()` = all-N. Flag-gated. |
-| `utils/concurrent/OpOrder.java` | Composite-barrier support. PINNED: shard identity travels in `CassandraWriteContext` (no owner field on the public `Group` class — `:143` has no back-ref today; context change is non-API). |
+| `utils/concurrent/OpOrder.java` | Composite-barrier support + **`Group` gains a final owner back-reference set at both construction sites (`:97,:399`)** — the earlier context-carrier pin is OVERTURNED (design-hostiles §1.2: `Barrier.isAfter` is per-instance group-id arithmetic, the group must self-identify; threading the context would break the public `Memtable.accepts` signature). `CassandraWriteContext` unchanged. |
 | `db/CassandraKeyspaceWriteHandler.java` `:47,:107` | start on current shard's order; record shard in context. |
 | `db/memtable/AbstractMemtableWithCommitlog.java` `:40,:55-62,:71-109` | writeBarrier → composite; `accepts` pairs opGroup with its own shard's barrier (`isAfter` is intra-order only). |
 | Barrier sites | `ColumnFamilyStore.java:1247/:1260/:1271/:1285-86/:3365`, `AbstractCommitLogSegmentManager.java:371`, `index/internal/CassandraIndex.java:681`, `tcm/.../DistributedSchema.java:365` → composite. |
 | `service/accord/AccordKeyspace.java:361` | Shard attribution for Accord-thread writes — **blocked on phase-3 3.1 item 6**. |
 
-Non-shard-writer attribution rule (PINNED proposal): `currentShardId()` else
-token-hash%N (covers startup, replay Stage.MUTATION threads, 2i builds).
+Non-shard-writer attribution rule (DECIDED, design-hostiles §0): `currentShardId()`
+else token-hash%N else threadId%N for token-less empty contexts (covers startup,
+replay Stage.MUTATION threads, 2i builds, `createContextForRead` — per-read on
+2i-indexed reads, and Accord's CFK loader). Computed ONCE in `beginWrite`, shared by
+the writeOrder start and the commitlog manager selection.
 
 **Allocator step (HOSTILE #4, ships with I4 or as I4.5)**
 
@@ -283,23 +288,32 @@ sourced from the closest published analogue (Sphinx KV store A/B on commodity Li
   — keep it. Shard-affine NIC steering is their "programmable NIC offload" future
   work = our deferred shard-aware client protocol (phase-5 defers).
 
-## 8. Consolidated open questions (USER — everything else above is pinned or delegated to a phase-3 design doc)
+## 8. Consolidated open questions (status updated 2026-07-09 — Phase 3 designs closed most)
 
-1. **Accord end-state** (phase-3 3.1 item 6): inbox-route (a) / align shardings (b) /
-   exempt (c). PoC runs non-Accord tables either way; the CEP needs the choice.
-2. **Commitlog architecture** (phase-3 3.3): (a) vs (b) — evidence favors (a).
-3. **I3 continuation executor**: strict-REQUEST_RESPONSE vs dedicated completion pool.
-4. **I3 cut-line ratification**: single-partition reads + plain mutations only.
-5. **Shard-thread CPU budget**: N=cores on top of existing pools — accept
+1. ~~**Accord end-state**~~ **DECIDED** (design-target D7): CEP end-state = (a)
+   inbox-route, (b) recorded as later optimization; PoC = (c) de facto, no Accord code
+   changes in Phase 4.
+2. ~~**Commitlog architecture**~~ **DECIDED** (design-hostiles §2): (a) N per-shard
+   managers, with the banded-id + bound-vector coverage protocol.
+3. ~~**I3 continuation executor**~~ **DECIDED** (design-async-coordinator §1): no new
+   pool — split terminal (writes inline on the acking thread; read materialization +
+   audit/FQL completions on requestExecutor), park guard as enforcement.
+4. ~~**I3 cut-line**~~ **RATIFIED** (design-async-coordinator §2) with clarifications:
+   IN/paging groups convert, unlogged plain batches convert (BatchMessage override),
+   predicate is CL-aware (SERIAL/LOCAL_SERIAL reads behind the line).
+5. **Shard-thread CPU budget** (STILL USER): N=cores on top of existing pools — accept
    oversubscription for the PoC, or shrink `concurrent_writes`/NTR threads flag-on?
    (Affects every A/B's honesty; recommend: accept for I1, shrink NTR in I3's A/B where
    it IS the claim.) **Gates 4.1, not 4.2** — must be pinned with the criteria before
    any increment code.
-6. **I1 step-2 measurement variant**: owner-check skip only (recommended), or also a
-   hard no-lock build with workload-precondition policy?
-7. **FlushItem/payload release audit** (I3 step 0) — sign off that it's a pre-code
-   verification task, not a spec gap.
-8. **Foreground-read caching model** (added 2026-07-08, ../findings.md §5.1): buffered
+6. **I1 step-2 measurement variant** (STILL USER): owner-check skip only (recommended),
+   or also a hard no-lock build with workload-precondition policy?
+7. ~~**FlushItem/payload release audit**~~ **DONE** (design-async-coordinator §8):
+   safe as-is; converts into three I3 step-0 build requirements (exactly-once promise
+   completion, ops-release in cleanup consumers, idempotent slot handle +
+   catch-around-encode).
+8. **Foreground-read caching model** (STILL OPEN — adjudicated by Phase 4 A/B, both
+   arms first-class per design-target D2; user prior 2026-07-09 = full-Scylla): buffered
    ring reads keeping the page cache (I2b default) vs DIO reads + expanded ChunkCache
    (Scylla model). PROVISIONAL — performance is the sovereign criterion; user: "if we
    nerf performance by still including buffered io then it isn't an option." Adjudicated

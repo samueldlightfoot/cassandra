@@ -497,3 +497,65 @@ findings.md §5.1/§8/§9, phase-1-uring-binding/findings-execution.md (binding 
 - Phase 2 closure commit made (results, jobs, verdict, syncOp fix, spec patches).
 - Phase 3 begun per spec §4: 3.1 design-target.md drafted first (sub-agent + adversarial
   review), then 3.2/3.3 in parallel, 3.4/3.5 last by main agent.
+
+## 2026-07-09 — Session 8 (cont.): Phase 3 EXECUTED — all five design docs, exit gate passed
+
+Execution per spec §4: sub-agent drafted 3.1 → adversarial review (PASS-WITH-FIXES,
+6 findings) → amended; 3.2 + 3.3 drafted in parallel against accepted 3.1 →
+adversarial reviews (3.2 PASS-WITH-FIXES: 3 blockers; 3.3 FAIL: 1 blocker + 5
+co-fixes) → both amended by their original agents; 3.4/3.5 written by main agent.
+(Note: both reviewer agents died at the spend limit AFTER writing their review
+files — verdicts recovered from disk, nothing lost.)
+
+**The decisions that now bind Phase 4:**
+- design-target.md: shared-something model named; D1 shard model (N=cores,
+  per-(table,key) routing, owner-check-with-lock-fallback, sequential()→custom loop
+  at I2b); D2 two I/O arms (identical shard-model bytes; pool×A / pool×B primary
+  adjudication cells); D3 off-shard census incl. small I/O pool (default 8, seam at
+  ChannelProxy.read, terminal size zero) + UserCodeEscape pool + cdc/legacy-2i
+  predicate exclusions + periodic-only routing; D4 five routing points (verified
+  lines); D5 two dispatch patterns (scatter/gather, owner-forwarding), exclusion
+  list = normative predicate; D6 strict ownership, PendingTasks+misroutedPuts
+  detection, per-table `shards` option as the split lever; D7 Accord end-state =
+  (a) inbox-route (leads with fixing two Accord blocking hazards), (c) PoC de facto.
+- design-async-coordinator.md: no new pool — split terminal (writes inline on
+  acking thread, read materialization + audit/FQL on requestExecutor); park guard +
+  no-inline-local-work rule (execute() never mEI off park-licensed threads);
+  cut-line ratified CL-aware (SERIAL reads behind the line — Paxos v1's missing
+  async timeout FORCES all Paxos behind); ops+bytes backpressure, event-loop-owned
+  tryAcquire, release-signalled WaitQueue, 1024 default; per-request deadline task
+  is the timeout AUTHORITY (silent local-leg drops otherwise hang+leak); FlushItem
+  audit DONE: safe as-is + three step-0 build requirements.
+- design-hostiles.md: ShardedOpOrder(N) (flag chooses N, one code path);
+  carrier OVERTURNED to OpOrder.Group owner field (Memtable.accepts public API is
+  the binding constraint); composite issue-all-then-await-all at the 5-site census;
+  commitlog (a) with review-forced coverage protocol — manager-banded segment ids +
+  per-manager bound vectors + IntervalSet N-intervals (single pair + id-terminated
+  discard RETRACTED as silent data loss); ONE sync service + W-SYNC watch item;
+  async group-commit decided (CEP-era, after I3); allocator-per-shard unconditional,
+  slack batching measurement-gated; H5 deferred with un-defer trigger.
+- increments.md (★): order I0→I1→I2a→I2b→I3(0-3)→I4(b→a→c)→I5 with dependency
+  graph; every entry has flag/claim/measurement(p99-gated)/rollback/deps/
+  PoC-vs-CEP-era; harness pinned (tail gate cites the 2016 +15%-throughput-2×-p99
+  lesson); hedge set = I3 (strong), I4c step 1 (quiet), I1 (conditional).
+- effort.md: bands I0+I1 S-M, I2a S, I2b M, I3 L, I4 L (grew with the coverage
+  protocol), I5 S; program ~6mo optimistic / ~9mo likely (or ~5-6mo wall-clock at
+  two lanes); hand-JNI = M (3-5wk) priced-not-scheduled with pull triggers;
+  10-risk register with owners; three-way comparison for Phase 5.
+
+**Cross-doc consistency maintained:** design-target amended twice (carrier +
+attribution tier + commitlog coverage clause from design-hostiles §6; hop-7 split
+terminal from design-async F2); phase-4-poc/expected-changes.md folded to match
+(predicate exclusions + periodic check into §1; §5 commitlog/OpOrder rows; §8
+items 1-4,7 marked DECIDED/DONE — 5,6,8 remain open, 5 gates 4.1).
+
+**Exit gate (spec §5): PASSED** — five docs exist; every §2.2 hostile chosen or
+explicitly deferred (H5 + readOrdering with triggers); increments have
+flag/measure/rollback/band; hedge set identified. Committed as Phase 3 closure.
+
+**Open for user before Phase 4 code:** §8 item 5 (oversubscription stance — gates
+4.1 criteria), item 6 (I1 step-2 hard no-lock variant?), item 8 (two-arm
+adjudication — runs as I2b cells, user prior = full-Scylla recorded).
+
+**Next:** Phase 4 (phase-4-poc/spec.md) — 4.1 baseline + criteria (needs the item-5
+pin), then I0/I1 build.
