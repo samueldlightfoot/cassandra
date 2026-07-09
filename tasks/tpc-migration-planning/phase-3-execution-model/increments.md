@@ -42,6 +42,9 @@ D10 — each entry marks PoC-blocking vs CEP-era requirements.
 - **Single-node rig caveat:** coordinator == replica, so I2 covers the benchmark's
   hot read path before I5 exists, and I5's effect only fully shows multi-node —
   recorded in poc-criteria.md, I5's macro number is not oversold.
+- **Model assignment (phase-4 D11):** Opus is the default build/bench model; Fable
+  is metered — reserved for the `Model` rows below, every increment's adversarial
+  spec+patch review, tail-gate-FAIL root-causing, and the 4.4 verdict.
 
 ## 1. Build order and dependency graph
 
@@ -89,6 +92,7 @@ Validated amendments to the spec's pinned I1→I5 sequence (with evidence):
 | Micro | enqueue→dequeue hand-off latency + unparks/sec exported from day one (paper rule: the wake-up is the steering cost — this is the number every later increment interprets). |
 | Rollback | Dead code (nothing routes to it). |
 | PoC-blocking | All of it. CEP-era: none. |
+| Model | **Opus** (inert scaffolding from a pinned inventory); Fable only via the standard patch review. |
 
 ## 3. I1 — shard-routed mutation apply (+ I0 in the same patch)
 
@@ -101,6 +105,7 @@ Validated amendments to the spec's pinned I1→I5 sequence (with evidence):
 | Rollback | Flag off = byte-identical trunk path (`maybeExecuteImmediately` at `:2025`). |
 | Depends | I0. |
 | PoC-blocking | Both flags + counters + the owner-check fallback. CEP-era: none (this is the smallest real TPC step). |
+| Model | **Opus** build (line-level inventory exists); **Fable patch review** — the owner-check-with-lock-fallback is the one subtle piece. |
 
 ## 4. I2a — shard-routed local reads (sequential())
 
@@ -113,6 +118,7 @@ Validated amendments to the spec's pinned I1→I5 sequence (with evidence):
 | Rollback | Flag off = `Stage.READ.maybeExecuteImmediately` verbatim. |
 | Depends | I0/I1 (boundaries source + executors). |
 | PoC-blocking | The four routed seams. CEP-era: none. |
+| Model | **Opus** (four mechanical seams, same branch shape as I1). |
 
 ## 5. I2b — custom shard loop + ring + the small I/O pool
 
@@ -125,6 +131,7 @@ Validated amendments to the spec's pinned I1→I5 sequence (with evidence):
 | Rollback | Flag off = FileChannel.read path; `shard_reads` alone falls back to I2a. |
 | Depends | I2a + Phase 1 binding (as-built API per phase-1 findings-execution §3 with hardened syncOp). |
 | PoC-blocking | Loop, seam, pool, miss-storm cell. CEP-era: chunk-level read continuations (the pool's terminal-size-zero end-state — out of PoC scope, stated so nobody oversells I2b), RWF_NOWAIT, per-thread pinning. |
+| Model | **Opus** build; **Fable spec review BEFORE build** (the loop idle strategy + read-group lifecycle + miss-reschedule seam are the subtle bits), plus the standard patch review. |
 
 ## 6. I3 — non-blocking coordinator (steps 0–3)
 
@@ -141,6 +148,7 @@ structure.
 | Rollback | Flag off = synchronous `execute` byte-for-byte; step-0 scaffolding is inert. |
 | Depends | Nothing TPC-side (I0 only for eventual shard-inbox completion — CEP-era executor swap). Sequenced after I2 in the pinned order; independently startable. |
 | PoC-blocking | Steps 0–3, the three §8 build requirements, the guard. CEP-era: Paxos/counter/batch conversion (per-round owner-forwarding, D5), async QueryHandler interface, wheel timer (only if cancellation churn shows). |
+| Model | **Fable throughout** (spec, build, review) — future composition, exactly-once completion, release lifecycles, park guard: the increment where plausible-but-wrong concurrency code is the expected failure mode. |
 
 ## 7. I4 — per-shard writeOrder (b) → commitlog (a) → allocators (c)
 
@@ -153,6 +161,7 @@ structure.
 | Rollback | Flags off: `ShardedOpOrder(1)` = trunk semantics on the same code path; 1 manager = band-0 ids = byte-identical including the id sequence. Restart with flags flipped either direction replays cleanly (design-hostiles §2 FAILURE/UPGRADE); drain-before-flip recommended, not required. |
 | Depends | I1 (attribution rule-1 needs shard threads; managers are near-single-writer only under routing). Internal order b→a→c (§1 graph). |
 | PoC-blocking | I4b composite machinery + I4a coverage protocol + the new test suite (loss-sequence, replay-union, banded-id, truncation-under-N, per-manager discard, shared-cap, CDC-exhaustion) + I4c step 1. CEP-era: async group-commit (batch/group under routing — decided shape in design-hostiles §2.3, sequenced after I3), step-2 slack batching (measurement-gated), per-band globalPosition prefilter, snapshot-restore at N>1, `commitlog_segment_size` re-tuning. |
+| Model | **Fable for I4b + I4a** (composite barriers; the coverage protocol's risk class is silent data loss — already caught once at review); **Opus for I4c** (mechanical allocator-per-shard, step 2 not built without the named signal). |
 
 ## 8. I5 — inbound shard dispatch
 
@@ -165,6 +174,7 @@ structure.
 | Rollback | Flag off = `header.verb.stage.execute` verbatim. |
 | Depends | I0/I1 (executors + routing predicate); independent of I2/I3/I4. |
 | PoC-blocking | Router + branch + dtest seam. CEP-era: HINT_REQ allowlist promotion (only on profile evidence — design-target §5), large-message handling, Accord verbs (D7 route-through-inboxes end-state). |
+| Model | **Opus** (smallest patch, task object reused verbatim); standard Fable patch review — check the dtest seam actually exercises the router. |
 
 ---
 

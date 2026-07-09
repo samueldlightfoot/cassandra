@@ -28,6 +28,24 @@ rollback: deferred to Phase 5 scope. PoC flags are cheap system properties. The 
 correctness bar: existing unit tests + in-JVM dtests pass flag-on (in-JVM dtests run on
 macOS; CCM multi-node needs the rig/Linux).
 
+### D11. Model assignment (2026-07-09) — Fable is metered; spend it where reasoning is the product
+The planning phases bought a no-open-questions bar, so most of Phase 4 is executing
+pinned specs — **Opus is the default** for builds, bench execution, and doc upkeep.
+**Fable is reserved for** the work where subtle-but-plausible wrongness is the failure
+mode:
+- Adversarial review of EVERY increment spec and patch (the program's proven
+  bug-catcher — 3.3 FAIL, the I4 single-pair retraction).
+- I3 spec + build (future composition, exactly-once completion, release lifecycles,
+  park guard — the 2016 "works but tails are wrong" class lives here).
+- I4b + I4a spec + build (composite barriers; banded-id/bound-vector coverage
+  protocol — the silent-data-loss risk class already caught once).
+- Tail-gate FAILs and replay-correctness anomalies: root-causing escalates to Fable
+  when the micro counters don't answer.
+- 4.4 poc-verdict.md adjudication (one-shot headline judgment).
+Per-increment assignments: `Model` row in ../phase-3-execution-model/increments.md.
+Sub-phase defaults: 4.1 Opus · 4.2 per increment rows (reviews always Fable) ·
+4.3 whichever model is active · 4.4 Fable.
+
 ## 2. Sub-phases
 
 ### 4.1 Baseline + success criteria → `poc-criteria.md`
@@ -70,9 +88,12 @@ the evidence). Pinned decomposition; deviating needs a hurdle-log rationale:
   unit-testable alone); step 2 coordinator composition (fetchRows / mutate); step 3
   Dispatcher/Message async completion + outstanding-ops limiter. Only step 3 delivers
   the macro A/B; each prior step is buildable and revertible on its own.
-- **I4a**: per-shard commitlog (post-3.3 choice, `sharded_commitlog`); **I4b**:
-  per-shard writeOrder (`sharded_write_order`); **I4c**: per-shard memtable allocator.
-  Separate flags/micro counters give per-step A/Bs.
+- **I4, order b→a→c** (fixed in increments.md §1 from the design-hostiles evidence —
+  composite barriers must precede the managers because site 3 `ACLSM:371` needs the
+  composite, and allocators land last for discard safety): **I4b** per-shard writeOrder
+  (`sharded_write_order`); **I4a** per-shard commitlog (`sharded_commitlog`); **I4c**
+  per-shard memtable allocator (rides `sharded_commitlog`). Separate flags/micro
+  counters give per-step A/Bs.
 - **I5**: single-step. No change.
 
 ### 4.3 Hurdle log → `hurdles.md` (living; updated every increment)
