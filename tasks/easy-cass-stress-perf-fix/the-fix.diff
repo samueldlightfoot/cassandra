@@ -1,0 +1,17 @@
+diff --git a/src/main/kotlin/org/apache/cassandra/easystress/generators/functions/Random.kt b/src/main/kotlin/org/apache/cassandra/easystress/generators/functions/Random.kt
+index 71e6992..f5b54c5 100644
+--- a/src/main/kotlin/org/apache/cassandra/easystress/generators/functions/Random.kt
++++ b/src/main/kotlin/org/apache/cassandra/easystress/generators/functions/Random.kt
+@@ -44,10 +44,10 @@ class Random : FieldGenerator {
+         return ThreadLocalRandom.current().nextInt(min.toInt(), max.toInt())
+     }
+ 
++    private val generator = RandomStringGenerator.Builder().withinRange(65, 90).build()
++
+     override fun getText(): String {
+         val length = ThreadLocalRandom.current().nextInt(min.toInt(), max.toInt())
+-
+-        val generator = RandomStringGenerator.Builder().withinRange(65, 90).build()
+         return generator.generate(length)
+     }
+ 

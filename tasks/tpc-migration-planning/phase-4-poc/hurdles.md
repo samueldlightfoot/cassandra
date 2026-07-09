@@ -226,12 +226,14 @@ common thread: **`rc=0` / "it ran" is not evidence of success** — verify at th
     a real secondary factor, but value-gen CPU is the dominant cost.)
   - **Confound to control:** large duration-dependent decay (20s→44k, 60s→16k) — likely client GC
     from value-gen allocation + server flush — swamped several knob tests; not fully isolated.
-  - **Fix options:** (a) cheaper/smaller value generator (`--field.keyvalue.value=...`) — cuts the
-    dominant client CPU cost, lets the same cores push more; (b) more client cores (helps — it's
-    CPU-bound; on this box trades against Cassandra's cores → smaller, less-TPC-representative
-    server); (c) OFF-BOX load generator (client gets its own cores, Cassandra keeps all 12, no
-    co-location pollution) — cleanest for THROUGHPUT claims. Latency-at-fixed-rate A/Bs are valid
-    now (both arms share the identical client cap).
+  - **RESOLVED 2026-07-09 — it was a load-gen BUG, not cores/box:** `Random.getText()`
+    (easy-cass-stress `generators/functions/Random.kt`) rebuilt a `RandomStringGenerator` via
+    `.Builder().build()` on EVERY write op. Building it ONCE (2-line fix) took a single process
+    from ~16k → **231k writes/s (14×)**; Cassandra went idle→61% CPU on the SAME box. So option
+    (a) was right but the lever was the per-op generator construction, not value size; options
+    (b) more cores / (c) off-box are NOT needed to load Cassandra. Full writeup + fix +
+    re-baseline plan: `tasks/easy-cass-stress-perf-fix/`. **baseline_v1's throughput numbers were
+    captured with the broken tool → invalid; must re-baseline with the fix (that task's Phase 3).**
 - **Lesson:** never infer a server bottleneck from throughput ÷ concurrency — MEASURE server
   apply latency (tablestats/proxyhistograms) and check whether the SERVER stage is actually
   saturated (tpstats Active/Pending) and whether a resource is pegged. Idle CPU + idle disk +
