@@ -208,10 +208,20 @@ common thread: **`rc=0` / "it ran" is not evidence of success** — verify at th
   server write apply (11µs) is 20× faster than server read (223µs) yet write throughput (16k)
   < read throughput (73k) — impossible if server-bound; the client's per-write cost simply
   exceeds its per-read cost. 128 client threads didn't raise it (pipeline-bound, not thread-bound).
-- **Fix / open action:** to make Cassandra the bottleneck (required before any THROUGHPUT
-  claim), the load generator must outrun the server — options: multiple easy-cass-stress
-  processes, an off-box generator, more client cores, or a lighter value generator. Until then,
-  only LATENCY-at-fixed-offered-rate A/Bs are valid (both arms share the identical client cap).
+- **Fix / open action (empirically scoped 2026-07-09):** a single easy-cass-stress process is
+  pipeline-bound (~30k writes/s, client cores ~47% — NOT core-bound). Multiple processes on the
+  SAME 4 cores scale: 2 procs → 74k (2.4×). But at 74k the CLIENT cores peg (100% at ~2–4 procs)
+  while **Cassandra is still idle** (cores ~28%, MutationStage Active=0). So:
+  - **More client cores DOES help past ~2 procs** (client becomes genuinely CPU-bound there) —
+    but taking them from Cassandra shrinks it to an unrepresentative core count (TPC scaling is
+    the thesis; 12 cores is already small) AND worsens co-location LLC/mem-bandwidth contention.
+    Net: core reallocation is a poor trade on a single box.
+  - **On this 12-core box you cannot both keep Cassandra representative AND generate enough load
+    to saturate it** — the co-located client would need most of the 12 cores. → the clean fix is
+    an **OFF-BOX load generator** (2nd machine over network: client gets its own cores, Cassandra
+    keeps all 12, no cache/mem-bandwidth pollution). Realistic too (real clients are remote).
+  - Interim: multi-process (≤2) co-located client for LATENCY A/Bs is fine (both arms share the
+    cap). THROUGHPUT claims and demonstrating TPC's under-load/contention benefit need off-box.
 - **Lesson:** never infer a server bottleneck from throughput ÷ concurrency — MEASURE server
   apply latency (tablestats/proxyhistograms) and check whether the SERVER stage is actually
   saturated (tpstats Active/Pending) and whether a resource is pegged. Idle CPU + idle disk +
