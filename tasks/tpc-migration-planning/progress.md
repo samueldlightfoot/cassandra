@@ -559,3 +559,16 @@ adjudication — runs as I2b cells, user prior = full-Scylla recorded).
 
 **Next:** Phase 4 (phase-4-poc/spec.md) — 4.1 baseline + criteria (needs the item-5
 pin), then I0/I1 build.
+
+## 2026-07-09 — Session 8 (cont.): the two open USER items answered
+
+User pinned both remaining pre-Phase-4 decisions (phase-4 §8 updated):
+- **Item 5 (CPU budget):** accept oversubscription for I1/I2/I4/I5, documented per
+  cell as a tail-win floor; NTR shrinks only in I3's cell where the shrink is the
+  claim. 4.1 pins this into poc-criteria.md.
+- **Item 6 (I1 step 2):** owner-check skip only — no hard no-lock ceiling build.
+Item 8 (I/O arms) remains open by design — adjudicated by I2b's pool×A / pool×B
+cells; user prior = full-Scylla, recorded.
+
+**Phase 4 is unblocked.** Next: /phase-start tasks/tpc-migration-planning/phase-4-poc
+→ 4.1 baseline + poc-criteria.md (both pins restated there), then I0/I1.

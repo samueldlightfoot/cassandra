@@ -301,13 +301,14 @@ sourced from the closest published analogue (Sphinx KV store A/B on commodity Li
 4. ~~**I3 cut-line**~~ **RATIFIED** (design-async-coordinator §2) with clarifications:
    IN/paging groups convert, unlogged plain batches convert (BatchMessage override),
    predicate is CL-aware (SERIAL/LOCAL_SERIAL reads behind the line).
-5. **Shard-thread CPU budget** (STILL USER): N=cores on top of existing pools — accept
-   oversubscription for the PoC, or shrink `concurrent_writes`/NTR threads flag-on?
-   (Affects every A/B's honesty; recommend: accept for I1, shrink NTR in I3's A/B where
-   it IS the claim.) **Gates 4.1, not 4.2** — must be pinned with the criteria before
-   any increment code.
-6. **I1 step-2 measurement variant** (STILL USER): owner-check skip only (recommended),
-   or also a hard no-lock build with workload-precondition policy?
+5. ~~**Shard-thread CPU budget**~~ **DECIDED by user (2026-07-09): accept
+   oversubscription for I1/I2/I4/I5** (documented per cell as a tail-win floor, per
+   the Enberg pinning note — a muted number is a config consequence, not a program
+   verdict); **`native_transport_max_threads` shrinks ONLY in the I3 A/B cell where
+   the shrink IS the measured claim.** 4.1 pins this into poc-criteria.md verbatim.
+6. ~~**I1 step-2 measurement variant**~~ **DECIDED by user (2026-07-09): owner-check
+   skip only** — no hard no-lock ceiling build; the contended/uncontended counters
+   quantify the lock's cost.
 7. ~~**FlushItem/payload release audit**~~ **DONE** (design-async-coordinator §8):
    safe as-is; converts into three I3 step-0 build requirements (exactly-once promise
    completion, ops-release in cleanup consumers, idempotent slot handle +
