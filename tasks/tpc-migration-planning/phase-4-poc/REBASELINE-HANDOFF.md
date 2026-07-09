@@ -1,7 +1,56 @@
 # Phase 4.1 RE-BASELINE — handoff for a clean context
 
-**Write date:** 2026-07-09. **Read this first, act on §6.** Self-contained: you should not
-need the originating session's context.
+**Write date:** 2026-07-09. Self-contained: you should not need the originating session's context.
+
+---
+
+## 0. AUTONOMOUS RUN — READ FIRST (operator is asleep; do NOT ask questions)
+You are running unattended overnight. **Never block on a question; decide per the rules here and
+proceed.** Your job: put Cassandra under real load, capture a trustworthy throughput+latency
+baseline server-side, write it into `poc-criteria.md` §8, and commit. Work in this repo
+(`/Users/samlightfoot/repos/fork/cassandra`) on branch `tpc-migration`; commit as you go.
+
+**Ground rules**
+- SSH key-auth: `ssh -o StrictHostKeyChecking=no root@157.180.98.112`. No password anywhere.
+- **Reboot guard:** the box auto-reboots for kernel upgrades. Check `uptime` before each phase; if
+  SSH dies with "connection refused", it rebooted — wait, re-launch Cassandra (§3), continue.
+- **Every pkill uses the bracket self-exclusion trick** or you SIGKILL your own SSH shell:
+  `pkill -9 -f "Cassandra[D]aemon"`, `pkill -9 -f "cassandra-easy-stress-.*-all[.]jar"`,
+  `pkill -9 -f "[G]radleDaemon"`. (Hurdle A6.)
+- **Long runs:** launch the driver with `setsid ... </dev/null >log 2>&1 & disown` so it survives
+  SSH drops (hurdle A5); poll a log with a background waiter; grep for FATAL + populate/cell
+  emptiness, not just success (monitor-silence lesson).
+- **Measure throughput SERVER-SIDE** (§5). rc=0 ≠ success — assert cells did real work.
+- Keep each cell's raw output under `/data/tpc-poc/results/rebaseline/`; rsync locally at the end.
+- Tool is `cassandra-easy-stress` at `/root/repos/cassandra-easy-stress` (UNFIXED/clean — do NOT
+  apply any Random.kt "fix"; it's a dead end).
+
+**Pre-decided choices (do NOT deviate without logging why in progress notes):**
+1. Saturation signal = **Cassandra fence CPU (cores 0–7) ≥ 85% avg**. (MutationStage Active is
+   NOT reliable for writes — apply is ~11µs so the stage never queues; at 231k w/s it was still
+   Active=0. Use CPU, plus Pending>0 if it ever appears.)
+2. To load harder, **stack client PROCESSES** on cores 8–11, each at `--rate 2000000` (a single
+   process delivers ~231k w/s max, client-core-bound). Sweep procs 1→6.
+3. **If client cores 8–11 hit ≥90% before Cassandra cores 0–7 reach 85%** → the client is the cap.
+   Re-pin live: `taskset -a -pc 0-5 $(pgrep -f 'Cassandra[D]aemon')` (Cassandra→6 cores 0–5),
+   client→cores 6–11 (6 cores), and re-sweep. Log this as a config change in the results.
+4. If even 6 client cores can't drive Cassandra 0–5 to 85% CPU → record the honest client-limited
+   ceiling and proceed to Phase B at that ceiling (don't spin forever; note "off-box gen may be
+   needed" and move on).
+5. Value/workload: default KeyValue value (`random(100,200)`), `--partitions 2000000`,
+   `--threads 32`. **START WITH A FRESH POPULATE** — the keyspace currently holds ~15GB of
+   accumulated test overwrites (skewed sstables); drop + repopulate for a clean read dataset:
+   `cassandra-easy-stress run KeyValue --host 127.0.0.1 --prometheusport 0 --replication
+   "{'class':'SimpleStrategy','replication_factor':1}" --populate $((2000000/32)) --readrate 0.0
+   --partitions 2000000 --threads 32 --rate 2000000 --duration 1s --drop` (note `--populate` is
+   PER-THREAD, hurdle A3), then `nodetool flush cassandra_easy_stress` + wait for compactions to
+   drain (`nodetool compactionstats` pending→0). Use `--no-schema` for all measurement cells after.
+
+**Concrete plan:** §6 Step A (saturation discovery) → Step B (baseline curves at 3–4 load levels
+below saturation, 3 iters, server-side throughput + proxyhistograms latency) → §6 Step C (rewrite
+`poc-criteria.md` §8, commit). Then append a progress note to `../progress.md` and stop.
+
+---
 
 ## 1. Why we're re-running (CORRECTED premise)
 `cassandra-easy-stress` client output is **reliable** — verified: at sane offered rates the client
@@ -76,27 +125,37 @@ must be high enough that MutationStage/ReadStage actually build and/or Cassandra
 the whole point of the re-run. Keep client `--csv-latency`/`--hdr` for latency but avoid overload
 rates where latency becomes coordinated-omission noise.
 
-## 6. WHAT TO RE-RUN (the action)
-**Step A — bottleneck map (new, load-bearing).** For each mix (write r=0, balanced r=0.5, read
-r=0.9), sweep **process count** 1→N (each `taskset -c 8-11`, `--rate 2000000`) and record
-server-side throughput + Cassandra CPU (0–7) + MutationStage Active/Pending + client CPU (8–11).
-Goal: find where **Cassandra saturates** (cores→~100% or MutationStage Active→32 with Pending
-building) vs where the **client** caps first. Known start point: 1 client ≈ 135k w/s, Cassandra
-~61% CPU — so ~2 procs or a core shift likely saturates it. If the client caps before Cassandra:
-apply option 2 (shrink Cassandra to e.g. 0–5, client 6–11 — trade-off recorded in hurdles A16),
-re-map. Off-box load gen only if the 12-core box genuinely can't saturate Cassandra.
+## 6. WHAT TO RE-RUN (the action — concrete, autonomous)
+First: preflight (§3), confirm Cassandra up + on cores 0–7 + keyspace populated (re-populate if
+`Local write count`≈0). Build a driver script on the rig (adapt `baseline_driver.sh` — swap its
+client-stdout throughput parse for the §5 SERVER-side method: bracket each cell with `lwc`/`lrc`
+count reads; fix its mpstat parse: `mpstat -P ALL 1 2`, match `Average`, CPU field `$3`). Launch it
+`setsid`-detached, monitor a log. Cells are 40s each (server-side rate over the middle 30s), 3
+iters where noted.
 
-**Step B — reference curves (the actual baseline).** Once you know the load config that makes
-Cassandra the bottleneck (or the honest client ceiling), capture, per mix, server-side p99-vs-
-throughput at a few controlled offered rates below saturation, 3 iters for a noise band. This
-replaces `poc-criteria.md` §8. Reuse/adapt `baseline_driver.sh` (rate-ladder) BUT swap its
-client-stdout parse for the §5 server-side method; fix its mpstat parse (`mpstat -P ALL 1 2`,
-match `Average`, CPU is `$3`). The rig probe `/data/tpc-poc/lt.sh` already reports throughput +
-MutationStage + fence CPU (its mpstat parse needs the same fix).
+**Step A — saturation discovery (find the load that loads Cassandra).**
+For each mix (write `--readrate 0.0`, balanced `0.5`, read `0.9`): run **P = 1,2,3,4,5,6 processes**,
+each `taskset -c <client-cores> ... --rate 2000000 --queue 4000000 --duration 40s`, concurrently.
+Per P record: SERVER-side total throughput (Local write+read count delta), **Cassandra cores 0–7 avg
+CPU**, client cores avg CPU, MutationStage/ReadStage Active+Pending. Stop increasing P when Cassandra
+cores 0–7 ≥ **85%** (= saturated; note the throughput = `MAX[mix]`) OR client cores ≥ 90% first
+(client-bound → apply pre-decision §0.3: re-pin Cassandra to 0–5, client to 6–11, restart Step A for
+that mix). If 6 procs on 6 client cores still can't reach 85% Cassandra CPU, record the client-limited
+ceiling as `MAX[mix]` and move on (§0.4). Known anchor: 1 proc ≈ 231k w/s @ Cassandra ~61% CPU.
 
-**Step C — rewrite `poc-criteria.md` §8** with server-side numbers; note the load config used and
-whether the ceiling is Cassandra or client. Re-examine the read/write delta with correct numbers
-(the earlier "write-path serialization" claim was already retracted — see hurdles A16).
+**Step B — reference curves (the baseline itself).**
+For each mix, at the saturating config from Step A, capture p99-vs-throughput at **4 load levels ≈
+{40, 60, 80, 95}% of MAX[mix]** (dial load by process count and/or `--rate`; verify achieved
+server-side). 3 iters each. Per cell record: server-side achieved throughput, `nodetool
+proxyhistograms` (coordinator R/W p50/p95/p99/p99.9, µs = the authoritative latency), client
+`--csv-latency`/`--hdr` (labelled client-observed), Cassandra + client CPU, error count (must be 0),
+GC log overlay. These curves ARE the new baseline.
+
+**Step C — write results + commit.**
+Rewrite `poc-criteria.md` §8 with the server-side curves; state the load config (procs, cores,
+rates) and whether the ceiling is Cassandra (85% CPU) or client. Re-examine the read/write delta
+with correct numbers. rsync `/data/tpc-poc/results/rebaseline/` → `phase-4-poc/rebaseline-results/`
+(gitignored). Commit `poc-criteria.md` + driver. Append a progress note to `../progress.md`.
 
 ## 7. Done criteria
 - §8 repopulated with SERVER-side throughput + proxyhistogram latency + a noise band, 0-error cells.
