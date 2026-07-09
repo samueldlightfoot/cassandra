@@ -208,20 +208,30 @@ common thread: **`rc=0` / "it ran" is not evidence of success** — verify at th
   server write apply (11µs) is 20× faster than server read (223µs) yet write throughput (16k)
   < read throughput (73k) — impossible if server-bound; the client's per-write cost simply
   exceeds its per-read cost. 128 client threads didn't raise it (pipeline-bound, not thread-bound).
-- **Fix / open action (empirically scoped 2026-07-09):** a single easy-cass-stress process is
-  pipeline-bound (~30k writes/s, client cores ~47% — NOT core-bound). Multiple processes on the
-  SAME 4 cores scale: 2 procs → 74k (2.4×). But at 74k the CLIENT cores peg (100% at ~2–4 procs)
-  while **Cassandra is still idle** (cores ~28%, MutationStage Active=0). So:
-  - **More client cores DOES help past ~2 procs** (client becomes genuinely CPU-bound there) —
-    but taking them from Cassandra shrinks it to an unrepresentative core count (TPC scaling is
-    the thesis; 12 cores is already small) AND worsens co-location LLC/mem-bandwidth contention.
-    Net: core reallocation is a poor trade on a single box.
-  - **On this 12-core box you cannot both keep Cassandra representative AND generate enough load
-    to saturate it** — the co-located client would need most of the 12 cores. → the clean fix is
-    an **OFF-BOX load generator** (2nd machine over network: client gets its own cores, Cassandra
-    keeps all 12, no cache/mem-bandwidth pollution). Realistic too (real clients are remote).
-  - Interim: multi-process (≤2) co-located client for LATENCY A/Bs is fine (both arms share the
-    cap). THROUGHPUT claims and demonstrating TPC's under-load/contention benefit need off-box.
+- **Root cause (corrected 2026-07-09 after a wrong first call — profiled + measured):** the load
+  generator is **client-CPU-bound**, dominated by WRITE VALUE GENERATION. Async-profiler-style
+  stack sampling: `org.apache.commons.text.RandomStringGenerator.generate` is the top hot frame
+  (KeyValue builds a 100–200-char random string value per write — `KeyValue.kt` Random min=100
+  max=200; reads generate nothing → reads 73k vs writes 16–44k). Under max push a SINGLE process
+  uses **88%** of the 4 client cores (2 procs → 94%, only ~1.5× then thrash). Cassandra applies
+  in **11µs** and is idle throughout — never the limit.
+  - **My earlier "client not CPU-bound (47%), more cores won't help" was WRONG** — that 47% was a
+    flush-decayed low-throughput (~15k) sample. Under load the client IS CPU-bound. So **more
+    client cores DO raise throughput** (the user was right); "2 processes" is just using the 4
+    cores harder, not a distinct fix.
+  - Ruled out as the limiter (all measured): connections (18→130 flat), app threads (32→128),
+    `--rate` (300k→5M flat), queue fairness (rebuilt), shared RateLimiter (rebuilt), driver
+    `NETTY_IO_SIZE` 8→32 (rebuilt) — none moved single-process throughput cleanly. (Driver uses a
+    fixed `cores×2`=8-thread I/O group per process that also runs the completion callback inline —
+    a real secondary factor, but value-gen CPU is the dominant cost.)
+  - **Confound to control:** large duration-dependent decay (20s→44k, 60s→16k) — likely client GC
+    from value-gen allocation + server flush — swamped several knob tests; not fully isolated.
+  - **Fix options:** (a) cheaper/smaller value generator (`--field.keyvalue.value=...`) — cuts the
+    dominant client CPU cost, lets the same cores push more; (b) more client cores (helps — it's
+    CPU-bound; on this box trades against Cassandra's cores → smaller, less-TPC-representative
+    server); (c) OFF-BOX load generator (client gets its own cores, Cassandra keeps all 12, no
+    co-location pollution) — cleanest for THROUGHPUT claims. Latency-at-fixed-rate A/Bs are valid
+    now (both arms share the identical client cap).
 - **Lesson:** never infer a server bottleneck from throughput ÷ concurrency — MEASURE server
   apply latency (tablestats/proxyhistograms) and check whether the SERVER stage is actually
   saturated (tpstats Active/Pending) and whether a resource is pegged. Idle CPU + idle disk +
