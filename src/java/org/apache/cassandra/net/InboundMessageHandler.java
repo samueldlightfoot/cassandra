@@ -426,7 +426,15 @@ public class InboundMessageHandler extends AbstractMessageHandler
         AccordRemoteTracing.traceOffWire(header);
 
         callbacks.onDispatched(task.size(), header);
-        header.verb.stage.execute(ExecutorLocals.create(state), task);
+
+        ExecutorLocals locals = ExecutorLocals.create(state);
+        // I5: route small (pre-deserialized) messages to the owning shard executor at ingress. Large
+        // messages deserialize on-stage, so their key isn't knowable here - they take the Stage path.
+        if (task instanceof ProcessSmallMessage
+            && ShardInboundRouter.tryRoute(((ProcessSmallMessage) task).message, locals, task))
+            return;
+
+        header.verb.stage.execute(locals, task);
     }
 
     private abstract class ProcessMessage implements Runnable

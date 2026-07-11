@@ -125,6 +125,7 @@ import org.apache.cassandra.net.ArtificialLatency;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.NoPayload;
+import org.apache.cassandra.net.ShardInboundRouter;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.repair.autorepair.AutoRepair;
 import org.apache.cassandra.schema.Schema;
@@ -590,7 +591,13 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 // place for it to run
                 if (executor == ImmediateExecutor.INSTANCE)
                     executor = Stage.MISC.executor();
-                executor.execute(ExecutorLocals.create(state), () -> MessagingService.instance().inboundSink.accept(messageIn));
+                ExecutorLocals locals = ExecutorLocals.create(state);
+                Runnable deliver = () -> MessagingService.instance().inboundSink.accept(messageIn);
+                // I5: mirror InboundMessageHandler.dispatch. In-JVM delivery bypasses that handler, so
+                // without this hook the flag-on router is never exercised by dtests.
+                if (ShardInboundRouter.tryRoute(messageIn, locals, deliver))
+                    return;
+                executor.execute(locals, deliver);
             }
         };
     }

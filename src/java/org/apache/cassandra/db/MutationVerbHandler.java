@@ -94,7 +94,12 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
             OptionalInt shardId = MutationShardRouting.route(mutation);
             if (shardId.isPresent())
             {
-                shards.execute(shardId.getAsInt(), apply);
+                // Under inbound shard dispatch this doVerb already runs on the owning shard thread;
+                // apply inline rather than re-enqueue onto that same shard's queue (a self-wake).
+                if (ShardExecutors.currentThreadIsOwnerOf(shardId.getAsInt()))
+                    apply.run();
+                else
+                    shards.execute(shardId.getAsInt(), apply);
                 return;
             }
         }

@@ -107,7 +107,23 @@ public final class ShardExecutors
     {
         int shard = Math.floorMod(memtableShardId, SHARD_COUNT);
         submitted.incrementAndGet();
-        executors[shard].execute(() -> {
+        executors[shard].execute(shardTagged(shard, task));
+    }
+
+    /** As {@link #execute(int, Runnable)}, but carries {@code locals} (trace/client-warn state) into the
+     *  routed task. Used when routing a whole verb from the inbound path, where the loop-side locals must
+     *  survive the hop; the shard executors are {@code localAware()}, so the state propagates. */
+    public void execute(ExecutorLocals locals, int memtableShardId, Runnable task)
+    {
+        int shard = Math.floorMod(memtableShardId, SHARD_COUNT);
+        submitted.incrementAndGet();
+        executors[shard].execute(locals, shardTagged(shard, task));
+    }
+
+    /** Wrap {@code task} so it runs with {@link #CURRENT_SHARD} set to {@code shard}, restored after. */
+    private static Runnable shardTagged(int shard, Runnable task)
+    {
+        return () -> {
             CURRENT_SHARD.set(shard);
             try
             {
@@ -117,7 +133,7 @@ public final class ShardExecutors
             {
                 CURRENT_SHARD.set(UNSET);
             }
-        });
+        };
     }
 
     @VisibleForTesting

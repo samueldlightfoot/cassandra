@@ -314,6 +314,9 @@ public enum CassandraRelevantProperties
     /** @deprecated See CASSANDRA-17797 */
     @Deprecated(since = "4.1")
     IGNORE_RACK("cassandra.ignore_rack"),
+    /** Route allowlisted inbound verbs (MUTATION_REQ) to the owning shard executor at ingress, rather
+     * than the verb's Stage. Requires {@link #MUTATION_SHARD_ROUTING}. Read once at startup. */
+    INBOUND_SHARD_DISPATCH("cassandra.tpc.inbound_shard_dispatch", "false"),
     INDEX_SUMMARY_EXPECTED_KEY_SIZE("cassandra.index_summary_expected_key_size", "64"),
     INITIAL_TOKEN("cassandra.initial_token"),
     INTERNODE_EVENT_THREADS("cassandra.internode-event-threads"),
