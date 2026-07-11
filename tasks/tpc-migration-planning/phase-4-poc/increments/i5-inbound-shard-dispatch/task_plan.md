@@ -15,21 +15,30 @@ would hide whether I5 recovers I1's own RF≥3 hop regression or adds net value.
 
 ---
 
-## Phase A — I1-close (RF=3-safe headline; single-node + in-JVM)
-- [ ] **Drop `skip_lock`.** Delete the `MUTATION_SHARD_SKIP_LOCK` property + enum (unconsumed
-      per I1 handoff) and any references. No `MemtableShard.put` change, no shard-index field —
-      the writeLock stays; single-writer routing already makes it uncontended.
-- [ ] **Build `misroutedPuts` decoupled from skip_lock.** New `TrieMemtableMetricsView` counter
-      (`metrics/TrieMemtableMetricsView.java`, beside contended/uncontended at `:41/:44/:47`),
-      incremented in `MemtableShard.put` when the caller is on a shard thread AND the owner-check
-      fails while it still takes the `tryLock` (design-target §1 definition). This is D6's
-      skew-vs-stale-routing discriminator and poc-criteria §1's hurdle evidence — it must exist
-      even though nothing skips the lock. Owner-check reads `ShardExecutors.currentThreadIsOwnerOf`.
-- [ ] **Multi-node flag-on in-JVM dtest** through the inboundSink seam (not `CQLTester.execute`,
-      which bypasses StorageProxy): RF-aware in-JVM cluster, `shard_routing` on, writes land +
-      read back; `misroutedPuts` observable. Confirms the replica `MutationVerbHandler` routing.
-- [ ] `ant jar` (not just build) + class-in-jar check; flag-off byte-identical regression
-      (`SimpleReadWriteTest` in-JVM).
+## Phase A — I1-close (RF=3-safe headline; single-node + in-JVM) — DONE 2026-07-11
+- [x] **Drop `skip_lock`.** Deleted the `MUTATION_SHARD_SKIP_LOCK` property (confirmed unconsumed:
+      single declaration, zero readers). No `MemtableShard.put` lock change; writeLock stays.
+- [x] **Build `misroutedPuts` decoupled from skip_lock.** New counter on `TrieMemtableMetricsView`
+      (name + field + ctor init beside contended/uncontended). Incremented in `MemtableShard.put`
+      via the two-part guard `currentShardId() >= 0 && !currentThreadIsOwnerOf(shardIndex)` — the
+      `>= 0` half is load-bearing: it excludes off-thread writers (hints/RR/LWT), which would
+      otherwise all count as misrouted (`-1 != floorMod`).
+      **Resolution of the "no shard-index field" tension:** `MemtableShard` can't see its own index,
+      so the outer `TrieMemtable.put:191` (which computes it) threads it as a **method parameter** to
+      `MemtableShard.put(shardIndex, …)`. Field-free, honors the plan; counter sits with its siblings.
+- [x] **Multi-node flag-on in-JVM dtest** — `ShardRoutedReplicaApplyTest` (test/distributed): 3 nodes
+      RF=3, flag on, memtable='trie'; 200 coordinator writes forward MUTATION_REQ to remote replicas.
+      GREEN (1/1, 8.5s): routing enabled on all nodes, routed-apply count advanced ≥200 on nodes
+      1/2/3 (replica path proven), `misroutedPuts`==0 everywhere, all rows read back at ALL. Uses the
+      default (non-NETWORK) in-process sink → `doVerb` — macOS-runnable; NETWORK would bind 127.0.0.2/3.
+- [x] `ant jar` + class-in-jar check (verified by `javap` on the class **extracted from the jar**:
+      `currentShardId`/`currentThreadIsOwnerOf`/`getfield misroutedPuts` present — zip-date column is
+      Ant-normalized, not trustworthy). Flag-off byte-identical: `SimpleReadWriteTest` 40/40 GREEN.
+
+  Side-check: `TrieMemtableMetricsTest` errors (tests=0) on a PRE-EXISTING driver/server ABI skew —
+  `transport.ProtocolVersion.supportedVersions()` returns `ImmutableList` but the bundled datastax
+  driver expects `java.util.List` → `NoSuchMethodError` in `Cluster.connect()` (setup:90). Entirely in
+  `transport/`; my diff (config/db.memtable/metrics) can't touch it. Same issue the I1 handoff logged.
 
 ## Phase B — I5 inbound shard dispatch (flag `cassandra.tpc.inbound_shard_dispatch`)
 - [ ] **`net/ShardInboundRouter.java`** — allowlist **{MUTATION_REQ} ONLY** (READ_REQ deferred to

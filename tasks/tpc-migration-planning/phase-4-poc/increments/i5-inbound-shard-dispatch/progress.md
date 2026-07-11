@@ -53,3 +53,29 @@ multi-node perf) is later, when the code is ready.
 Model: Opus builds; Fable reviews the `misroutedPuts` owner-check site (Phase A) and the I5 seam
 guards — epoch-ahead / FORWARD_TO stage fallbacks + owner-inline bypass are the subtle bits (Phase B).
 As-built I0/I1 interfaces to reuse verbatim: see `../i1-shard-routed-apply/progress.md` HANDOFF.
+
+## 2026-07-11 — Phase A BUILT + verified (all four items green)
+Seams re-verified on-branch before coding (no drift). One inconsistency surfaced + resolved: the plan
+said "no shard-index field" AND "owner-check inside `MemtableShard.put`", but the shard can't see its
+own index. Resolved by threading `shardIndex` as a **method parameter** from `TrieMemtable.put:191`
+(field-free). Guard is two-part: `currentShardId() >= 0 && !currentThreadIsOwnerOf(shardIndex)` — the
+`>= 0` excludes off-thread writers (hints/RR/LWT) that would otherwise all read as misrouted.
+
+Changes (4 files): deleted `MUTATION_SHARD_SKIP_LOCK` (unconsumed); `misroutedPuts` counter on
+`TrieMemtableMetricsView`; `shardIndex` param + guard in `TrieMemtable`; new dtest
+`ShardRoutedReplicaApplyTest`.
+
+Verification:
+- `ShardRoutedReplicaApplyTest` GREEN (3-node RF=3, flag on): replica routing proven (routed-apply
+  count ≥200 on nodes 1/2/3), `misroutedPuts`==0 all nodes, read-back at ALL. Non-NETWORK sink→doVerb
+  path (macOS-runnable). This is the replica path single-node can't reach.
+- `ant jar` + `javap` on the jar-extracted class confirms the new bytecode is packaged.
+- Flag-off byte-identical: `SimpleReadWriteTest` 40/40 GREEN.
+- `ShardExecutorsTest` 5/5, `MutationShardRoutingTest` 6/6, `ShardRoutedMutationApplyTest` 1/1 GREEN.
+- `TrieMemtableMetricsTest` errors (tests=0) = PRE-EXISTING driver ABI skew (`ProtocolVersion.
+  supportedVersions()` returns `ImmutableList`, datastax driver expects `List`) in `transport/` — not
+  my diff. Same issue the I1 handoff logged; unrelated to routing.
+
+NOT committed yet (user says when). Next: **Phase B** (I5 inbound dispatch — `ShardInboundRouter`,
+the three guards, `ShardExecutors.execute(ExecutorLocals,int,Runnable)` overload, inboundSink dtest
+seam). Fable should review the epoch-ahead / FORWARD_TO fallbacks + owner-inline bypass.
