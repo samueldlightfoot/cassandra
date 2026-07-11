@@ -19,6 +19,7 @@
 package org.apache.cassandra.net;
 
 import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.ShardExecutors;
@@ -48,7 +49,15 @@ public final class ShardInboundRouter
     public static final boolean ENABLED =
         INBOUND_SHARD_DISPATCH.getBoolean() && MutationShardRouting.ROUTING_ENABLED;
 
+    /** Messages routed to a shard executor at ingress. */
+    private static final AtomicLong routed = new AtomicLong();
+    /** Allowlisted candidates a guard diverted back to the verb's Stage (epoch/forward/unroutable). */
+    private static final AtomicLong stageFallbacks = new AtomicLong();
+
     private ShardInboundRouter() {}
+
+    public static long routedCount() { return routed.get(); }
+    public static long stageFallbackCount() { return stageFallbacks.get(); }
 
     /**
      * If {@code message} is routable, submit {@code deliveryTask} to the owning shard executor carrying
@@ -74,22 +83,29 @@ public final class ShardInboundRouter
         // Guard 1 - epoch ahead. The handler's TCM catch-up does a blocking peer/CMS fetch when the
         // message epoch leads ours; that must never run on a shard thread. Cheap volatile read, rare path.
         if (message.epoch().isAfter(ClusterMetadata.current().epoch))
-            return false;
+            return fallback();
 
         // Guard 2 - FORWARD_TO. The handler forwards to peer replicas; that send must not queue behind a
         // hot shard (cross-node head-of-line blocking).
         if (message.forwardTo() != null)
-            return false;
+            return fallback();
 
         ShardExecutors shards = ShardExecutors.instance();
         if (shards == null)
-            return false;
+            return fallback();
 
         OptionalInt shardId = MutationShardRouting.route((Mutation) message.payload);
         if (shardId.isEmpty())
-            return false;
+            return fallback();
 
         shards.execute(locals, shardId.getAsInt(), deliveryTask);
+        routed.incrementAndGet();
         return true;
+    }
+
+    private static boolean fallback()
+    {
+        stageFallbacks.incrementAndGet();
+        return false;
     }
 }
