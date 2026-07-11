@@ -202,3 +202,35 @@ Flag-on is **compiled but behaviorally unverified.** B2 is the load-bearing proo
   per-shard depth signal (D6) before the fallback can trigger. Today `InboundMessageHandler` capacity is
   the only back-pressure. Router currently always routes when allowlisted + guards pass.
 - Then Fable review (epoch/FORWARD_TO fallbacks, owner-inline bypass, locals overload).
+
+## 2026-07-11 — Phase B2 BUILT + flag-ON proven (router + owner-inline bypass live at RF=3)
+Committed B1 first (`a33130ff39` code, `446391909b` notes). Then B2:
+
+**Prereq verified:** in-JVM `receiveMessage` defaults to `RECEIVE_MESSAGES_ASYNC=false` →
+`sync(runnable).accept(false)` → `runOnCaller=false` → the **else branch** (`Instance.java:580-594`) where
+the hook lives. So default in-JVM clusters DO exercise the router (not vacuous). `sync(Consumer)` submits
+the body to the isolated executor and waits (`IsolatedExecutor.java:158`).
+
+**Added:** `ShardInboundRouter.routedCount()`/`stageFallbackCount()` (AtomicLong + `fallback()` helper);
+new dtest `ShardInboundDispatchTest`.
+
+**Proof (`ShardInboundDispatchTest` GREEN 1/1) — a 1x-vs-2x discriminator, non-vacuous:**
+- Remote replicas 2,3: `routedCount` delta ≥200 → the I5 inbound router fires on the replica path.
+- Owner-inline bypass: replica `submittedTaskCount` delta ≤ routedDelta+5 (~1x). Broken bypass → ~2x
+  (router submits + applyMutation re-enqueues). This is the precise bypass proof.
+- Node 1 `routedCount` delta < rows: its own coordinator writes apply via `performLocally`, never inbound —
+  confirms I5 targets the inbound-replica path (I1 is coordinator-local).
+- `stageFallback` delta 0 on 2,3 (no guard tripped steady-state); `misroutedPuts` 0 all nodes; reads at ALL.
+
+Flag-off re-verified after the counter change (`SimpleReadWriteTest` 40/40); `ant jar` packages the
+counter-bearing router (javap). Commit pending.
+
+### HANDOFF → Phase B3 (remaining before Phase C perf)
+- **Guard dtests not yet written.** epoch-ahead and FORWARD_TO guards are wired + counted but not
+  independently exercised. Need: a topology-change window to force epoch-ahead → assert `stageFallback`
+  advances + routing still correct; a multi-DC `FORWARD_TO` write → assert divert. Both are steady-state 0
+  in `ShardInboundDispatchTest`, so their divert paths are UNPROVEN.
+- **Inbox-full fallback still deferred** (B1 note): shard queues unbounded, no depth signal yet (D6).
+- **1x-vs-2x slack (+5)** is a guess against background traffic; Fable should sanity-check it isn't masking a
+  partial bypass failure. In this run the replicas had no other shard traffic, so delta should be ~exact.
+- Then Fable review, then Phase C (Hetzner multi-node perf, 3-arm off/I1/I1+I5).

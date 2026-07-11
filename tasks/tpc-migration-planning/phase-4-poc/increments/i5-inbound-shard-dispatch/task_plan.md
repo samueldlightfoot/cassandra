@@ -74,13 +74,29 @@ would hide whether I5 recovers I1's own RF≥3 hop regression or adds net value.
 - [x] Flag-off byte-identical verified: `SimpleReadWriteTest` 40/40 GREEN; Phase A `ShardRoutedReplicaApplyTest`
       1/1, `ShardExecutorsTest` 5/5, `MutationShardRoutingTest` 6/6 GREEN; `ant jar` packages both new classes.
 
-### B2 — flag-ON behavioral proof + Fable review — NOT STARTED (crucial: flag-on is compiled, not verified)
-- [ ] **Flag-on in-JVM dtest** (3-node RF=3, `memtable='trie'`, flag set before `Cluster.start()`): prove the
-      router actually fires — routed-through-router count advances, `misroutedPuts`==0, owner-inline bypass
-      hits (no double-enqueue), tracing/ClientWarn propagate, data reads back at ALL.
-- [ ] **Guard dtests:** epoch-ahead diverts to Stage (topology-change window); FORWARD_TO diverts (multi-DC).
-- [ ] **Micro-instrumentation:** router fallback count + routed count; inbox depth; messaging `internalLatency`.
-- [ ] **Fable review:** the epoch/FORWARD_TO Stage fallbacks, the owner-inline bypass, the locals overload.
+### B2 — flag-ON behavioral proof — DONE 2026-07-11 (router + bypass proven live at RF=3)
+- [x] **Router counters** — `ShardInboundRouter.routedCount()` / `stageFallbackCount()` (AtomicLong;
+      `fallback()` helper increments the diverted count). Observable per-instance via `callOnInstance`.
+- [x] **Flag-on in-JVM dtest** — `ShardInboundDispatchTest` (3-node RF=3, `memtable='trie'`, BOTH flags set
+      before `Cluster.start()`). GREEN (1/1, 11.5s). Non-vacuous proof via a 1x-vs-2x discriminator:
+      - Remote replicas (2,3): `routedCount` delta **≥200** (router fires on the I5 inbound path).
+      - Owner-inline bypass: replica `submittedTaskCount` delta ≤ `routedCount` delta + 5 (**~1x**, not 2x —
+        a broken bypass would re-enqueue and roughly double it).
+      - Node 1 (coordinator+replica): `routedCount` delta **< rows** — its own writes apply via
+        `performLocally`, confirming I5 is the *inbound-replica* mechanism (distinct from I1 coordinator-local).
+      - `stageFallback` delta **0** on 2,3 (no guard tripped in steady state); `misroutedPuts` **0** all nodes;
+        all rows read back at ALL.
+- [x] Flag-off re-verified after the counter change: `SimpleReadWriteTest` 40/40 GREEN; `ant jar` packages
+      the counter-bearing router (javap-confirmed).
+
+### B3 — remaining before the Phase C perf run — NOT STARTED
+- [ ] **Guard dtests:** force epoch-ahead → Stage divert; force FORWARD_TO (multi-DC) → Stage divert.
+      (Guards are wired + counted; not yet independently exercised by a test.)
+- [ ] **Deferred from B1:** inbox-full → Stage fallback (shard queues unbounded; needs a per-shard depth
+      signal, ties to D6). Today `InboundMessageHandler` capacity is the sole back-pressure.
+- [ ] **Micro-instrumentation for the perf run:** inbox depth, messaging `internalLatency` delta.
+- [ ] **Fable review:** epoch/FORWARD_TO Stage fallbacks, owner-inline bypass, locals overload, and the
+      1x-vs-2x discriminator's robustness (background-traffic slack).
 
 ## Phase C — multi-node RF=3 perf (DEFERRED to on-demand Hetzner Cloud, poc-criteria §9)
 No standing rig. Correctness is proven earlier (Phase A/B in-JVM multi-node dtests); this phase is
