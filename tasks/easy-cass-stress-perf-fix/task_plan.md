@@ -1,5 +1,11 @@
 # Task: re-measure Cassandra throughput with correct (server-side) methodology
 
+> ⛔ **SUPERSEDED / CLOSED (2026-07-10).** This plan's "client-reported throughput is ~2×
+> inflated" claim is ALSO FALSE — client output matches `nodetool` in the clean regime.
+> True: the value-gen fix is a red herring. Canonical understanding:
+> `tasks/tpc-migration-planning/phase-4-poc/{STRESS-RUNBOOK,stress-tool-behaviour}.md` and
+> the corrected `findings.md` in this dir. Do not act on the text below.
+
 **Status:** the "value-generator fix" chased in the parent session is a RED HERRING (server-side
 A/B: unfixed 132k vs fixed 139k w/s = noise, not 14×). The real finding: **client-reported
 throughput is ~2× inflated; must measure server-side.** See findings.md TL;DR. Rig is UNFIXED/clean.

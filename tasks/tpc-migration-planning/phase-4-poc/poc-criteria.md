@@ -132,6 +132,13 @@ space `--partitions` sized so the dataset ≫ heap only in the I2b miss cell; ba
 
 ## 5. Noise band + oversubscription (the honesty pins)
 
+> **⚠️ 2026-07-10 — the "gate at 50%, knee too noisy" rule below is SUPERSEDED.** The 80%/knee
+> noise was a **co-located-rig artifact**; off-box the knee is clean (0 err, stable p99), so the
+> gate now uses a **primary loaded-tail point + secondary mid-load point** (increments.md's "the
+> gate is the loaded tail"). The absolute rates here are also stale (mismeasured clean_max — see
+> §8.1 banner). See `gate-reconciliation.md` + `offbox-baseline-clean.md`. The noise-band *tie
+> rule* (delta inside the band = tie) still stands.
+
 - **Noise band (measured `baseline_v1`):** at **50% of clean_max the p99 is stable and
   tight** (write 0.34–0.58ms, balanced 0.28–0.44ms, read 1.15–31ms) — these are the gate
   reference points. At **80% of clean_max (near the knee) p99 is highly unstable** across the
@@ -177,6 +184,11 @@ writers (commitlog, compaction, flush, streaming, hints) target DIO in EITHER ou
 ---
 
 ## 8. Baseline results — `baseline_v1` (2026-07-09, rig 157.180.98.112)
+
+> **⚠️ SUPERSEDED 2026-07-10 by `offbox-baseline-clean.md`** (off-box, single-process,
+> `--concurrency 3000`). `baseline_v1`'s clean_max was mismeasured (Cassandra idle — §8.1 banner);
+> real clean_max is ~15× higher (write ~246k, balanced ~180k, read ~120k). Use the clean doc for
+> all operating points; this section is kept only as the record of the mismeasured pass.
 
 Captured by `baseline_driver.sh` (rate-ladder model, §4). All cells **0 errors**. Client
 CO-corrected latency (stdout/`--hdr`/`--csv-latency` agree). Raw per-cell output archived in

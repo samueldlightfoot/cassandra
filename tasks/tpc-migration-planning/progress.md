@@ -689,3 +689,176 @@ Netty ~1%, maintenance pools vs shard-owned scheduling groups — the latter now
 a named revisit trigger). Pointers added in increments.md §10 + effort.md §4;
 memory saved (scylla-endgame-influence). CEP framing line: adopted, destined, or
 diverged-with-evidence — never by accident.
+
+---
+## 2026-07-10 — Phase 4.1 stress-tool characterization (the load-gen was the blocker)
+Re-baseline attempt stalled on load-generator behaviour; spent the session fully
+characterizing `cassandra-easy-stress` instead of trusting the (wrong) handoff model.
+
+**Findings (all measured/source-verified this session):**
+- Delivered ≈ offered in the CLEAN regime (single proc, ≤~100k: ratio 0.94–0.96, fresh
+  dataset, server-side). The prior "0.1–0.25× delivery" claim was a SKEWED-DATASET artifact
+  — FALSE. Knee ~200k offered→162k delivered (client 99% + Cassandra 90% together). Collapse
+  >200k: delivered DROPS (shared Guava RateLimiter + fair-queue contention on 4 client cores).
+- `--rate` + `--maxrlat/--maxwlat` must NEVER be combined (the trap that cost 4h+): `--rate`
+  is the rate limiter's target throughput; `--maxlat` is an optimizer that CONTROLS that
+  throughput to a latency SLO. For latency-defined saturation: ONE process, `--maxwlat/
+  --maxrlat` ALONE, no `--rate`. Units are ms (verified). Earlier "stall" was 3 stacked procs.
+- DECISIVE: `--maxwlat` governs the CLIENT's CO-corrected p99 (op-creation→complete, incl.
+  generator queue wait), NOT Cassandra's. Single-proc `--maxwlat 100` converged at ~47k/s
+  with client p99≈100ms BUT server `proxyhistograms` write p99 = **310µs**, Cassandra ~30%
+  CPU. The 4-core co-located client walls on its own queueing (~50k) / throughput collapse
+  (~160k) while Cassandra is barely loaded → can't cleanly saturate Cassandra from here.
+
+**Decision (user):** repin 6/6 (Cassandra 0–5, client 6–11) to give the generator headroom;
+off-box load gen if still client-bound.
+
+**Docs written:** `phase-4-poc/STRESS-RUNBOOK.md` (one-page how-to), `stress-tool-behaviour.md`
+(mechanism+evidence), `START-HERE-baseline-6core.md` (new-context handoff — START THERE).
+Corrected: `REBASELINE-HANDOFF.md` (banner), `tasks/easy-cass-stress-perf-fix/{findings,
+task_plan}.md` (flagged false), memory `feedback_easy_cass_stress_scripted_run_gotchas`,
+`tasks/lessons.md`.
+
+**NEXT (new context):** `phase-4-poc/START-HERE-baseline-6core.md`.
+
+## 2026-07-10 — Session: 6/6 repin validated → OFF-BOX decision
+
+**Ran the START-HERE-baseline-6core plan. Verdict: co-located generation cannot produce a
+clean, representative Cassandra p99 baseline on this 12-core box. Going off-box (user).**
+
+**Evidence (all server-side, fresh 346 MB / 2M-partition dataset after drop+repopulate):**
+- `--maxwlat 100` write-only, 6/6, single proc: converged & oscillated at ~47k/s,
+  **Cassandra 30% CPU, srv write p99 0.37ms, client p99 121ms** — same ~300× gap as 4 cores.
+  Client only 20–30% CPU at convergence ⇒ it was never CPU-bound; more cores can't move the
+  queueing-latency governor. maxwlat is the wrong tool for a *Cassandra* SLO on this box.
+- Raw `--rate` sweep, 6-core Cassandra / 6-core client (clean data):
+  | offered | delivered | ratio | CassCPU | CliCPU | srv p99 |
+  |--------:|----------:|------:|--------:|-------:|--------:|
+  | 100k | 78k | 0.78 | 43% | 37% | 1.6ms |
+  | 160k | 121k | 0.76 | 73% | 53% | 2.8ms |
+  | 220k | 142k | 0.65 | 89% | 71% | 4.0ms |
+
+**Why off-box (the lose-lose on 12 cores):**
+- 8-core Cassandra / 4-core client (§2 curve): client pegs 99% at Cassandra's knee → knee is
+  client-contaminated.
+- 6/6: client finally gets headroom (71% vs Cassandra 89%) BUT Cassandra is core-starved
+  (6 of 12) → unrepresentative baseline, knee drops to ~142k.
+- Even sub-knee at 6/6: 22% coordinated omission at 100k and srv p99 1.6ms at only 43%
+  Cassandra CPU — the co-located client injects tail latency. Fatal for a p99-based gate.
+- Can't give this box BOTH a full-core-budget Cassandra AND an isolated generator w/ headroom.
+
+**Rig left in:** Cassandra repinned to **0–11 (full)** = off-box target config. Dataset fresh
+(346 MB, 2M partitions, compaction drained). No stray stress procs. Box public IP only
+(157.180.98.112/32) — no Hetzner vSwitch/private net configured yet.
+
+**BLOCKED ON USER:** provision an off-box load generator (see `phase-4-poc/OFFBOX-HANDOFF.md`).
+
+**NEXT (new context):** `phase-4-poc/OFFBOX-HANDOFF.md` once the load box exists.
+
+### 2026-07-10 (cont.) — Adversarial re-analysis: is the load box really needed?
+
+Before purchasing, ran topology check + a contamination experiment + 3 devil's-advocate
+sub-agents. Findings sharpened the earlier "go off-box" call:
+- **Box is 6 PHYSICAL cores / 12 HT threads** (Xeon E-2276G, 1 socket, ONE shared 12 MiB L3,
+  1 NUMA). Earlier "12 cores" conflated HT threads with cores. core N = logical {N, N+6}, so
+  every co-located split tested was HT-sibling-contended.
+- **Contamination experiment:** at SUB-KNEE load, co-location does NOT inflate server-side p99
+  (HT-overlap 446µs vs disjoint 535µs at ~37k). But a clean disjoint 2-phys-core client MAXES
+  at 93k while Cassandra is only 44% CPU → can't reach the knee from a clean split.
+- **No single-box dodge survives for near-knee data** (shared L3, no Intel CAT). Sub-knee is
+  benign but uninformative (nothing for TPC to fix) AND common-mode cancellation breaks (TPC
+  changes efficiency → different client headroom per arm → confounded delta).
+- **Deeper finding (red-team):** a 6-phys-core / single-NUMA Cassandra box can't exhibit the
+  many-core scaling TPC targets → the binding constraint is the **Cassandra box**, not the
+  generator. A minimal load box (CCX33/8) is under-spec'd AND serves a too-small DB.
+
+**Refined conclusion:** load box is needed for near-knee data on THIS box, but the better
+spend is a larger-core Cassandra box. Full analysis + the user-facing scope decision:
+`phase-4-poc/LOADGEN-DECISION-ANALYSIS.md`. Handoff corrected: `OFFBOX-HANDOFF.md`.
+
+**BLOCKED ON USER:** pick PoC ambition (50%-load A/B vs real near-knee) + hardware path
+(off-box gen on current box, or upgrade the Cassandra box). See analysis doc §4.
+
+### 2026-07-10 (cont.) — Off-box load box PROVISIONED + first baseline captured (autonomous)
+
+CCX43 (62.238.35.142, 16 vCPU EPYC-Milan = 8 phys cores, hel1) set up as off-box generator:
+key auth + Java 17 + stress fat-jar copied. Cassandra rebound rpc_address 127.0.0.1→0.0.0.0
+(broadcast 157.180.98.112), restarted, repinned 0-11 (all 6 phys cores), firewall 9042→load
+box only, fresh 2M/459MB dataset. Scripts on rig: load box /opt/ces/{drive,drive_mp}.sh;
+Cassandra /root/{measure,ladder,runall,clat,clat_all}.sh. Results: results/offbox/ (also
+pulled to phase-4-poc/results-offbox/).
+
+**VALIDATED off-box premise:** at Cassandra's knee the LOAD BOX keeps headroom (≤68% at 92%
+Cassandra) — co-location never could. Single stress proc caps ~100k (tool serialization), so
+drive N parallel procs.
+
+**Trunk saturation (CPU% = reliable signal; throughput steady-state clat):**
+- write-only: knee ~220-225k @ 92-99%, clean ~200k @ 74%. srv write p99 ~3-4ms near knee.
+- read-heavy(0.9): saturation ~115-123k @ 92-100%. clean read p99 ~1.6ms @ 100k/72%.
+- balanced(0.5): saturation ~180-200k @ 98-100%. write tail ~12ms at saturation.
+Reads ~2x CPU-heavier than writes. Full tables: phase-4-poc/offbox-baseline-results.md.
+
+**Gaps/next:** (1) low sub-knee clean-latency points (~100k write) not yet captured (1 proc,
+reduced --rate). (2) mixed N=1 + overload rungs hit transient control-conn timeouts (need ≥30s
+recovery after an overload rung). (3) reconcile gate operating points (poc-criteria §5 sub-knee
+vs increments.md loaded-tail) BEFORE the increment A/B. (4) then run the SAME curve on the
+increment build for the gate comparison.
+
+**COST:** CCX43 bills hourly and CANNOT be stopped by saving cost (Hetzner bills for existence)
+— **user must DELETE the instance** when baselines are done. Currently idle (no load running).
+
+### 2026-07-10 (cont.) — CLEAN single-process trunk baseline captured
+
+After the --concurrency discovery, re-ran the trunk baseline the RIGHT way: ONE process,
+--concurrency 3000, --rate swept, fresh 2M dataset, 30s idle-settle + server-side proxyhist.
+Authoritative results: phase-4-poc/offbox-baseline-clean.md (raw: results-offbox/clean_*.txt).
+
+Clean trunk curve (server-side p99, delivered≈offered, 0 err below knee):
+- write: 119k@37%→0.5ms · 181k@57%→0.9ms · knee 246k@88%→1.9ms · sat ~250k@98%
+- balanced0.5: 133k@69%→wr1.9/rd0.2ms · knee 180k@96% · sat ~209k@100%
+- read0.9: 90k@59%→1.1ms · knee 120k@80%→3.3ms · sat ~136k@100%
+Single process cleanly delivers to the knee (multi-process retired). Client-side p99 column
+unreliable (CO+startup); server proxyhist is authority (bucketed → read as band).
+
+Caveats: first rung of mixed/read ladders boundary-polluted (30s idle < enough after a 100%-CPU
+saturation rung — discard those cells). No 3-iter noise bands yet.
+
+**Baselines: trunk side is now gate-usable for sub-knee+knee points.** Remaining before the gate:
+(1) 3-iter noise bands at chosen operating points; (2) reconcile gate points (poc-criteria §5 vs
+increments.md loaded-tail); (3) build increment I1 + run identical curve.
+
+### 2026-07-10 (cont.) — Gate operating-point reconciliation (box deleted, zero-cost)
+
+Load box deleted (cost stopped; all data + scripts saved locally). Reconciled the gate-point
+conflict → `phase-4-poc/gate-reconciliation.md`.
+- Conflict: poc-criteria §5 gates at 50%-of-clean_max (knee "too noisy"); increments.md says
+  "the gate is the loaded tail" (near knee), low-load may regress + doesn't gate.
+- RESOLUTION: §5's knee-noise was a CO-LOCATED artifact; off-box the knee is clean (0 err, stable
+  p99). So gate at the loaded tail after all — the conflict dissolves in favour of increments.md,
+  enabled by the rig change §5 predates. Also: §5/§8.2 numbers are stale (mismeasured clean_max).
+- Reconciled gate: PRIMARY loaded-tail (~80-90% CPU) + SECONDARY mid-load (~55-70%), both gating;
+  low-load point non-gating (observes I1's routing-hop crossover). Points per mix from the clean
+  baseline. Noise-band tie rule unchanged.
+- Added SUPERSEDED banners to poc-criteria §5 + §8.
+- OPEN DECISION (user): gate metric = client-CO-p99 via processed --hdr (§4.2, recommended) vs
+  server proxyhistogram. Capture BOTH regardless; the stdout p99 column is unusable (startup+decay).
+
+NEXT: (1) user picks gate metric; (2) build increment I1; (3) re-provision box → 3-iter noise
+bands at the 6 gating points + I1 A/B in one session.
+
+### 2026-07-10 (cont.) — Gate METRIC analysis (sub-agent + source verification)
+
+Ran a critical sub-agent on client-CO-p99 (--hdr) vs server proxyhistogram as gate metric. It
+recommended client-CO primary, arguing server-side is "blind to shard-inbox queue wait." VERIFIED
+that claim FALSE against fork source: StorageProxy.java:534 records write latency after
+responseHandler.get() (:1004) which waits for local apply → proxyhistogram DOES include the shard
+hop + queue wait. Both metrics see I1's routing-hop regression.
+- Real A-B diff = client-generator queue wait + <1ms network only (NOT shard wait).
+- Server-side (B) is CO-immune by construction + cleanest matched-throughput comparator.
+- RECOMMENDATION (in gate-reconciliation.md, departs from §4.2 — user's call): AND-gate BOTH
+  (either regresses beyond band = fail); primary = server-side B, client-CO A = end-to-end guard.
+  AND-structure makes the primary label low-stakes.
+Meta: sub-agent mechanism claims must be source-verified before adoption (lessons.md pattern held).
+
+NEXT: user confirms metric stance (or accepts recommendation) → build increment I1 → re-provision
+box → 3-iter noise bands at 6 gating points + I1 A/B.

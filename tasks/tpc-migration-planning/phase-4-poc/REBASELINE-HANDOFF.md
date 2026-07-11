@@ -4,6 +4,18 @@
 
 ---
 
+> ## ⛔ CORRECTION (2026-07-10) — the load model below is SUPERSEDED
+> The `--rate 2000000` + stack-multiple-processes plan in §0/§4/§6 is **WRONG** and cost
+> hours. `--rate 2M` busy-spins the client rate limiter into a throughput *collapse*;
+> stacking processes just time-shares the client cores. **Correct method: ONE stress
+> process, latency-governed by `--maxwlat`/`--maxrlat` ALONE (no `--rate`), measured
+> server-side.** Read **`STRESS-RUNBOOK.md`** and **`stress-tool-behaviour.md`** (same dir)
+> before running anything. The rest of this handoff (server-side measurement, fresh
+> populate, config pins, gates) is still valid — only the *how-to-generate-load* part is
+> replaced.
+
+---
+
 ## 0. AUTONOMOUS RUN — READ FIRST (operator is asleep; do NOT ask questions)
 You are running unattended overnight. **Never block on a question; decide per the rules here and
 proceed.** Your job: put Cassandra under real load, capture a trustworthy throughput+latency
