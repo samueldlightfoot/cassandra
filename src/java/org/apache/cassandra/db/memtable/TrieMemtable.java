@@ -34,6 +34,7 @@ import org.github.jamm.Unmetered;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.Clustering;
@@ -188,8 +189,9 @@ public class TrieMemtable extends AbstractShardedMemtable
         try
         {
             DecoratedKey key = update.partitionKey();
-            MemtableShard shard = shards[boundaries.getShardForKey(key)];
-            long colUpdateTimeDelta = shard.put(key, update, indexer, opGroup);
+            int shardIndex = boundaries.getShardForKey(key);
+            MemtableShard shard = shards[shardIndex];
+            long colUpdateTimeDelta = shard.put(shardIndex, key, update, indexer, opGroup);
 
             if (shard.data.reachedAllocatedSizeThreshold() && !switchRequested.getAndSet(true))
             {
@@ -547,8 +549,12 @@ public class TrieMemtable extends AbstractShardedMemtable
             this.metrics = metrics;
         }
 
-        public long put(DecoratedKey key, PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup) throws InMemoryTrie.SpaceExhaustedException
+        public long put(int shardIndex, DecoratedKey key, PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup) throws InMemoryTrie.SpaceExhaustedException
         {
+            // Only a shard thread can be "misrouted": the >= 0 guard excludes off-thread writers
+            // (hints, read-repair, LWT), which legitimately own no shard and take the lock as normal.
+            if (ShardExecutors.currentShardId() >= 0 && !ShardExecutors.currentThreadIsOwnerOf(shardIndex))
+                metrics.misroutedPuts.inc();
             BTreePartitionUpdater updater = new BTreePartitionUpdater(allocator, allocator.cloner(opGroup), opGroup, indexer);
             boolean locked = writeLock.tryLock();
             if (locked)

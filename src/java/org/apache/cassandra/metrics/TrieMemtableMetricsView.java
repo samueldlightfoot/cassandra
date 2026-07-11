@@ -34,6 +34,7 @@ public class TrieMemtableMetricsView
     public static final String TYPE_NAME = "TrieMemtable";
     private static final String UNCONTENDED_PUTS = "Uncontended memtable puts";
     private static final String CONTENDED_PUTS = "Contended memtable puts";
+    private static final String MISROUTED_PUTS = "Misrouted memtable puts";
     private static final String CONTENTION_TIME = "Contention time";
     private static final String LAST_FLUSH_SHARD_SIZES = "Shard sizes during last flush";
 
@@ -42,6 +43,11 @@ public class TrieMemtableMetricsView
 
     // the number of memtable puts that needed to wait on write lock
     public final Counter contendedPuts;
+
+    // puts made by a shard-writer thread onto a shard it does not own — routing skew or a stale
+    // boundary; healthy single-writer routing keeps this near zero. Unrouted writers (hints,
+    // read-repair, LWT) run off any shard thread and are excluded, not counted here.
+    public final Counter misroutedPuts;
 
     // shard put contention measurements
     public final LatencyMetrics contentionTime;
@@ -55,6 +61,7 @@ public class TrieMemtableMetricsView
         
         uncontendedPuts = Metrics.counter(factory.createMetricName(UNCONTENDED_PUTS));
         contendedPuts = Metrics.counter(factory.createMetricName(CONTENDED_PUTS));
+        misroutedPuts = Metrics.counter(factory.createMetricName(MISROUTED_PUTS));
         contentionTime = new LatencyMetrics(factory, CONTENTION_TIME);
         lastFlushShardDataSizes = new MinMaxAvgMetric(factory, LAST_FLUSH_SHARD_SIZES);
     }
