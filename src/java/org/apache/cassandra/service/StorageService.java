@@ -89,6 +89,7 @@ import org.apache.cassandra.concurrent.FutureTask;
 import org.apache.cassandra.concurrent.FutureTaskWithResources;
 import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.Config;
@@ -3953,6 +3954,11 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             }
             Stage.shutdownAndAwaitMutatingExecutors(false,
                                                     DRAIN_EXECUTOR_TIMEOUT_MS.getInt(), TimeUnit.MILLISECONDS);
+
+            // Shard executors carry routed mutation applies. Drain them after their feeding stages
+            // (above) and before flush + commitlog stop (below), so every in-flight apply reaches the
+            // memtable and commitlog first. No-op when routing is disabled.
+            ShardExecutors.drainAndAwait(DRAIN_EXECUTOR_TIMEOUT_MS.getInt(), TimeUnit.MILLISECONDS);
 
             StorageProxy.instance.verifyNoHintsInProgress();
 

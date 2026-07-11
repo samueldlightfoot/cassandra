@@ -62,6 +62,16 @@ public abstract class AbstractShardedMemtable extends AbstractAllocatorMemtable
         this.boundaries = owner.localRangeSplits(shardCount);
     }
 
+    /**
+     * The shard boundaries pinned at this memtable's construction (immutable for its lifetime).
+     * Exposed so shard routing can compute a key's shard id from the SAME boundaries this memtable
+     * will use for {@code put}, keeping the router and the memtable in agreement.
+     */
+    public ShardBoundaries getShardBoundaries()
+    {
+        return boundaries;
+    }
+
     private static class ShardedMemtableConfig implements ShardedMemtableConfigMXBean
     {
         @Override

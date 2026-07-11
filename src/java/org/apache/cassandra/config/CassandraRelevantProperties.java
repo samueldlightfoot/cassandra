@@ -411,6 +411,12 @@ public enum CassandraRelevantProperties
     MONITORING_MAX_OPERATIONS("cassandra.monitoring_max_operations", "50"),
     /** Defines the interval for reporting any operations that have timed out. */
     MONITORING_REPORT_INTERVAL_MS("cassandra.monitoring_report_interval_ms", "5000"),
+    /** Route the local mutation apply to a per-shard single-writer executor. Read once at startup — a
+     * mid-run flip would create mixed-writer windows. */
+    MUTATION_SHARD_ROUTING("cassandra.mutation.shard_routing", "false"),
+    /** When routing, skip the memtable per-shard writeLock while the current thread owns the shard
+     * (owner check with lock fallback). Independent of {@link #MUTATION_SHARD_ROUTING}. */
+    MUTATION_SHARD_SKIP_LOCK("cassandra.mutation.shard_routing.skip_lock", "false"),
     MV_ALLOW_FILTERING_NONKEY_COLUMNS_UNSAFE("cassandra.mv.allow_filtering_nonkey_columns_unsafe"),
     MV_ENABLE_COORDINATOR_BATCHLOG("cassandra.mv_enable_coordinator_batchlog"),
     /** mx4jaddress */
