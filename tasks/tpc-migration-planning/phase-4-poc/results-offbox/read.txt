@@ -1,0 +1,6 @@
+# mix rr=0.9  2026-07-10T11:05:55Z  Cassandra 0-11 (6 phys core), off-box gen (8-phys EPYC)
+[read_n1] deliv w=6612 r=62832 (tot=69444)/s CassCPU=57% srvWr p50/95/99=310.00/924.00/2759.00 us  srvRd=60.00/1916.00/3973.00 us CliCPU=25% err=0
+[read_n2] deliv w=11415 r=103743 (tot=115158)/s CassCPU=92% srvWr p50/95/99=310.00/924.00/2759.00 us  srvRd=770.00/1916.00/5722.00 us CliCPU=38% err=8
+[read_n3] deliv w=12408 r=110798 (tot=123206)/s CassCPU=100% srvWr p50/95/99=50.00/770.00/2299.00 us  srvRd=770.00/2299.00/6866.00 us CliCPU=55% err=29
+[read_n4] deliv w=12090 r=110007 (tot=122097)/s CassCPU=100% srvWr p50/95/99=24.00/642.00/1916.00 us  srvRd=770.00/2299.00/6866.00 us CliCPU=68% err=67
+[read_n5] deliv w=11494 r=104646 (tot=116140)/s CassCPU=100% srvWr p50/95/99=24.00/446.00/1331.00 us  srvRd=770.00/2299.00/6866.00 us CliCPU=78% err=95

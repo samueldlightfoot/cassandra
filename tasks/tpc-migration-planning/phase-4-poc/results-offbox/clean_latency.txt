@@ -1,0 +1,6 @@
+# CLEAN latency pass (40s idle-settle + 110s steady) 2026-07-10T11:17:00Z
+[wclean rr=0.0 N=2] deliv w=200950 r=0 tot=200950 CassCPU=74% | srvWr p50/95/99/99.9=17.00/770.00/3973.00/ us | srvRd=60.00/1331.00/3311.00/ us
+[wknee rr=0.0 N=3] deliv w=225004 r=0 tot=225004 CassCPU=99% | srvWr p50/95/99/99.9=310.00/1109.00/3311.00/ us | srvRd=60.00/1331.00/3311.00/ us
+[rclean rr=0.9 N=1] deliv w=10040 r=90395 tot=100435 CassCPU=72% | srvWr p50/95/99/99.9=310.00/924.00/3311.00/ us | srvRd=60.00/642.00/1597.00/ us
+[mclean rr=0.5 N=2] deliv w=102048 r=99639 tot=201687 CassCPU=100% | srvWr p50/95/99/99.9=20.00/3311.00/11864.00/ us | srvRd=60.00/1331.00/3311.00/ us
+CLAT_DONE

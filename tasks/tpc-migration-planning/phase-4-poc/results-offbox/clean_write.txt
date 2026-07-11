@@ -1,0 +1,6 @@
+# CLEAN single-proc cc3000  mix rr=0.0  2026-07-10T12:00:55Z
+[rate=120000] deliv w=119185 r=0 tot=119185 CassCPU=37% | srvWr50/95/99=14.00/179.00/535.00 srvRd=0.00/0.00/0.00 us | cliWrP99=191.3ms cliRdP99=0ms err=0
+[rate=180000] deliv w=181180 r=0 tot=181180 CassCPU=57% | srvWr50/95/99=14.00/372.00/924.00 srvRd=0.00/0.00/0.00 us | cliWrP99=308.32ms cliRdP99=0ms err=0
+[rate=240000] deliv w=245653 r=0 tot=245653 CassCPU=88% | srvWr50/95/99=24.00/770.00/1916.00 srvRd=0.00/0.00/0.00 us | cliWrP99=582.21ms cliRdP99=0ms err=0
+[rate=300000] deliv w=241013 r=0 tot=241013 CassCPU=98% | srvWr50/95/99=310.00/924.00/2759.00 srvRd=0.00/0.00/0.00 us | cliWrP99=4712.79ms cliRdP99=0ms err=1266000
+[rate=360000] deliv w=256099 r=0 tot=256099 CassCPU=98% | srvWr50/95/99=372.00/1109.00/3311.00 srvRd=0.00/0.00/0.00 us | cliWrP99=12514.44ms cliRdP99=0ms err=1483439
