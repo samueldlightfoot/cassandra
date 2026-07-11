@@ -80,6 +80,42 @@ Validated amendments to the spec's pinned I1→I5 sequence (with evidence):
 - **I5 stays last and single** (confirmed): smallest patch, biggest measurement
   caveat (single-node).
 
+### Amendment 2026-07-11 — skip_lock dropped, I5 pulled forward, RF=3 gate
+
+Two user directives ("RF=3 is the assumption even for single-node tests; an RF=1-only
+mechanism means little"; "move the dispatch point upstream") + a correctness finding
+re-sequence the front of the plan. Reviewed by an Explore seam-verify + a Fable design
+pass (PROCEED-WITH-CHANGES). Detail in `../phase-4-poc/increments/i5-inbound-shard-dispatch/{findings,task_plan}.md`.
+
+- **skip_lock (I1 step-2) is DROPPED — RF=1-only.** A shard owner that *skips* the memtable
+  writeLock races an unrouted writer (hint/read-repair/LWT) that *takes* it, on the same
+  `InMemoryTrie` — a `ReentrantLock` excludes only lock-takers. No cheap RF≥3-safe owner-skip
+  exists (seqlock needs a StoreLoad fence ≈ the CAS it removes; biased locking is gone from the
+  JDK; routing every writer population is the real fix, CEP-era). The prize is ~20–40 ns vs a
+  µs apply. **`shard_routing` step-1 (route, KEEP the uncontended lock) is the RF≥3-safe headline.**
+- **`misroutedPuts` is KEPT, decoupled from skip_lock** — it is D6's skew-vs-stale-routing
+  discriminator and §0's hurdle evidence; increment it when a shard-thread owner-check fails
+  while still taking the tryLock.
+- **I5 (inbound shard dispatch) is PULLED FORWARD as I1's completion.** At RF≥3, I1-alone ADDS a
+  replica hop (netty→Stage.MUTATION→shard = 2 wakes vs trunk's 1) and plausibly fails its own
+  multi-node tail gate; I5 restores parity (netty→shard inline = 1 wake). Allowlist **MUTATION_REQ
+  only** (READ_REQ→I2a: it imports the read-miss-blocks-shard hazard). Guards: owner-inline bypass,
+  epoch-ahead→Stage fallback (TCM catch-up blocks — never on a shard thread), FORWARD_TO→Stage
+  fallback; plus an ExecutorLocals-carrying `execute` overload and the in-JVM `receiveMessageRunnable`
+  router seam.
+- **Gate becomes MULTI-NODE RF=3 (added track, NOT a replacement).** Single-node is
+  coordinator==replica, so inbound dispatch is inert there — the directive forces multi-node. The
+  single-node rig stays the low-noise instrument for I2/I3/I4 (I5 inert → no confound). The 3-arm
+  cell is **off / I1 / I1+I5**. I5 is judged on mechanism evidence (internalLatency, inbox depth,
+  wake/fallback counts) + tail-neutrality, not a headline p99 (µs-scale delta, IRQ-placement-signed).
+  I5 is proven *correct* via multi-node in-JVM dtests now (dev box); its *measured* multi-node number
+  is DEFERRED to on-demand Hetzner Cloud (per-hour, disposable — no standing rig), which does not
+  block the single-node-measurable I1 work (poc-criteria §9).
+- Corrected front-of-sequence: `I0,I1-step1 DONE → I1-close (drop skip_lock; misroutedPuts;
+  multi-node dtest) → I5 (MUTATION_REQ + guards) → multi-node RF=3 track → I2a (promote READ_REQ)
+  → I2b,I3,I4 unchanged`. Top risk: multi-node re-baseline churn (noisiest instrument, smallest
+  claim) — time-box the 3-node stand-up; run I2a in parallel on the existing rig if it slips.
+
 ---
 
 ## 2. I0 — shard runtime foundation

@@ -7,7 +7,7 @@
 - Pinned decisions resolved from design docs (oversubscription, sequential() executors, owner-check
   fallback, routing exclusions, flags). 3 minor open items flagged (expiry re-check, 2i guard, cell def).
 - Gate metric stance adopted (working default): AND-gate server-side + client-CO; see
-  ../tpc-migration-planning/phase-4-poc/gate-reconciliation.md.
+  ../../gate-reconciliation.md.
 - **Awaiting: user OK on the plan before writing code (plan-mode-default).**
 
 ## 2026-07-10 — phase-start review + plan patched (user OK'd, chose "a")
@@ -153,3 +153,27 @@ Flag off by default; whole existing suite green (`SimpleReadWriteTest` 40/40 fla
   `ProtocolVersion.supportedVersions()` NoSuchMethodError → use `StorageProxy.mutate` in tests.
 - Owner-check is a hint only: wrong/absent shard id → takes the lock (still correct). Single-writer per
   memtable shard holds because shard m is written only by executor `m % SHARD_COUNT`.
+
+---
+
+## HANDOFF — 2026-07-11 PIVOT: Phase 2 (skip_lock) SUPERSEDED
+
+Two user directives — "RF=3 is the assumption even for single-node tests; an RF=1-only
+mechanism means little" and "move the dispatch point upstream" — plus a correctness finding
+redirect the increment. Work continues in **`../i5-inbound-shard-dispatch/`**.
+
+**Finding:** `skip_lock` (owner skips the writeLock) is RF=1-only — at RF≥3 a skipping owner
+races a lock-taking unrouted writer (hint/read-repair/LWT) on the `InMemoryTrie`. The lock only
+excludes threads that take it. So **Phase 2 (step-2 owner-check lock skip) is dropped.** The
+RF≥3-safe, production-analogous mechanism is what I1 already ships with `shard_routing` alone:
+route the apply, KEEP the lock (single-writer makes it uncontended).
+
+**What changes (see `../i5-inbound-shard-dispatch/{task_plan,findings}.md`):**
+- Drop the `MUTATION_SHARD_SKIP_LOCK` flag/enum (unconsumed); no `MemtableShard.put` change.
+- **Keep `misroutedPuts` — decoupled from skip_lock** (it's D6's skew discriminator + the gate's
+  hurdle evidence): increment on shard-thread owner-check-fail-but-still-tryLock.
+- Pull the upstream dispatch (increments.md's I5) FORWARD as I1's completion — at RF≥3, I1-alone
+  ADDS a replica hop (netty→Stage.MUTATION→shard = 2 wakes vs trunk's 1); I5 restores parity.
+- Gate becomes multi-node RF=3 (single-node is coordinator==replica → inbound dispatch inert).
+Reviewed by Explore (seams) + Fable (design, PROCEED-WITH-CHANGES). Multi-node poc-criteria
+amendment awaits user sign-off before any gate cell.

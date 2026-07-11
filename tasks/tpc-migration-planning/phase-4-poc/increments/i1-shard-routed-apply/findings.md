@@ -1,6 +1,6 @@
 # I1 findings — pointer + on-branch verification
 
-**Authoritative inventory:** `../tpc-migration-planning/phase-4-poc/findings-i1-mutation-apply.md`
+**Authoritative inventory:** `../../findings-i1-mutation-apply.md`
 (2026-07-07 agent report: full local-apply call graph, ShardBoundaries lifecycle, per-shard
 runtime options, flag idiom, counters, 11-item adversarial pass, resolved + open questions).
 

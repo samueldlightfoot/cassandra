@@ -237,3 +237,41 @@ disk_access_mode standard, auto_snapshot off; data `/data/tpc-poc` (nvme1n1p3), 
 `/commitlog/tpc-poc` (nvme0n1p1). Dataset 2M partitions (~391 MB live, warm-cache). Cassandra
 cores 0–7, client 8–11. KeyValue default value size. GC overlay pending per-cell (gc.log
 captured). `intel_iommu=pt` NOT set (same for baseline + increments).
+
+---
+
+## 9. Multi-node RF=3 gate track — DEFERRED to on-demand Hetzner Cloud (decided 2026-07-11)
+
+Motivation (session 2026-07-11): the shard-routed apply is production-analogous only at RF≥3
+(unrouted hint/read-repair/LWT writers exist; single-node RF=1 has none, which is exactly why
+its result "means little"), and the upstream inbound dispatch (increments.md I5, pulled forward)
+is single-node-inert (coordinator==replica → no internode messaging on the write path). So I5's
+*measured* effect needs an RF=3 topology the single-node rig cannot provide. This is an **added
+track, not a replacement** — the single-node rig (§2/§8) stays the instrument for I1/I2/I3/I4
+(all single-node-measurable; I5 is inert there and introduces no confound). **Sequencing (decided):
+design/build everything RF=3-correct now and benchmark I1 single-node; prove I5 *correct* via
+multi-node in-JVM dtests (dev box, no cloud); DEFER the multi-node *perf* run to on-demand Hetzner
+Cloud instances (per-hour, disposable) once the code — incl. I5 — is ready.** This does not block
+the single-node I1 work and needs no standing rig.
+
+- **Topology:** 3 nodes, **RF=3, CL=QUORUM both directions** — every node replica for every key,
+  so each write exercises coordinator-local apply (I1's `performLocally`) plus two remote
+  MUTATION_REQ legs (I5's seam). QUORUM (not ONE) keeps one remote leg in every measured latency.
+- **The A/B is 3-arm: off / I1 / I1+I5** — off-vs-I1+I5 alone would hide whether I5 recovers I1's
+  own RF≥3 hop regression or adds net value. I5 judged on mechanism evidence (`internalLatency`
+  delta, inbox depth, wake/fallback counts, hop accounting) + tail-neutrality at matched
+  throughput — **not** a headline p99 (µs-scale delta, sign decided by IRQ/loop placement).
+- **Correctness cell (non-gate):** pause a node mid-run, resume, hint delivery floods concurrently
+  with routed writes → `misroutedPuts` flat, no `InMemoryTrie` corruption, all data readable.
+- **Placement (resolved):** on-demand **Hetzner Cloud**, 3 instances, real inter-node network (not
+  loopback) — spun up per-hour when the code is ready, torn down after; no permanent rig, and cheap.
+  Caveat: cloud VMs carry neighbour noise and give less NIC-IRQ control than bare metal, so record
+  per-instance RTT + CPU steal; acceptable because I5's claim is mechanism-evidence + tail-neutrality,
+  not a bare-metal p99 headline. (Bare-metal 3-box is the fallback only if VM jitter swamps the signal.)
+- **New confounds + hygiene:** network jitter (record per-cell RTT), 3 independent GC processes
+  (overlay = union of all three logs), per-node compaction drift, hint residue between rungs
+  (assert hints dirs empty pre-cell), startup-pinned flags ⇒ rolling restart resets cache. Same
+  build on all nodes; all flip together (never measure mixed); re-warm per arm; interleave arm
+  order (A,B,B,A) across 3 iterations so restart/warmup drift doesn't correlate with an arm.
+- **Deliverable before gate cells:** a new `baseline_v1_multinode` (its own rate ladder +
+  operating points + 3-iter noise band, mirroring §8) — the RF=1 `baseline_v1` does not transfer.

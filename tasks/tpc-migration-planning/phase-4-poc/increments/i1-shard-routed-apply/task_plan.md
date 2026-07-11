@@ -10,7 +10,7 @@ points (gate-reconciliation.md), measured both server-side and client-CO (AND-ga
 **Honest cost:** trunk can apply INLINE on the NTR thread (zero hops) when a MUTATION permit is
 free; routing always costs one hop → low-load may regress (non-gating crossover cell).
 
-**Inventory (authoritative, verified on-branch 2026-07-10):** `../tpc-migration-planning/phase-4-poc/findings-i1-mutation-apply.md`. All seams confirmed present at the cited lines.
+**Inventory (authoritative, verified on-branch 2026-07-10):** `../../findings-i1-mutation-apply.md`. All seams confirmed present at the cited lines.
 
 ---
 
@@ -84,6 +84,9 @@ free; routing always costs one hop → low-load may regress (non-gating crossove
       steady boundaries; a forced epoch/boundary race raises `misroutedPuts` then heals.
 
 ## Phase 2 — step-2 owner-check lock skip (flag `skip_lock`) + counter
+> **SUPERSEDED 2026-07-11 (see `progress.md` PIVOT + `../i5-inbound-shard-dispatch/`).** skip_lock
+> is RF=1-only (a skipping owner races a lock-taking unrouted writer at RF≥3). Dropped. The lock
+> stays; `misroutedPuts` is kept but decoupled from the skip. Below retained for provenance only.
 - [ ] `TrieMemtable.MemtableShard`: add shard-index arg — ctor def at `TrieMemtable.java:541`
       (`(TableMetadataRef, MemtableAllocator, TrieMemtableMetricsView)` today) AND the instantiation
       call at `:140`; store as a `final int shardIndex` field for the owner assert.
