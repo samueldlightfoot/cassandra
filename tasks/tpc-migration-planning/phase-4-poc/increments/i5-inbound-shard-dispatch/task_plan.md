@@ -41,27 +41,46 @@ would hide whether I5 recovers I1's own RF≥3 hop regression or adds net value.
   `transport/`; my diff (config/db.memtable/metrics) can't touch it. Same issue the I1 handoff logged.
 
 ## Phase B — I5 inbound shard dispatch (flag `cassandra.tpc.inbound_shard_dispatch`)
-- [ ] **`net/ShardInboundRouter.java`** — allowlist **{MUTATION_REQ} ONLY** (READ_REQ deferred to
-      I2a — it imports the read-miss-blocks-shard hazard); inbox-full → `stage.execute` fallback,
-      keeping existing capacity accounting as the back-pressure authority.
-- [ ] **`InboundMessageHandler.java:429` branch** — reuse the `ProcessSmallMessage` task verbatim;
-      route only when flag on, verb allowlisted, small message (key knowable), and neither guard
-      trips. Capacity ACQUIRE/deserialize/arrival-expiry stay on the loop.
-- [ ] **Guard 1 — epoch-ahead → Stage fallback:** on the loop, `message.epoch().isAfter(current)`
-      → `stage.execute` (TCM catch-up at `AbstractMutationVerbHandler:93/:139/:189` blocks; must
-      never run on a shard thread — no-blocking-on-shard invariant).
-- [ ] **Guard 2 — FORWARD_TO → Stage fallback:** messages bearing `FORWARD_TO` take the Stage
-      path (forwarding to other replicas must not queue behind a hot shard).
-- [ ] **Owner-inline bypass** in `MutationVerbHandler.applyMutation`: `if
-      (ShardExecutors.currentShardId() == shardId) apply.run()` — under I5 `doVerb` already runs
-      on the owning shard thread; avoid re-enqueue to the same shard.
-- [ ] **`ShardExecutors.execute(ExecutorLocals, int, Runnable)` overload** — carry the
-      `ExecutorLocals`/`TraceState` the loop builds (executors are `localAware()`); else flag-on
-      silently drops tracing/ClientWarn for routed verbs.
-- [ ] **In-JVM dtest seam** — `Instance.receiveMessageRunnable` (or the inboundSink hook) calls
-      the SAME router; without it, in-JVM flag-on dtests bypass the router and prove nothing.
-- [ ] Flag-off = `header.verb.stage.execute` verbatim; micro: inbox depth, fallback count,
-      `internalLatency`.
+
+### B1 — skeleton wired at both call sites — DONE 2026-07-11 (compiles, flag-off regression-clean)
+- [x] **`net/ShardInboundRouter.java`** — `tryRoute(Message, ExecutorLocals, Runnable) → boolean`,
+      the single decision point for both call sites (so netty + in-JVM cannot drift). Allowlist
+      **{MUTATION_REQ} ONLY** (READ_REQ deferred to I2a — read-miss-blocks-shard hazard). `ENABLED` =
+      `INBOUND_SHARD_DISPATCH.getBoolean() && MutationShardRouting.ROUTING_ENABLED` (read once).
+      **Deferred, not built:** the inbox-full → Stage fallback. The shard executors are unbounded
+      `sequential()` queues (no depth signal yet); `InboundMessageHandler` capacity ACQUIRE/RELEASE
+      remains the sole back-pressure authority for now. Needs a per-shard depth metric first (ties to D6).
+- [x] **`InboundMessageHandler.dispatch()` branch** — routes only `task instanceof ProcessSmallMessage`
+      (large messages deserialize on-stage → key unknowable → Stage path). Extracts
+      `((ProcessSmallMessage) task).message` and calls `tryRoute`; on false, `stage.execute(locals, task)`
+      verbatim. Capacity ACQUIRE/deserialize/arrival-expiry still on the loop (dispatch runs post-ACQUIRE).
+- [x] **Guard 1 — epoch-ahead → Stage fallback:** `message.epoch().isAfter(ClusterMetadata.current().epoch)`.
+      Conservative **superset** of the true blocking set (fires even for the `containsSelf` async-catchup
+      case at `AbstractMutationVerbHandler:99`) — safe: never risks a shard-thread block, only over-diverts a
+      rare topology-change window to the Stage.
+- [x] **Guard 2 — FORWARD_TO → Stage fallback:** `message.forwardTo() != null`.
+- [x] **Owner-inline bypass** in `MutationVerbHandler.applyMutation`: **`currentThreadIsOwnerOf(shardId)`**
+      (NOT the plan's original `currentShardId() == shardId` — that skips the `floorMod` and breaks when
+      #memtable-shards > cores). Inline `apply.run()` when already on the owning shard thread, else
+      `shards.execute(...)` as before. Flag-off: `currentShardId()==-1` → always the else-branch (I1 behavior).
+- [x] **`ShardExecutors.execute(ExecutorLocals, int, Runnable)` overload** — delegates to the executor's
+      `execute(WithResources, Runnable)` (`ExecutorLocals implements WithResources`; the shard executors
+      are `localAware()`), sharing a new private `shardTagged(shard, task)` helper with the int-only method
+      so the `CURRENT_SHARD` set/restore is defined once. Confirms + fixes a latent I1 gap: the int-only
+      `execute` passes no locals, so I1 routed applies drop tracing/ClientWarn today.
+- [x] **In-JVM dtest seam wired** — `Instance.receiveMessageRunnable` async branch calls the SAME
+      `ShardInboundRouter.tryRoute` before `executor.execute(locals, deliver)`. (This is the hook; the
+      flag-on dtest that *exercises* it is B2, below — not yet written.)
+- [x] Flag-off byte-identical verified: `SimpleReadWriteTest` 40/40 GREEN; Phase A `ShardRoutedReplicaApplyTest`
+      1/1, `ShardExecutorsTest` 5/5, `MutationShardRoutingTest` 6/6 GREEN; `ant jar` packages both new classes.
+
+### B2 — flag-ON behavioral proof + Fable review — NOT STARTED (crucial: flag-on is compiled, not verified)
+- [ ] **Flag-on in-JVM dtest** (3-node RF=3, `memtable='trie'`, flag set before `Cluster.start()`): prove the
+      router actually fires — routed-through-router count advances, `misroutedPuts`==0, owner-inline bypass
+      hits (no double-enqueue), tracing/ClientWarn propagate, data reads back at ALL.
+- [ ] **Guard dtests:** epoch-ahead diverts to Stage (topology-change window); FORWARD_TO diverts (multi-DC).
+- [ ] **Micro-instrumentation:** router fallback count + routed count; inbox depth; messaging `internalLatency`.
+- [ ] **Fable review:** the epoch/FORWARD_TO Stage fallbacks, the owner-inline bypass, the locals overload.
 
 ## Phase C — multi-node RF=3 perf (DEFERRED to on-demand Hetzner Cloud, poc-criteria §9)
 No standing rig. Correctness is proven earlier (Phase A/B in-JVM multi-node dtests); this phase is

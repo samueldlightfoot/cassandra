@@ -155,3 +155,50 @@ Committed: `c565067b4a` (code+dtest), `67cd4b5c9c` (these notes).
 - I5 is single-node-inert (coordinator==replica → `performLocally`, never inbound) — Phase B gates are multi-node only.
 
 Fable should review the epoch-ahead / FORWARD_TO Stage fallbacks + the owner-inline bypass + the localAware overload.
+
+---
+
+## 2026-07-11 — Phase B1 BUILT + flag-off verified (skeleton wired at both call sites; NO flag-on proof yet)
+Seams re-verified on-branch before coding (no drift from the handoff). Resolved the one OPEN item:
+the locals overload delegates to the executor's `execute(WithResources, Runnable)` — `ExecutorLocals
+implements WithResources` and the shard executors are `localAware()` (`Stage.execute(ExecutorLocals,
+Runnable)` at `Stage.java:129` does exactly this). Also confirms a latent I1 gap: the int-only
+`ShardExecutors.execute` passes no locals, so I1 routed applies drop tracing/ClientWarn today.
+
+**Corrected two plan/findings errors against the code:**
+- Owner-inline bypass uses **`currentThreadIsOwnerOf(shardId)`**, not the plan's `currentShardId() ==
+  shardId` — the latter skips `floorMod(id, SHARD_COUNT)` and breaks when #memtable-shards > cores.
+- Epoch guard `message.epoch().isAfter(ClusterMetadata.current().epoch)` is a conservative **superset**
+  of the true blocking condition (it also diverts the `containsSelf` async-catchup case) — safe, slightly
+  over-diverts. Kept: correctness (never block a shard thread) over precision.
+
+**Changes (6 files):** new flag `INBOUND_SHARD_DISPATCH` (`cassandra.tpc.inbound_shard_dispatch`, default
+false, alphabetical slot); new `net/ShardInboundRouter.tryRoute(Message, ExecutorLocals, Runnable)→boolean`
+(single decision point for both paths); `ShardExecutors` locals overload + shared `shardTagged` helper;
+`InboundMessageHandler.dispatch()` routes `ProcessSmallMessage` only; `Instance.receiveMessageRunnable`
+async branch calls the same router; `MutationVerbHandler.applyMutation` owner-inline bypass.
+
+**Verification (all GREEN, actually re-ran — see gotcha):** `SimpleReadWriteTest` 40/40 (flag-off
+byte-identical), `ShardRoutedReplicaApplyTest` 1/1 (Phase A), `ShardExecutorsTest` 5/5,
+`MutationShardRoutingTest` 6/6. `ant jar` packages `ShardInboundRouter.class` + `ShardExecutors.class`
+(fresh timestamps). Not committed yet.
+
+**GOTCHA (cost ~10 min):** `ant test -Dtest.name=<FQN> -q` is a **no-op** — returns BUILD SUCCESSFUL in
+~10s without running anything (stale XML untouched). Use the **simple class name** (`-Dtest.name=ShardExecutorsTest`)
+and confirm via the `Tests run: N` line + fresh XML mtime, never BUILD SUCCESSFUL alone.
+
+### HANDOFF → Phase B2 (flag-ON behavioral proof)
+Flag-on is **compiled but behaviorally unverified.** B2 is the load-bearing proof:
+- Flag-on 3-node RF=3 dtest (`memtable='trie'`, set `cassandra.tpc.inbound_shard_dispatch` before
+  `Cluster.start()` — system props are process-global across in-JVM instances). Assert: router fires
+  (add a routed/fallback counter to `ShardInboundRouter` to observe), owner-inline bypass hits (no
+  double-enqueue), `misroutedPuts`==0, tracing propagates, reads back at ALL. The in-JVM hook is at
+  `Instance.receiveMessageRunnable` async branch — delivery is `inboundSink→doVerb`, so routing the
+  whole `() -> inboundSink.accept(messageIn)` task runs doVerb+apply on the shard thread; the bypass
+  then prevents the self-re-enqueue in `applyMutation`.
+- Guard dtests (epoch-ahead diverts; FORWARD_TO diverts) + micro-metrics (router routed/fallback count,
+  inbox depth, `internalLatency`).
+- **Deferred from B1 (don't forget):** inbox-full → Stage fallback. Shard queues are unbounded; needs a
+  per-shard depth signal (D6) before the fallback can trigger. Today `InboundMessageHandler` capacity is
+  the only back-pressure. Router currently always routes when allowlisted + guards pass.
+- Then Fable review (epoch/FORWARD_TO fallbacks, owner-inline bypass, locals overload).
