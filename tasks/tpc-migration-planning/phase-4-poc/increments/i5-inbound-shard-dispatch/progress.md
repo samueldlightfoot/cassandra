@@ -76,6 +76,82 @@ Verification:
   supportedVersions()` returns `ImmutableList`, datastax driver expects `List`) in `transport/` — not
   my diff. Same issue the I1 handoff logged; unrelated to routing.
 
-NOT committed yet (user says when). Next: **Phase B** (I5 inbound dispatch — `ShardInboundRouter`,
-the three guards, `ShardExecutors.execute(ExecutorLocals,int,Runnable)` overload, inboundSink dtest
-seam). Fable should review the epoch-ahead / FORWARD_TO fallbacks + owner-inline bypass.
+Committed: `c565067b4a` (code+dtest), `67cd4b5c9c` (these notes).
+
+---
+
+## HANDOFF → Phase B (I5 inbound dispatch) — from actual diff, 2026-07-11
+
+**(1) Deviations from plan**
+- `shardIndex` is a **method param** on `MemtableShard.put(int shardIndex, DecoratedKey, …)`, not a
+  field — plan said "no shard-index field" but the owner-check needs the index. Threaded from
+  `TrieMemtable.put` (computes it once for both the `shards[]` lookup and the call).
+- misrouted guard is **two-part**: `ShardExecutors.currentShardId() >= 0 && !currentThreadIsOwnerOf(shardIndex)`.
+  `>= 0` IS the "on a shard thread" test (UNSET=-1). Do not collapse to owner-check alone — off-thread
+  writers would all read as misrouted (`-1 != floorMod`).
+- Phase A dtest is a plain `Cluster` (non-NETWORK), not an inboundSink hook: the I1 replica apply runs
+  inside `doVerb`, already reached by the in-process sink. **Phase B's router at `InboundMessageHandler:429`
+  is NOT reached by in-JVM delivery** (goes sink→doVerb, bypassing InboundMessageHandler) — Phase B still
+  needs a separate hook at `Instance.receiveMessage`/inboundSink or the flag-on dtest is vacuous (findings §seams).
+
+**(2) As-built interfaces Phase B builds against (verbatim)**
+- Owner-inline bypass site = `MutationVerbHandler.applyMutation(Message<Mutation>, InetAddressAndPort)` :82.
+  Current routing block (:91-101):
+  ```
+  ShardExecutors shards = MutationShardRouting.ROUTING_ENABLED ? ShardExecutors.instance() : null;
+  if (shards != null) {
+      OptionalInt shardId = MutationShardRouting.route(mutation);
+      if (shardId.isPresent()) { shards.execute(shardId.getAsInt(), apply); return; }
+  }
+  apply.run();
+  ```
+  Bypass goes at the `shards.execute(...)` line; correct predicate is **`ShardExecutors.currentThreadIsOwnerOf(shardId.getAsInt())`** (NOT the plan's loose `currentShardId()==shardId`) → `apply.run()` else `shards.execute(...)`.
+- `ShardExecutors.execute(int memtableShardId, Runnable task)` (:106): `floorMod(id,SHARD_COUNT)`,
+  `submitted.incrementAndGet()`, then `executors[shard].execute(wrapper)` where wrapper does
+  `CURRENT_SHARD.set(shard); try{task.run()} finally{CURRENT_SHARD.set(UNSET)}`. The new
+  `execute(ExecutorLocals, int, Runnable)` overload MUST replicate this CURRENT_SHARD wrapper.
+  **Open (verify before coding):** how the `localAware()` `SequentialExecutorPlus` accepts locals — check
+  `SequentialExecutorPlus`/`LocalAwareExecutorPlus` for an `execute(ExecutorLocals, Runnable)`; the current
+  `execute` does NOT pass locals, so routed verbs currently drop tracing/ClientWarn (the bug the overload fixes).
+- Statics: `currentShardId()` :91 (-1=UNSET off-thread), `currentThreadIsOwnerOf(int)` :99
+  (`CURRENT_SHARD==floorMod(id,SHARD_COUNT)`), `instance()` (null when off), `shardCount()`,
+  `submittedTaskCount()` (instance). `SHARD_COUNT` is **private** (`=FBUtilities.getAvailableProcessors()`) — use `shardCount()`.
+- Dispatch seam **UNCHANGED by Phase A**: `InboundMessageHandler.java:429`
+  `header.verb.stage.execute(ExecutorLocals.create(state), task);` — `ProcessSmallMessage` inner class at :484;
+  small msgs fully deserialized before :429 so key is knowable.
+- `MutationShardRouting.route(Mutation) → OptionalInt`; `MutationShardRouting.ROUTING_ENABLED` (static final)
+  = master flag AND periodic commitlog.
+- Metric read cross-instance: registry key = `MetricRegistry.name(GROUP_NAME,"TrieMemtable","Misrouted memtable puts",scope)`;
+  `CassandraMetricsRegistry.Metrics.getCounters((n,m)->n.contains("Misrouted memtable puts"))` (Metrics extends codahale MetricRegistry).
+
+**(3) Tested / deferred / broken**
+- GREEN: ShardRoutedReplicaApplyTest (3-node RF=3 flag-on), SimpleReadWriteTest 40/40 (flag-off byte-identical),
+  ShardExecutorsTest 5/5, MutationShardRoutingTest 6/6, ShardRoutedMutationApplyTest 1/1.
+- BROKEN, pre-existing (NOT this diff): `TrieMemtableMetricsTest` + any native-driver test
+  (`Cluster.connect()`/`executeNet`) → `NoSuchMethodError ProtocolVersion.supportedVersions()`
+  (server returns `ImmutableList`, bundled datastax driver expects `List`), all in `transport/`.
+- Phase B: no code yet.
+
+**(4) Decisions + rationale**
+- Bypass predicate `currentThreadIsOwnerOf(shardId)` not `currentShardId()==shardId`: the former already
+  does the `floorMod(id, SHARD_COUNT)` mapping (memtable-shard-id → executor-id); a raw `==` breaks when
+  #memtable-shards > cores.
+- dtest at Cluster level, non-NETWORK: NETWORK binds 127.0.0.2/3 (not routable on macOS); the sink→doVerb
+  path exercises the same replica apply and runs locally.
+
+**(5) Gotchas**
+- Flag read-once at class-init **per instance classloader**; set `MUTATION_SHARD_ROUTING` before `Cluster.start()`.
+  System properties are process-global across in-JVM instances (all nodes see it).
+- `callOnInstance` lambda must read statics fresh inside the instance — a captured singleton → NotSerializableException.
+- in-JVM default `commitlog_sync=periodic` (InstanceConfig:116) ⟹ ROUTING_ENABLED true. No override needed.
+- Routing only engages on **sharded** memtables — table needs `WITH memtable='trie'`; SkipList is excluded.
+  dtest config: `withConfig(c->c.set("memtable", Map.of("configurations", Map.of("trie", Map.of("class_name","TrieMemtable")))))`.
+- `ant jar` zip-entry dates are Ant-normalized (showed 05-31) — verify packaged bytecode with `javap`, never the date column.
+
+**(6) Assumptions to treat as given**
+- Owner-check is a hint: wrong/absent shard id → falls back to taking the lock, still correct.
+- `misroutedPuts`==0 on healthy boundaries because `route()` and `TrieMemtable.put` read the same
+  boundaries+key → same shard; a nonzero value means skew/staleness (D6 discriminator).
+- I5 is single-node-inert (coordinator==replica → `performLocally`, never inbound) — Phase B gates are multi-node only.
+
+Fable should review the epoch-ahead / FORWARD_TO Stage fallbacks + the owner-inline bypass + the localAware overload.
