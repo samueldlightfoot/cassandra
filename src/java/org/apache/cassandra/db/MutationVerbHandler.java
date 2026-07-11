@@ -18,7 +18,9 @@
 package org.apache.cassandra.db;
 
 import java.util.Map;
+import java.util.OptionalInt;
 
+import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.ForwardingInfo;
@@ -80,7 +82,23 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
     protected void applyMutation(Message<Mutation> message, InetAddressAndPort respondToAddress)
     {
         Map<ParamType, Object> params = MessageParams.capture();
-        message.payload.applyFuture().addCallback(o -> respond(message, respondToAddress, params), wto -> failed());
+        Mutation mutation = message.payload;
+        Runnable apply = () -> mutation.applyFuture().addCallback(o -> respond(message, respondToAddress, params), wto -> failed());
+
+        // Apply on the mutation's shard executor when routing is on and it is routable; otherwise apply
+        // on the current (mutation stage) thread as before. The ack callback runs on the applying thread
+        // either way, which is safe: MessageParams were captured above, before the apply.
+        ShardExecutors shards = MutationShardRouting.ROUTING_ENABLED ? ShardExecutors.instance() : null;
+        if (shards != null)
+        {
+            OptionalInt shardId = MutationShardRouting.route(mutation);
+            if (shardId.isPresent())
+            {
+                shards.execute(shardId.getAsInt(), apply);
+                return;
+            }
+        }
+        apply.run();
     }
 
     private static void forwardToLocalNodes(Message<Mutation> originalMessage, ForwardingInfo forwardTo)

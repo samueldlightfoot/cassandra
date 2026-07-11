@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,6 +61,7 @@ import accord.primitives.Txn;
 import org.apache.cassandra.batchlog.Batch;
 import org.apache.cassandra.batchlog.BatchlogManager;
 import org.apache.cassandra.concurrent.DebuggableTask.RunnableDebuggableTask;
+import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.AccordConfig;
 import org.apache.cassandra.config.CassandraRelevantProperties;
@@ -74,6 +76,7 @@ import org.apache.cassandra.db.IMutation;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.MessageParams;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.MutationShardRouting;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.ReadCommand;
@@ -2022,7 +2025,7 @@ public class StorageProxy implements StorageProxyMBean
 
     private static void performLocally(Stage stage, Replica localReplica, final Runnable runnable, final RequestCallback<?> handler, Object description, Dispatcher.RequestTime requestTime)
     {
-        stage.maybeExecuteImmediately(new LocalMutationRunnable(localReplica, requestTime)
+        LocalMutationRunnable localMutationRunnable = new LocalMutationRunnable(localReplica, requestTime)
         {
             public void runMayThrow()
             {
@@ -2062,7 +2065,24 @@ public class StorageProxy implements StorageProxyMBean
             {
                 return Verb.MUTATION_REQ;
             }
-        });
+        };
+
+        // Route the local apply to its shard's single-writer executor when routing is on and the
+        // mutation is routable; otherwise run it on the mutation stage as before. The same runnable is
+        // reused either way, preserving its deadline-to-hint handling. Non-mutation callers (e.g.
+        // batchlog store) always take the unchanged path.
+        ShardExecutors shards = MutationShardRouting.ROUTING_ENABLED && description instanceof Mutation
+                                ? ShardExecutors.instance() : null;
+        if (shards != null)
+        {
+            OptionalInt shardId = MutationShardRouting.route((Mutation) description);
+            if (shardId.isPresent())
+            {
+                shards.execute(shardId.getAsInt(), localMutationRunnable);
+                return;
+            }
+        }
+        stage.maybeExecuteImmediately(localMutationRunnable);
     }
 
     /**
