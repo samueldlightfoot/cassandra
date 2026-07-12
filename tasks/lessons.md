@@ -95,3 +95,14 @@ future reader of the codebase. Rules:
 - When translating a plan into code, actively rewrite each rationale from doc-speak into
   self-contained prose. The plan's shorthand is for me; the comment is for the next maintainer.
 - Same rule for commit messages and public Javadoc.
+
+## Commit messages: no phase/increment numbers (2026-07-12) — REPEAT OFFENSE
+Despite the rule above, wrote commit subjects like "I5 Phase B1: ...", "I5 Phase B3: ...", and
+"Planning notes: I5 Phase B2 ...". User: "you've put phase numbers in commit messages again." The
+phase/increment taxonomy (Phase A/B/C, B1/B2/B3, I5, I1, TPC I0, D6) lives ONLY in `tasks/` and is
+meaningless to any future reader of the git history. Hard rules for EVERY commit, including
+"Planning notes: ..." ones:
+- Subject = what the change does in repo-durable terms (e.g. "Route inbound mutations to the owning
+  shard executor at ingress"). No "Phase X", no increment codename.
+- If a stable handle is needed, use the real feature/flag name (`cassandra.tpc.inbound_shard_dispatch`).
+- Check the subject for a phase/increment token BEFORE committing — this is the recurring failure point.
