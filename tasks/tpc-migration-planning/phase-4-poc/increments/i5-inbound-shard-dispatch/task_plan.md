@@ -89,14 +89,35 @@ would hide whether I5 recovers I1's own RF≥3 hop regression or adds net value.
 - [x] Flag-off re-verified after the counter change: `SimpleReadWriteTest` 40/40 GREEN; `ant jar` packages
       the counter-bearing router (javap-confirmed).
 
-### B3 — remaining before the Phase C perf run — NOT STARTED
-- [ ] **Guard dtests:** force epoch-ahead → Stage divert; force FORWARD_TO (multi-DC) → Stage divert.
-      (Guards are wired + counted; not yet independently exercised by a test.)
+### B3 — Fable review + fixes + guard tests — DONE 2026-07-12 (one BLOCKER found + fixed)
+- [x] **Fable adversarial review** — verdict **PROCEED-WITH-CHANGES**. Verified sound (with reasoning):
+      epoch guard (double-protected via epoch monotonicity + the writePlacements NPE path), owner-inline
+      bypass (ack/respond already ran on shard threads under I1; floorMod predicate correct), locals
+      hygiene (localAware TaskFactory sets+restores per task; CURRENT_SHARD nested inside, finally-restored),
+      capacity accounting (RELEASE already ran off-loop pre-I5), allowlist (MUTATION_REQ excludes all other
+      MUTATION-stage verbs; large MUTATION_REQ → Stage where I1 still routes).
+- [x] **BLOCKER B1 FIXED** — `route()` called `Keyspace.open()` which asserts/NPEs on an unknown keyspace;
+      under I5 that runs on the **netty event loop**, outside `processSmallMessage`'s try/catch, so a
+      keyspace-drop-in-flight race → AssertionError → `fatalExceptionCaught` → `channel.close()` (whole
+      connection) + permanent inbound-capacity leak (ACQUIRE done, RELEASE never runs). Root cause: `route()`
+      now uses `Schema.instance.getKeyspaceInstance` (null → empty). Defense: `tryRoute` body wrapped in
+      `try/catch(Throwable) → fallback()` + NoSpamLogger — the loop must never die from a routing decision
+      (aligns with "routing is only ever an optimization"). Unit test `skipsUnknownKeyspaceWithoutThrowing`.
+- [x] **FORWARD_TO guard dtest** — `ShardInboundDispatchTest.forwardToMessagesDivertToStage`: 2-DC
+      (dc0:1 / dc1:3, NTS), CL.ALL writes; each forwards one FORWARD_TO message into DC1 → asserts DC1
+      `stageFallbackCount` delta ≥ rows (guard 2 diverts). GREEN.
+- [x] **S1 fixed** — dropped the flaky `fallbacks==0` assertion (`routedDelta>=rows` already proves no user
+      write was diverted). NITs applied (doc on stageFallbacks/instance-null, epoch-monotonicity comment,
+      in-JVM over-route comment).
+
+### B4 — remaining before the Phase C perf run
+- [ ] **Epoch-ahead guard dtest** — DEFERRED: in-JVM filters can't rewrite a message's epoch (they only
+      drop), so there's no clean way to force `message.epoch().isAfter(current)` end-to-end. Fable proved the
+      guard sound analytically (monotonicity + double-protection); a direct `tryRoute` unit test with a
+      synthesized epoch-ahead MUTATION_REQ is the fallback if coverage is demanded.
 - [ ] **Deferred from B1:** inbox-full → Stage fallback (shard queues unbounded; needs a per-shard depth
       signal, ties to D6). Today `InboundMessageHandler` capacity is the sole back-pressure.
 - [ ] **Micro-instrumentation for the perf run:** inbox depth, messaging `internalLatency` delta.
-- [ ] **Fable review:** epoch/FORWARD_TO Stage fallbacks, owner-inline bypass, locals overload, and the
-      1x-vs-2x discriminator's robustness (background-traffic slack).
 
 ## Phase C — multi-node RF=3 perf (DEFERRED to on-demand Hetzner Cloud, poc-criteria §9)
 No standing rig. Correctness is proven earlier (Phase A/B in-JVM multi-node dtests); this phase is

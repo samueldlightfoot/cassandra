@@ -234,3 +234,50 @@ counter-bearing router (javap). Commit pending.
 - **1x-vs-2x slack (+5)** is a guess against background traffic; Fable should sanity-check it isn't masking a
   partial bypass failure. In this run the replicas had no other shard traffic, so delta should be ~exact.
 - Then Fable review, then Phase C (Hetzner multi-node perf, 3-arm off/I1/I1+I5).
+
+## 2026-07-12 — Fable review + BLOCKER fix + guard tests (B3)
+Ran the plan-mandated Fable adversarial review (model fable) of the B1+B2 diff. Verdict
+**PROCEED-WITH-CHANGES**: one real BLOCKER, everything else verified sound with reasoning.
+
+**BLOCKER B1 (fixed) — routing could kill the netty connection.** `MutationShardRouting.route()`
+called `Keyspace.open()`, which asserts (`-ea` default) / NPEs on an unknown keyspace. Under I1 that
+only ran inside the handler (after schema checks that throw first, caught → failure response). I5
+moved it onto the netty event loop at `dispatch()`, and the `dispatch(...)` call at
+`InboundMessageHandler.java:215` sits OUTSIDE `processSmallMessage`'s try/catch (closes :212). So a
+keyspace dropped while a write is in flight (coordinator behind) → guard 1 does NOT divert (msg epoch
+not ahead) → `route()` → `Keyspace.open` → AssertionError escapes → `fatalExceptionCaught` →
+`channel.close()` tears down the whole small-message connection, AND the capacity acquired at
+deserialize never releases (permanent reserve leak). Verified all three facts on-branch before fixing.
+- **Root cause fix:** `route()` uses `Schema.instance.getKeyspaceInstance` (null → empty).
+- **Defense in depth:** `tryRoute` body wrapped `try/catch(Throwable) → fallback()` + NoSpamLogger; the
+  loop must never die from a routing decision.
+- **Unit test:** `MutationShardRoutingTest.skipsUnknownKeyspaceWithoutThrowing` (synthesized mutation for
+  a non-existent keyspace → route returns empty, no throw).
+
+**Fable verified sound (don't re-litigate):** epoch guard is double-protected (epoch monotonicity makes
+the loop→shard TOCTOU conservative; the `:189 ks==null` blocking branch is unreachable for a
+not-ahead message, and would NPE earlier in `writePlacements` anyway, handled as pre-I5); owner-inline
+bypass (respond/ack already ran on shard threads under I1; floorMod predicate is correct); locals
+hygiene (localAware TaskFactory installs+restores per task, CURRENT_SHARD nested inside finally);
+capacity RELEASE already ran off-loop pre-I5; allowlist excludes all other MUTATION-stage verbs.
+
+**FORWARD_TO guard proven (new dtest):** `ShardInboundDispatchTest.forwardToMessagesDivertToStage` —
+2-DC (dc0:1 / dc1:3, NTS), CL.ALL; each write forwards one FORWARD_TO message into DC1 →
+DC1 `stageFallbackCount` delta ≥ rows. GREEN. (Modeled on `MessageForwardingTest`.)
+
+**Also:** dropped the flaky `fallbacks==0` line (S1); applied NIT doc fixes.
+
+**Verification (all GREEN, re-run):** MutationShardRoutingTest 7/7, ShardInboundDispatchTest 2/2
+(routing + FORWARD_TO), ShardRoutedReplicaApplyTest 1/1 (I1 path exercises the changed route()),
+SimpleReadWriteTest 40/40 (flag-off). Commit pending.
+
+### HANDOFF → B4 (remaining before Phase C perf)
+- **Epoch-ahead divert test is DEFERRED** — in-JVM filters drop but don't rewrite, so forcing
+  `epoch().isAfter(current)` end-to-end has no clean mechanism. Fable proved the guard sound; if coverage
+  is demanded, write a direct `ShardInboundRouter.tryRoute` unit test with a synthesized epoch-ahead
+  MUTATION_REQ (`Message.out(MUTATION_REQ, mut).withEpoch(current+n)`), flags set in @BeforeClass so
+  ENABLED latches true. NOTE the guard divert MACHINERY (fallback path) is already proven by the
+  FORWARD_TO test — only the epoch predicate itself is untested end-to-end.
+- Inbox-full → Stage fallback still deferred (needs per-shard depth signal, D6).
+- Micro-instrumentation (inbox depth, internalLatency) for the perf run.
+- Then Phase C (Hetzner 3-node, 3-arm off/I1/I1+I5).
