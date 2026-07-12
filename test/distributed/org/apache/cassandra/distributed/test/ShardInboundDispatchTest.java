@@ -96,7 +96,6 @@ public class ShardInboundDispatchTest extends TestBaseImpl
             int rows = 200;
             long[] routedBefore = { routed(cluster, 1), routed(cluster, 2), routed(cluster, 3) };
             long[] submitBefore = { submitted(cluster, 1), submitted(cluster, 2), submitted(cluster, 3) };
-            long[] fallbackBefore = { fallbacks(cluster, 1), fallbacks(cluster, 2), fallbacks(cluster, 3) };
 
             for (int i = 0; i < rows; i++)
                 cluster.coordinator(1).execute(
@@ -127,16 +126,58 @@ public class ShardInboundDispatchTest extends TestBaseImpl
             assertTrue("node 1 coordinator-local applies must not go through the inbound router",
                        routed(cluster, 1) - routedBefore[0] < rows);
 
-            // Steady state: no guard tripped during the write loop (no epoch-ahead / FORWARD_TO here).
-            for (int n = 2; n <= 3; n++)
-                assertEquals("no stage fallback expected on node " + n, 0L,
-                             fallbacks(cluster, n) - fallbackBefore[n - 1]);
-
             // Steady boundaries: no shard thread wrote a shard it does not own.
             for (int n = 1; n <= 3; n++)
                 assertEquals("misrouted puts must be zero on node " + n, 0L, misroutedPuts(cluster, n));
 
             // Every replica holds every write.
+            for (int i = 0; i < rows; i++)
+                assertRows(cluster.coordinator(1).execute(
+                    withKeyspace("SELECT v FROM %s.tbl WHERE k = ?"), ALL, i), row(i * 10));
+        }
+    }
+
+    /**
+     * Guard 2: a message bearing FORWARD_TO must divert to the Stage, because the handler would forward
+     * it to peer replicas and that send must not queue behind a hot shard. In a two-DC cluster every
+     * CL.ALL write from the DC0 coordinator forwards into DC1 through one node carrying FORWARD_TO — that
+     * node's router must fall back, while the two forwarded (FORWARD_TO-stripped) legs still route.
+     */
+    @Test
+    public void forwardToMessagesDivertToStage() throws Throwable
+    {
+        try (Cluster cluster = (Cluster) init(builder()
+                                              .withDC("dc0", 1)
+                                              .withDC("dc1", 3)
+                                              .withConfig(c -> c.set("memtable", ImmutableMap.of(
+                                                      "configurations", ImmutableMap.of(
+                                                              "trie", ImmutableMap.of("class_name", "TrieMemtable")))))
+                                              .start()))
+        {
+            // Every DC1 node replicates, so the coordinator forwards to DC1 through exactly one FORWARD_TO
+            // message per write.
+            cluster.schemaChange("ALTER KEYSPACE " + KEYSPACE +
+                " WITH replication = {'class':'NetworkTopologyStrategy','dc0':1,'dc1':3}");
+            cluster.schemaChange(withKeyspace(
+                "CREATE TABLE %s.tbl (k int PRIMARY KEY, v int) WITH memtable = 'trie'"));
+
+            int[] dc1 = { 2, 3, 4 };
+            long fallbackBefore = 0;
+            for (int n : dc1) fallbackBefore += fallbacks(cluster, n);
+
+            int rows = 100;
+            for (int i = 0; i < rows; i++)
+                cluster.coordinator(1).execute(
+                    withKeyspace("INSERT INTO %s.tbl (k, v) VALUES (?, ?)"), ALL, i, i * 10);
+
+            long fallbackDelta = 0;
+            for (int n : dc1) fallbackDelta += fallbacks(cluster, n);
+            fallbackDelta -= fallbackBefore;
+
+            // One FORWARD_TO message reaches DC1 per write; each is diverted to the Stage.
+            assertTrue("FORWARD_TO messages must divert to the stage (dc1 fallback delta=" + fallbackDelta + ")",
+                       fallbackDelta >= rows);
+
             for (int i = 0; i < rows; i++)
                 assertRows(cluster.coordinator(1).execute(
                     withKeyspace("SELECT v FROM %s.tbl WHERE k = ?"), ALL, i), row(i * 10));

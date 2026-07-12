@@ -594,7 +594,9 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 ExecutorLocals locals = ExecutorLocals.create(state);
                 Runnable deliver = () -> MessagingService.instance().inboundSink.accept(messageIn);
                 // I5: mirror InboundMessageHandler.dispatch. In-JVM delivery bypasses that handler, so
-                // without this hook the flag-on router is never exercised by dtests.
+                // without this hook the flag-on router is never exercised by dtests. Messages arrive here
+                // fully deserialized (no small/large split), so this routes a superset of production —
+                // harmless, since routing is only ever an optimization.
                 if (ShardInboundRouter.tryRoute(messageIn, locals, deliver))
                     return;
                 executor.execute(locals, deliver);

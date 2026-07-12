@@ -35,6 +35,7 @@ import org.apache.cassandra.db.memtable.SkipListMemtable;
 import org.apache.cassandra.db.memtable.TrieMemtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.schema.TableMetadata;
 
 import static org.apache.cassandra.db.memtable.AbstractShardedMemtable.SHARDS_OPTION;
 import static org.junit.Assert.assertEquals;
@@ -111,6 +112,18 @@ public class MutationShardRoutingTest extends CQLTester
         createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'org.apache.cassandra.index.sai.StorageAttachedIndex'");
         ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
         assertTrue(route(cfs, key(cfs, 42)).isPresent());
+    }
+
+    @Test
+    public void skipsUnknownKeyspaceWithoutThrowing()
+    {
+        // A keyspace dropped while a write is in flight must not throw here: at ingress route() runs on
+        // the netty loop, ahead of the handler's schema checks that would otherwise reject it.
+        TableMetadata ghost = TableMetadata.builder("no_such_keyspace", "tbl")
+                                           .addPartitionKeyColumn("k", Int32Type.instance)
+                                           .build();
+        DecoratedKey key = Murmur3Partitioner.instance.decorateKey(Int32Type.instance.decompose(1));
+        assertFalse(MutationShardRouting.route(new Mutation(PartitionUpdate.emptyUpdate(ghost, key))).isPresent());
     }
 
     // Not yet covered: materialized-view base tables (needs a view + an affecting update), CDC tables

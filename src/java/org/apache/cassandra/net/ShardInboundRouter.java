@@ -19,13 +19,18 @@
 package org.apache.cassandra.net;
 
 import java.util.OptionalInt;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.MutationShardRouting;
 import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.INBOUND_SHARD_DISPATCH;
 
@@ -45,13 +50,17 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.INBOUND_SH
  */
 public final class ShardInboundRouter
 {
+    private static final Logger logger = LoggerFactory.getLogger(ShardInboundRouter.class);
+    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
+
     /** I5 gate: this flag AND I1's routing (master flag + periodic commitlog). Read once at startup. */
     public static final boolean ENABLED =
         INBOUND_SHARD_DISPATCH.getBoolean() && MutationShardRouting.ROUTING_ENABLED;
 
     /** Messages routed to a shard executor at ingress. */
     private static final AtomicLong routed = new AtomicLong();
-    /** Allowlisted candidates a guard diverted back to the verb's Stage (epoch/forward/unroutable). */
+    /** Allowlisted MUTATION_REQ candidates sent to the verb's Stage instead: a guard tripped
+     *  (epoch-ahead / FORWARD_TO), the mutation was unroutable, or routing hit an error. */
     private static final AtomicLong stageFallbacks = new AtomicLong();
 
     private ShardInboundRouter() {}
@@ -75,32 +84,43 @@ public final class ShardInboundRouter
         if (!ENABLED)
             return false;
 
-        // Allowlist: MUTATION_REQ only. READ_REQ is deferred (a read miss would block the shard thread);
-        // other verbs carry work not yet proven shard-safe.
-        if (message.verb() != Verb.MUTATION_REQ)
-            return false;
+        // Runs on the netty event loop, where an escaping throw would close the connection. Routing is
+        // only ever an optimization, so on any failure fall back to the Stage instead of propagating.
+        try
+        {
+            // Allowlist: MUTATION_REQ only. READ_REQ is deferred (a read miss would block the shard
+            // thread); other verbs carry work not yet proven shard-safe.
+            if (message.verb() != Verb.MUTATION_REQ)
+                return false;
 
-        // Guard 1 - epoch ahead. The handler's TCM catch-up does a blocking peer/CMS fetch when the
-        // message epoch leads ours; that must never run on a shard thread. Cheap volatile read, rare path.
-        if (message.epoch().isAfter(ClusterMetadata.current().epoch))
+            // Guard 1 - epoch ahead. The handler's TCM catch-up does a blocking peer/CMS fetch when the
+            // message epoch leads ours; that must never run on a shard thread. Safe because epochs only
+            // advance: a message not ahead of the loop's read is not ahead of the later shard-thread read.
+            if (message.epoch().isAfter(ClusterMetadata.current().epoch))
+                return fallback();
+
+            // Guard 2 - FORWARD_TO. The handler forwards to peer replicas; that send must not queue behind
+            // a hot shard (cross-node head-of-line blocking).
+            if (message.forwardTo() != null)
+                return fallback();
+
+            ShardExecutors shards = ShardExecutors.instance();
+            if (shards == null)
+                return fallback();
+
+            OptionalInt shardId = MutationShardRouting.route((Mutation) message.payload);
+            if (shardId.isEmpty())
+                return fallback();
+
+            shards.execute(locals, shardId.getAsInt(), deliveryTask);
+            routed.incrementAndGet();
+            return true;
+        }
+        catch (Throwable t)
+        {
+            noSpamLogger.warn("Inbound shard routing failed; falling back to the stage", t);
             return fallback();
-
-        // Guard 2 - FORWARD_TO. The handler forwards to peer replicas; that send must not queue behind a
-        // hot shard (cross-node head-of-line blocking).
-        if (message.forwardTo() != null)
-            return fallback();
-
-        ShardExecutors shards = ShardExecutors.instance();
-        if (shards == null)
-            return fallback();
-
-        OptionalInt shardId = MutationShardRouting.route((Mutation) message.payload);
-        if (shardId.isEmpty())
-            return fallback();
-
-        shards.execute(locals, shardId.getAsInt(), deliveryTask);
-        routed.incrementAndGet();
-        return true;
+        }
     }
 
     private static boolean fallback()

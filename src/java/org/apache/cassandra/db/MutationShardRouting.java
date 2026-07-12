@@ -29,6 +29,7 @@ import org.apache.cassandra.db.memtable.AbstractShardedMemtable;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 
@@ -82,9 +83,15 @@ public final class MutationShardRouting
     {
         String keyspaceName = mutation.getKeyspaceName();
 
+        // Unknown keyspace (e.g. dropped while a write was in flight): don't route. Ingress routing runs
+        // on the netty loop, ahead of the handler's schema checks, so this lookup must not throw here.
+        Keyspace keyspace = Schema.instance.getKeyspaceInstance(keyspaceName);
+        if (keyspace == null)
+            return OptionalInt.empty();
+
         // Views: a routed apply would run the synchronous view update and the ViewManager striped-lock
         // retry loop on a shard thread.
-        if (Keyspace.open(keyspaceName).viewManager.updatesAffectView(mutation, false))
+        if (keyspace.viewManager.updatesAffectView(mutation, false))
             return OptionalInt.empty();
 
         // CDC: commitlog CDC allocation can block or throw on space exhaustion.
