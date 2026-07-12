@@ -20,8 +20,8 @@ package org.apache.cassandra.net;
 
 import java.util.OptionalInt;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
+import com.codahale.metrics.Counter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,10 +29,13 @@ import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.MutationShardRouting;
+import org.apache.cassandra.metrics.DefaultNameFactory;
+import org.apache.cassandra.metrics.MessagingMetrics;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.utils.NoSpamLogger;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.INBOUND_SHARD_DISPATCH;
+import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
  * Inbound shard dispatch: route an allowlisted verb to the owning shard executor at ingress, so its
@@ -52,21 +55,25 @@ public final class ShardInboundRouter
 {
     private static final Logger logger = LoggerFactory.getLogger(ShardInboundRouter.class);
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
+    // Registered under the existing "Messaging" metric group (these count inbound-messaging routing
+    // decisions); a novel group would need the registry's static allowlist + its virtual table updated.
+    private static final DefaultNameFactory FACTORY = new DefaultNameFactory(MessagingMetrics.TYPE_NAME);
 
-    /** I5 gate: this flag AND I1's routing (master flag + periodic commitlog). Read once at startup. */
+    /** Master gate: this flag AND mutation shard routing (its flag + a periodic commitlog). Read once
+     *  at startup — a mid-run flip would create mixed routed/unrouted windows. */
     public static final boolean ENABLED =
         INBOUND_SHARD_DISPATCH.getBoolean() && MutationShardRouting.ROUTING_ENABLED;
 
     /** Messages routed to a shard executor at ingress. */
-    private static final AtomicLong routed = new AtomicLong();
+    private static final Counter routed = Metrics.counter(FACTORY.createMetricName("ShardRoutedMessages"));
     /** Allowlisted MUTATION_REQ candidates sent to the verb's Stage instead: a guard tripped
      *  (epoch-ahead / FORWARD_TO), the mutation was unroutable, or routing hit an error. */
-    private static final AtomicLong stageFallbacks = new AtomicLong();
+    private static final Counter stageFallbacks = Metrics.counter(FACTORY.createMetricName("ShardRoutingStageFallbacks"));
 
     private ShardInboundRouter() {}
 
-    public static long routedCount() { return routed.get(); }
-    public static long stageFallbackCount() { return stageFallbacks.get(); }
+    public static long routedCount() { return routed.getCount(); }
+    public static long stageFallbackCount() { return stageFallbacks.getCount(); }
 
     /**
      * If {@code message} is routable, submit {@code deliveryTask} to the owning shard executor carrying
@@ -113,7 +120,7 @@ public final class ShardInboundRouter
                 return fallback();
 
             shards.execute(locals, shardId.getAsInt(), deliveryTask);
-            routed.incrementAndGet();
+            routed.inc();
             return true;
         }
         catch (Throwable t)
@@ -125,7 +132,7 @@ public final class ShardInboundRouter
 
     private static boolean fallback()
     {
-        stageFallbacks.incrementAndGet();
+        stageFallbacks.inc();
         return false;
     }
 }

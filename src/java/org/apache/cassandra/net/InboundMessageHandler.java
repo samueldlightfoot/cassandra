@@ -428,7 +428,7 @@ public class InboundMessageHandler extends AbstractMessageHandler
         callbacks.onDispatched(task.size(), header);
 
         ExecutorLocals locals = ExecutorLocals.create(state);
-        // I5: route small (pre-deserialized) messages to the owning shard executor at ingress. Large
+        // Route small (pre-deserialized) messages to the owning shard executor at ingress. Large
         // messages deserialize on-stage, so their key isn't knowable here - they take the Stage path.
         if (task instanceof ProcessSmallMessage
             && ShardInboundRouter.tryRoute(((ProcessSmallMessage) task).message, locals, task))

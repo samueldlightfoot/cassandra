@@ -41,7 +41,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Exercises inbound shard dispatch (I5): with the flag on, an inbound MUTATION_REQ is routed to the
+ * Exercises inbound shard dispatch: with the flag on, an inbound MUTATION_REQ is routed to the
  * owning shard executor at ingress, so its whole handler runs on the shard thread instead of the
  * MUTATION stage. A single-node test cannot reach this — the coordinator applies its own writes via
  * {@code performLocally}, never through inbound messaging. At three nodes / RF=3 every node replicates
@@ -51,7 +51,7 @@ import static org.junit.Assert.assertTrue;
  * <p>The counters give a clean 1x-vs-2x discriminator for the owner-inline bypass:
  * <ul>
  *   <li>node 1 (coordinator+replica) applies locally via {@code performLocally} — the router never
- *       sees those writes (routed count stays low), but the apply is still shard-executed (I1), so
+ *       sees those writes (routed count stays low), but the apply is still shard-executed, so
  *       its {@code submittedTaskCount} advances;</li>
  *   <li>nodes 2, 3 route every write through the router (routed count &ge; rows). Because the routed
  *       handler runs on the owning shard thread, {@code applyMutation} applies inline rather than
@@ -101,7 +101,7 @@ public class ShardInboundDispatchTest extends TestBaseImpl
                 cluster.coordinator(1).execute(
                     withKeyspace("INSERT INTO %s.tbl (k, v) VALUES (?, ?)"), QUORUM, i, i * 10);
 
-            // Remote replicas routed every inbound write through the router — the I5 path.
+            // Remote replicas routed every inbound write through the router — the inbound-replica path.
             for (int n = 2; n <= 3; n++)
             {
                 long routedDelta = routed(cluster, n) - routedBefore[n - 1];
