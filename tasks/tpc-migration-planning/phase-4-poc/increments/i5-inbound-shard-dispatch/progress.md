@@ -344,3 +344,23 @@ reused `Messaging` (§5 gotcha). No further deviations this session.
   hardware (3-arm off / routing / routing+ingress at RF=3 QUORUM), judged on mechanism evidence +
   tail-neutrality, not a p99 headline. Nothing else must be built first except (optionally) the deferred tests.
 - `refs/original/refs/heads/tpc-migration` is a filter-branch backup from rewording commits; drop when done.
+
+**(8) Entry point for a fresh context**
+Read first (in order): this `progress.md` (start at the `2026-07-12 — Perf-run observability` handoff) →
+`task_plan.md` (B1–B5 status) → `findings.md` → `src/java/org/apache/cassandra/net/ShardInboundRouter.java`
+(the mechanism) → `../../poc-criteria.md` §9 (multi-node gate). Ready-to-paste starting prompt for the
+next phase (Phase C perf):
+
+> Read `tasks/tpc-migration-planning/phase-4-poc/increments/i5-inbound-shard-dispatch/progress.md` from the
+> `2026-07-12 — Perf-run observability` handoff onward, then `task_plan.md`. The inbound-shard-dispatch
+> mechanism (flag `cassandra.tpc.inbound_shard_dispatch`, requires `cassandra.mutation.shard_routing`) is
+> code-complete, adversarially reviewed, and its blocker is fixed — do NOT rebuild it. The remaining work is
+> the multi-node perf measurement: provision 3 Hetzner Cloud instances (RF=3, CL=QUORUM), then run the 3-arm
+> gate — both flags off / routing only / routing+inbound-dispatch — on write-heavy cells. Read the mechanism
+> evidence per arm: metrics `Messaging.ShardRoutedMessages`, `Messaging.ShardRoutingStageFallbacks`, the
+> `Shard-N` `PendingTasks` MBeans, and `Messaging.MUTATION_REQ-WaitLatency`. Judge on tail-neutrality at
+> matched throughput, not a p99 headline. First action: read `poc-criteria.md` §9 for the exact gate and
+> stand up the Hetzner box per the deferred Phase C plan in `task_plan.md`.
+>
+> (Alternative smaller task if not ready for hardware: the deferred epoch-ahead guard unit test — recipe in
+> the B4/B5 handoff notes above.)
