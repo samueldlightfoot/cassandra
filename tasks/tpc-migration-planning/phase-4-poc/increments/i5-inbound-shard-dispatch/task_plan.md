@@ -110,14 +110,25 @@ would hide whether I5 recovers I1's own RF≥3 hop regression or adds net value.
       write was diverted). NITs applied (doc on stageFallbacks/instance-null, epoch-monotonicity comment,
       in-JVM over-route comment).
 
-### B4 — remaining before the Phase C perf run
+### B4 — perf-run observability — DONE 2026-07-12 (most already existed)
+- [x] **Micro-instrumentation.** Investigation showed two of the three signals already exist:
+      - `internalLatency` = the existing per-verb `MUTATION_REQ-WaitLatency` timer, recorded in
+        `onExecuting` inside `ProcessMessage.run()` (InboundMessageHandlers.java:269) — which runs on the
+        shard thread under routing, so it transparently measures shard-queue wait. No new code.
+      - **Per-shard inbox depth** already JMX-exposed: the shard executors are built `.withJmx("request")`,
+        so each `Shard-N` publishes `PendingTasks`/`ActiveTasks` (read via nodetool/JMX/Prometheus exporter).
+      - GAP FIXED: the router's routed/fallback counters were plain AtomicLongs (dtest-only). Now registered
+        Counters under the existing `Messaging` group — `ShardRoutedMessages`, `ShardRoutingStageFallbacks`
+        — so they're scrapeable on a real node. (A novel metric group needs the registry allowlist + its
+        virtual table updated, so an existing group was reused.) Also dropped stale codenames from comments.
+
+### B5 — remaining (optional / blocked)
 - [ ] **Epoch-ahead guard dtest** — DEFERRED: in-JVM filters can't rewrite a message's epoch (they only
       drop), so there's no clean way to force `message.epoch().isAfter(current)` end-to-end. Fable proved the
       guard sound analytically (monotonicity + double-protection); a direct `tryRoute` unit test with a
       synthesized epoch-ahead MUTATION_REQ is the fallback if coverage is demanded.
-- [ ] **Deferred from B1:** inbox-full → Stage fallback (shard queues unbounded; needs a per-shard depth
+- [ ] **Deferred:** inbox-full → Stage fallback (shard queues unbounded; needs a per-shard depth
       signal, ties to D6). Today `InboundMessageHandler` capacity is the sole back-pressure.
-- [ ] **Micro-instrumentation for the perf run:** inbox depth, messaging `internalLatency` delta.
 
 ## Phase C — multi-node RF=3 perf (DEFERRED to on-demand Hetzner Cloud, poc-criteria §9)
 No standing rig. Correctness is proven earlier (Phase A/B in-JVM multi-node dtests); this phase is

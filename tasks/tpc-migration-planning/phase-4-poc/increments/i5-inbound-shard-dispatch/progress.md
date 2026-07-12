@@ -281,3 +281,66 @@ SimpleReadWriteTest 40/40 (flag-off). Commit pending.
 - Inbox-full → Stage fallback still deferred (needs per-shard depth signal, D6).
 - Micro-instrumentation (inbox depth, internalLatency) for the perf run.
 - Then Phase C (Hetzner 3-node, 3-arm off/I1/I1+I5).
+
+## 2026-07-12 — Perf-run observability done; mechanism code-complete. HANDOFF for a fresh context.
+Increment code lives in these files (last 6 code commits `a070eb8c7a..e710b56deb`; the io/uring and
+baseline files in `trunk..HEAD` are unrelated pre-existing branch work — ignore them):
+`net/ShardInboundRouter.java` (new), `net/InboundMessageHandler.java`, `concurrent/ShardExecutors.java`,
+`db/MutationVerbHandler.java`, `db/MutationShardRouting.java`, `config/CassandraRelevantProperties.java`,
+`distributed/impl/Instance.java`, `distributed/test/ShardInboundDispatchTest.java`.
+
+**(1) Deviations from plan** — all already logged above and still stand: `shardIndex` is a method param
+(not a field); bypass predicate is `currentThreadIsOwnerOf` (not `currentShardId()==shardId`); the
+routed/fallback counters ended up as registered Metrics, not AtomicLongs (see §4); no new metric group —
+reused `Messaging` (§5 gotcha). No further deviations this session.
+
+**(2) As-built interfaces the next phase uses — verbatim**
+- Flag: `INBOUND_SHARD_DISPATCH` = `cassandra.tpc.inbound_shard_dispatch`, default `false`. Requires
+  `cassandra.mutation.shard_routing` (I1) true AND periodic commitlog, else `ShardInboundRouter.ENABLED`
+  is false. Both read once at startup — set BEFORE node start.
+- `ShardInboundRouter.tryRoute(Message<?> message, ExecutorLocals locals, Runnable deliveryTask) -> boolean`
+  (static): true = routed to shard (caller returns), false = caller runs its own Stage dispatch. The single
+  decision point; wired at `InboundMessageHandler.dispatch()` (small messages only) and
+  `Instance.receiveMessageRunnable` async branch.
+- `ShardInboundRouter.routedCount()` / `stageFallbackCount()` (static longs; back the counters).
+- `ShardExecutors.execute(ExecutorLocals, int memtableShardId, Runnable)` — locals-carrying overload
+  (delegates to the localAware executor's `execute(WithResources, Runnable)`); plus the pre-existing
+  `execute(int, Runnable)`, `currentShardId()`, `currentThreadIsOwnerOf(int)`, `instance()`,
+  `submittedTaskCount()`, `shardCount()`.
+- `MutationShardRouting.route(Mutation) -> OptionalInt` — now null-safe (returns empty on unknown keyspace);
+  `MutationShardRouting.ROUTING_ENABLED` (static final).
+
+**(3) Perf-run observability (Phase C reads these — NO new code needed beyond what's built)**
+- Router counts: metrics `Messaging.ShardRoutedMessages` and `Messaging.ShardRoutingStageFallbacks`
+  (Counters; scrapeable via JMX/nodetool/Prometheus exporter, same as any Messaging metric).
+- Inbox depth: per-shard `PendingTasks`/`ActiveTasks` on the `Shard-N` thread-pool MBeans (the executors
+  are `withJmx("request")`).
+- Queue wait: existing `Messaging.MUTATION_REQ-WaitLatency` timer — measures shard-queue wait under routing
+  (recorded in `onExecuting` inside the routed `ProcessMessage.run`).
+
+**(4) Tested / deferred / broken**
+- GREEN: ShardInboundDispatchTest 2/2 (routing 1x-vs-2x bypass proof + FORWARD_TO divert),
+  MutationShardRoutingTest 7/7, ShardRoutedReplicaApplyTest 1/1, SimpleReadWriteTest 40/40 (flag-off byte-identical).
+- DEFERRED: epoch-ahead divert test (no in-JVM epoch-rewrite; guard proven analytically) — recipe above.
+  inbox-full → Stage fallback (needs a per-shard depth signal, D6).
+- The BLOCKER (ingress throw → connection kill) is FIXED + regression-tested. Don't reopen.
+
+**(5) Decisions + rationale (new this session)**
+- Router counters as registered `Messaging`-group Counters, not a new `ShardInboundRouter` group: a novel
+  group hits `CassandraMetricsRegistry`'s static allowlist (`IllegalStateException: Unknown metric group`)
+  and its virtual-table coupling → would need test changes. Reusing an allowed group is friction-free.
+- Most of "micro-instrumentation" already existed (WaitLatency, per-shard PendingTasks); only the router
+  counters needed exposing. Didn't add a redundant aggregate pending-depth gauge.
+
+**(6) Gotchas for the next context**
+- `ant test -Dtest.name=<FQN>` is a silent no-op; use the simple class name and check `Tests run:` + fresh XML.
+- In-JVM registers metrics per-instance classloader — no cross-node JMX collision (same as `misroutedPuts`).
+- Registering the two router metrics at `ShardInboundRouter` class-init happens even flag-OFF (class loads on
+  first dispatch); harmless (they stay 0). Confirmed flag-off byte-identical still holds.
+- Commit messages / code comments: NO phase/increment codenames (Phase B, I5, I1, D6). Repeated correction.
+
+**(7) Assumptions to treat as given**
+- The mechanism is correctness-complete and adversarially reviewed. Phase C is a *measurement* task on real
+  hardware (3-arm off / routing / routing+ingress at RF=3 QUORUM), judged on mechanism evidence +
+  tail-neutrality, not a p99 headline. Nothing else must be built first except (optionally) the deferred tests.
+- `refs/original/refs/heads/tpc-migration` is a filter-branch backup from rewording commits; drop when done.
