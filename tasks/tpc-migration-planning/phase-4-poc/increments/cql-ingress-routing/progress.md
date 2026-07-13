@@ -130,6 +130,26 @@ on the real native path — the thing in-JVM dtests cannot show.**
 - **NEXT (Phase-3 hardening, not gating):** commit the metrics fix + Phase-2 build; composite-PK routing;
   §6 `hasQueueCapacity` shard-inbox term; if a throughput number is wanted, a matched-saturation A/B sweep.
 
+### Clean performance A/B (2026-07-13 later) — REGIME CROSSOVER (`perf-ab-methodology.md` §RESULTS)
+
+The Phase-3 seam numbers proved the *mechanism* cleanly but the throughput/CPU/p99 were noisy (hand-aligned
+unequal windows, over-driven regime). Redone properly: same jar, only the flag differs, fresh `prep_flip`
+per arm, 3× 60s sub-knee windows + 1 saturation window, off-box loadgen. Two harness bugs fixed: profiling
+(`asprof`+`perf`) *inside* the CPU window inflated busy% ~14pp (removed — cs/op from vmstat instead); the
+flip records no `ClientRequest.Write.Latency` (server p99 unavailable, both arms — unbiased).
+- **Sub-knee ~182k:** CPU **65.5% → 60.1% (−5.4pp)**, cs/op **2.10 → 1.54 (−27%)**, %usr −2.8 / %sys −2.8,
+  Routed ≈100%/window, shards Blocked=0. Flag-off reproduces the flip+step1 baseline (65.5% ≈ documented
+  67.4%, cs/op 2.10 ≈ 2.1), validating the harness. **Routing is a real moderate-load CPU win** — matching
+  the earlier context-switch arithmetic (the first "CPU flat" read was profiling contamination).
+- **Saturation (matched loaded table):** peak deliverable **310k (off) → 298k (on) = −4%**, both 98% CPU,
+  cs/op 0.446 → 0.716 (routing +60% switches/op), Blocked=0. The design's bounded risk (shard serialization
+  under load) is real but modest: coordinate on 12 shard threads + per-request loop↔shard handoff can't
+  batch like the wide NTR pool, capping peak ~4% lower.
+- **Tail:** client CO-corrected steady p99 ~193ms (off) ≈ ~194ms (on) — **neutral**, GC/flush-dominated.
+- **Verdict:** CQL routing WINS at moderate load (−5.4pp CPU, tail-neutral), COSTS ~4% peak throughput at
+  saturation. Crossover. NB the A/B is vs **flip+step1**, not trunk — isolates the routing increment; a
+  vs-trunk PoC-criterion read needs a separate trunk build.
+
 
 ## Session 2026-07-13 — crux settled, design doc written, Fable critique in flight
 
