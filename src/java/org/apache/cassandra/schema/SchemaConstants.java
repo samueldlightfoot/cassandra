@@ -131,7 +131,7 @@ public final class SchemaConstants
      */
     public static boolean isLocalSystemKeyspace(String keyspaceName)
     {
-        return LOCAL_SYSTEM_KEYSPACE_NAMES.contains(toLowerCaseLocalized(keyspaceName)) || isVirtualSystemKeyspace(keyspaceName);
+        return containsIgnoreCase(LOCAL_SYSTEM_KEYSPACE_NAMES, keyspaceName) || isVirtualSystemKeyspace(keyspaceName);
     }
 
     /**
@@ -139,7 +139,7 @@ public final class SchemaConstants
      */
     public static boolean isReplicatedSystemKeyspace(String keyspaceName)
     {
-        return REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(toLowerCaseLocalized(keyspaceName));
+        return containsIgnoreCase(REPLICATED_SYSTEM_KEYSPACE_NAMES, keyspaceName);
     }
 
     /**
@@ -148,7 +148,7 @@ public final class SchemaConstants
      */
     public static boolean isVirtualSystemKeyspace(String keyspaceName)
     {
-        return VIRTUAL_SYSTEM_KEYSPACE_NAMES.contains(toLowerCaseLocalized(keyspaceName));
+        return containsIgnoreCase(VIRTUAL_SYSTEM_KEYSPACE_NAMES, keyspaceName);
     }
 
     /**
@@ -166,9 +166,8 @@ public final class SchemaConstants
      */
     public static boolean isNonVirtualSystemKeyspace(String keyspaceName)
     {
-        final String lowercaseKeyspaceName = toLowerCaseLocalized(keyspaceName);
-        return LOCAL_SYSTEM_KEYSPACE_NAMES.contains(lowercaseKeyspaceName)
-               || REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(lowercaseKeyspaceName);
+        return containsIgnoreCase(LOCAL_SYSTEM_KEYSPACE_NAMES, keyspaceName)
+               || containsIgnoreCase(REPLICATED_SYSTEM_KEYSPACE_NAMES, keyspaceName);
     }
 
     /**
@@ -203,5 +202,27 @@ public final class SchemaConstants
                            .addAll(SystemDistributedKeyspace.TABLE_NAMES)
                            .addAll(AccordKeyspace.TABLE_NAMES)
                            .build();
+    }
+
+    /**
+     * Case-insensitive membership in a set of lowercase names, without allocating on the hot path.
+     * These checks run per write (via {@code Keyspace.open} -> {@code Schema.getKeyspaceInstance});
+     * keyspace names are almost always already lowercase, so the direct {@code contains} answers
+     * without lowercasing. A fresh lowercased copy is built only when the name actually contains an
+     * uppercase char — the rare path, never the write hot path. Keyspace names are ASCII ({@code \w+}),
+     * so the A-Z scan is sufficient. Do not simplify to {@code set.contains(name)}: that would miss
+     * mixed-case names the old lowercasing accepted.
+     */
+    private static boolean containsIgnoreCase(Set<String> lowercaseNames, String name)
+    {
+        if (lowercaseNames.contains(name))
+            return true;
+        for (int i = 0, len = name.length(); i < len; i++)
+        {
+            char c = name.charAt(i);
+            if (c >= 'A' && c <= 'Z')
+                return lowercaseNames.contains(toLowerCaseLocalized(name));
+        }
+        return false;
     }
 }

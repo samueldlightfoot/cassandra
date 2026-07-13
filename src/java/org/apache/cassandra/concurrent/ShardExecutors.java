@@ -28,6 +28,8 @@ import com.google.common.annotations.VisibleForTesting;
 import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
 
+import io.netty.util.concurrent.FastThreadLocal;
+
 import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
 import static org.apache.cassandra.config.CassandraRelevantProperties.MUTATION_SHARD_ROUTING;
 
@@ -48,8 +50,17 @@ public final class ShardExecutors
     private static final int SHARD_COUNT = FBUtilities.getAvailableProcessors();
 
     /** The executor index the calling thread owns while it runs a routed task; {@link #UNSET} otherwise.
-     *  Set per task (not once per thread) so it survives worker-thread replacement. */
-    private static final ThreadLocal<Integer> CURRENT_SHARD = ThreadLocal.withInitial(() -> UNSET);
+     *  Set per task (not once per thread) so it survives worker-thread replacement. Netty's
+     *  {@link FastThreadLocal}, not {@code java.lang.ThreadLocal}: shard threads are FastThreadLocalThreads,
+     *  where get/set is an array index rather than a hashed-map probe on every routed task. */
+    private static final FastThreadLocal<Integer> CURRENT_SHARD = new FastThreadLocal<Integer>()
+    {
+        @Override
+        protected Integer initialValue()
+        {
+            return UNSET;
+        }
+    };
 
     /** Created only when routing is enabled, so no shard threads exist when the flag is off (the default). */
     private static volatile ShardExecutors instance =
