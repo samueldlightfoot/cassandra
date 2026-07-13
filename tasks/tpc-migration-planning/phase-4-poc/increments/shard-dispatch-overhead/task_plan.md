@@ -22,9 +22,10 @@ Parity is NOT a goal here — it requires deleting the hop (ingress routing), a 
 
 ## Step 1 — kill per-op waste (cheap, high-confidence, do first)
 
-- [x] 1a. **DONE (code, unit-verified; rig pending).** Made the system-keyspace name sets
-      case-insensitive (`String.CASE_INSENSITIVE_ORDER`, allocation-free `contains`); predicates pass
-      the raw name through. `SchemaConstantsTest` pins it. Original note below.
+- [x] 1a. **DONE + rig-verified.** Allocation-free `containsIgnoreCase` (direct `contains` fast-path;
+      lowercase a copy only if the name has an uppercase char). Rig: keyspace-check 4.01 → ~2.95%.
+      NOTE: a first `TreeSet(CASE_INSENSITIVE_ORDER)` cut REGRESSED to 5.99% (comparator per-char case
+      folding) — caught on the rig, reworked. See `progress.md` rig section + `lessons.md`.
 - [ ] 1a. **Per-write keyspace lowercasing.** `SchemaConstants.isLocalSystemKeyspace` (`:134`) +
       `isVirtualSystemKeyspace` (`:151`) allocate a lowercased keyspace name per call (twice), on the
       `Keyspace.open` write path. Fix: case-insensitive membership over the tiny known set (no
@@ -42,11 +43,16 @@ Parity is NOT a goal here — it requires deleting the hop (ingress routing), a 
 - [ ] 1c. **(optional) Cheaper latency reservoir.** `DecayingEstimatedHistogramReservoir.findIndex`
       is ~1.5%/op. Only touch if 1a/1b don't move the needle enough — the metric is wanted; the cost
       is the reservoir. Lower priority.
-- [ ] 1d. **Re-profile** (matched 179k rung) — expect toLowerCase + threadlocal-miss frames gone;
-      CPU down ~2-4 pp; confirm no regression in correctness (metrics still recorded).
+- [x] 1d. **DONE (rig, 2026-07-13).** toLowerCase + `getEntryAfterMiss` frames GONE; matched-throughput
+      flip-arm busy 68.56 → 67.41 (−1.15pp, modest — under the +2-4pp hope; frame-level −3.4pp targeted
+      but the other ~95% has run variance). 1b routing-specific → shrinks the delta. See `progress.md`.
 
 ## Step 2 — allocation-free / specialized shard dispatch (structural; GATED)
 
+- [x] 2a. **DONE (rig, 2026-07-13) — prize is SMALL on-CPU.** `asprof -e alloc`: dispatch machinery a
+      minority of allocation (`AsyncPromise` ~6.7%, `LocalMutationRunnable`/routing partial); `Mutation`
+      payload dominates (~66%, shared with off). On-CPU GC only ~4.4%. → Step 2's on-CPU payoff ~1-1.5pp;
+      real value would be the p95+ GC-pause tail, not on-CPU. **Gate: skip for on-CPU; revisit for tail.**
 - [ ] 2a. **Size the prize FIRST**: 20 s `asprof -e alloc` on the matched rung → per-op dispatch
       allocation bytes. If small, skip 2 (do the cheap 1 + reassess). This gates the surgery.
 - [ ] 2b. Replace the general executor task path (`ShardExecutors.java`, the local-apply branch's
