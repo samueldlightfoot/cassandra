@@ -39,7 +39,57 @@ on the local Mac — the benchmark is a `setsid` process on the rig and continue
    within 3-iter band. Low-load is characterization only (I1 expected to regress). p99-neutral-or-better = pass.
 5. **DELETE loadgen** (command above). Write findings.
 
-## 2026-07-12 (later) — PAUSED again; OFF-arm DONE, I1-arm now running
+## 2026-07-12 (RESULT) — valid A/B done; i1 +28.5pp CPU root-caused to coordinator↔shard rendezvous
+
+**See `findings.md` for the full writeup.** Valid A/B (v2 harness: truncate-per-cell +
+autocompaction-off, tripwire green): i1 = **+28.5pp CPU / p50 14→149µs at matched 178.8k**.
+async-profiler (both arms) root-caused it: shard routing makes the coordinator **park waiting
+for the local apply**, the shard thread **signals/unparks it** — a futex rendezvous per write
+(620k cs/s). OFF applies inline (no handoff). ShardExecutors subtree 0.07%→22.9%;
+WaitQueue/Condition.signal 1.5%→16.5% (usr); futex/unpark ~5%→~19% (sys). Not a bug — an RF=1
+artifact; RF≥3 should hide it behind the remote-replica wait (HYPOTHESIS → multi-node gate).
+asprof A/B method documented in agent-common `tools/async-profiler.md`.
+
+**Infra state:** orchestrator STOPPED; node UP (off arm, autocompaction disabled — needs
+`enableautocompaction` + restart before any reuse); loadgen 62.238.35.142 UP (billing ~6h).
+Full 12-cell matrix aborted after root-cause (remaining cells would only reconfirm +28pp).
+
+## 2026-07-12 (latest) — INVALID run discarded; tightened harness re-running
+
+**The off/i1 block run below is INVALID** — `sp-hdr.sh` (measurement client) omitted
+`--partitions`, so the dataset grew 429 MB → ~7 GB *during* the matrix. Compaction tax
+aliased onto arm order: "i1" mid showed 91% CPU / 2759µs p99 vs off 69% / 1331µs at the
+same 178k ops/s — pure confound, zero mechanism. Diagnosis confirmed with numbers.
+
+**Methodology documented** so it can't recur (agent-common, durable):
+`benchmarking/methodology.md` §2 (pin write key space), §6 (single-node gate on server
+p50/p95, not GC/CO tail), §8 (interleave arms + per-cell invariant tripwire);
+`cassandra/stress-tooling.md` §3 (pin `--partitions` on run phase, not just populate);
+`gotchas.md` Benchmarking-Validity row. (Uncommitted — awaiting user.)
+
+**v1 tightened harness ALSO INVALID** — the `--partitions 2000000` pin does NOT bound the
+`run`-phase key space in easy-cass-stress (KeyValue `run` writes ~1 new partition/op; killed
+run hit **50.9M partitions / 14 GB**). Confirmed via tablestats. Even v1 cell-1 grew
+439 MB → 5 GB *within its own window*, so no cell was clean. `--partitions` only affects populate.
+
+**v2 fix (write-only insight):** workload is `--readrate 0`, so existing data is irrelevant
+to the measured path. Per cell: **TRUNCATE to empty** (13 GB → 84 K in 1.4s, verified) →
+**`disableautocompaction`** during the window → measure. Every cell starts identical (~0 MB,
+tripwire = equal start), grows equally (same write volume), and the µs write-apply signal
+isn't buried under compaction's ~30pp-CPU noise. Summary logs mb0 (start) + mb_end per cell.
+Relaunched 17:08 UTC. **VALIDATION GATE: cells 1 (off_mid) + 2 (i1_mid) must both start ~0 MB
+with comparable p50** — else stop again.
+
+**v1 tightened harness (SUPERSEDED — see v2 above):**
+- Client pins `--partitions 2000000` (fixed 439 MB baseline; live MB logged per cell as tripwire).
+- Node restarted every cell → fresh JVM + empty proxyhistograms (no metric bleed) + arm flip.
+- Compaction drained to pending=0 before each measurement window.
+- Arms interleaved per cell, point order balanced across 3 rounds (12 cells: off/i1 × mid/loaded × 3).
+- Gate: server p50/p95 + rig CPU @ matched throughput. p99/Max reported, NOT gated (GC/CO; multi-node's job).
+- Cell c01_off_mid clean: p50 14µs / p95 372µs / ach 178.9k / cpu 60.7% / **live_MB 439 (stable)**.
+- Monitor: `grep "DONE tightened" /root/results/orch_tight.log`; then GATE + write findings + DELETE loadgen.
+
+## 2026-07-12 (later) — PAUSED again; OFF-arm DONE, I1-arm now running [SUPERSEDED — INVALID, see above]
 
 **OFF-arm results (SEDA baseline), 3 iters each — loadgen ≤53% CPU (server-bound, valid):**
 | point | offered | achieved/s | srv_wp99µs | rig_cpu% |

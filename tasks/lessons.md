@@ -1,5 +1,30 @@
 # Lessons
 
+## Performance attribution: measure before you conclude, verify magnitude within bounds
+2026-07-12, I1 single-node A/B. I predicted i1 would be "neutral within noise," then when the
+data showed +28.5pp CPU I attributed it to "a dispatch hop" — twice stating a mechanism without
+measuring it. User: "I can't see that being the cause for 30% more CPU" and "verify all your
+conclusions with real numbers and data to ensure within expected bounds." The dispatch-hop story
+was ~6× too small (a context switch is ~1-5µs → ~4pp, not 28pp). Rules:
+- **Never state a performance cause or magnitude from code-reading/intuition alone.** Attribution
+  requires a profile (async-profiler A/B), a decomposition (mpstat %usr vs %sys), or a counter
+  (vmstat cs/s). "It's probably X" about CPU/latency is a hypothesis, label it as one.
+- **Sanity-check the arithmetic before asserting.** +28pp on 12 cores = +3.4 cores = ~19µs-CPU/op.
+  Ask "does my proposed cause plausibly cost that much?" If a single context switch can't, the
+  story is wrong or incomplete — keep digging (it was a park/unpark *rendezvous per write* +
+  condition machinery, ~19% futex/unpark + 16.5% WaitQueue.signal, all profiler-verified).
+- **The subagent can be confidently wrong too** — it claimed "MutationStage + Shard oversubscription"
+  but tpstats showed MutationStage idle (1 completed). Verify a load-bearing subagent claim against
+  live state before building on it.
+
+## Never `pkill -f CassandraDaemon` (or any `-f <pattern>`) in an SSH command whose own text contains the pattern
+2026-07-12, I1 profiling. Ran `pkill -9 -f CassandraDaemon` inside an `ssh root@rig '...'` command.
+`-f` matched the remote SSH shell's own argv (which literally contained "CassandraDaemon") and killed
+the session (exit 255) mid-restart, taking cassandra down without relaunching. Already documented in
+agent-common gotchas + methodology §10; I hit it anyway. Rule: over SSH, use a **self-excluding**
+pattern `Cassandra[D]aemon` (the bracket makes the regex match the process but not the literal
+command text), or `pgrep -x`/resolved-PID kill. This applies to EVERY `pkill -f` run over SSH.
+
 ## Explainers: a threshold is not explained until you name what it bounds
 2026-07-08, TPC Phase 2 G1 explainer. First draft said "that is the 70%: most of the box
 from one core" — user: "not sticking... what is, specifically? if we hit 63% and are cpu
@@ -106,3 +131,44 @@ meaningless to any future reader of the git history. Hard rules for EVERY commit
   shard executor at ingress"). No "Phase X", no increment codename.
 - If a stable handle is needed, use the real feature/flag name (`cassandra.tpc.inbound_shard_dispatch`).
 - Check the subject for a phase/increment token BEFORE committing — this is the recurring failure point.
+
+## Async request paths: clear request-scoped thread-locals on the ORIGIN thread (2026-07-13)
+Flipping the CQL Dispatcher to async, I moved the per-request teardown (ClientWarn/coordinator-
+warnings reset, Tracing.stopSession) onto the completion thread — and forgot the origin. A pooled
+Native-Transport worker sets request-scoped thread-locals (captureWarnings, CoordinatorWarnings.init,
+and `Tracing.newSession` sets TraceState) before dispatching. In the sync path the same worker also
+ran the `finally` teardown, so it stayed clean. Once teardown moves to the completing thread, the
+worker keeps the stale state and carries it into its NEXT request → `Tracing.newSession`'s
+`assert get() == null` fires under `-ea`. Rules:
+- When teardown of an origin-thread thread-local moves to another thread, the origin must STILL clear
+  its own copy (capture the bundle, then `ExecutorLocals.clear()` + `captureAndClear()` the origin).
+  Capture ≠ clear.
+- `ClientWarn.set`/`captureWarnings` preserve the current `traceState` (they only swap the clientWarn
+  slot), so a stale TraceState is NOT overwritten by the next request's setup — it must be cleared.
+- This class of leak is invisible to code review and unit tests; it only shows up when the LIVE traced
+  path runs repeatedly. A dtest that fires several traced requests through the real native protocol
+  (not `coordinator().execute()`, which bypasses the Dispatcher) is what caught it. Always exercise a
+  newly-activated dormant path end-to-end before trusting it.
+
+## macOS: single-node in-JVM native dtests run; multi-node needs loopback aliases (2026-07-13)
+A 1-node `distributed.Cluster` dtest with `NATIVE_PROTOCOL` + the datastax driver runs on macOS
+(only binds 127.0.0.1). A 3-node one fails `failed to bind to /127.0.0.2:7012` — macOS doesn't bind
+127.0.0.2+ by default. Bind with `sudo ifconfig lo0 alias 127.0.0.2 up` (etc.) or defer multi-node
+to Linux/CI. Not a code failure. Complements [[feedback_macos_multinode_dtest_unreproducible]]
+(CCM/TCM) and [[feedback_injvm_dtest_runs_on_macos]].
+
+## Allocation-free ≠ cheaper CPU: TreeSet(CASE_INSENSITIVE_ORDER) is not a free swap (2026-07-13)
+To kill a per-write `toLowerCaseLocalized` allocation in the system-keyspace checks, the first cut
+made the name sets `TreeSet(String.CASE_INSENSITIVE_ORDER)` — allocation-free `contains`. Profiling
+on the rig showed it was a REGRESSION: the keyspace-check CPU went 4.01% → 5.99%. The comparator does
+`Character.toUpperCase`/`toLowerCase` per char, and `TreeSet.contains` does ~log(n) compares per
+lookup, ×~8 lookups per `getKeyspaceInstance` — more CPU than the allocate-lowercased-copy + hash it
+replaced. The allocation was gone (good for the GC tail) but on-CPU got worse.
+- Rule: removing an allocation can COST CPU if the replacement does per-char/per-compare work. For
+  allocation-free case-insensitive membership on a hot path, prefer a direct hash `contains(name)`
+  fast-path and only lowercase-a-copy when the input actually contains an uppercase char (rare) —
+  not a comparator that case-folds every char of every compare.
+- Rule: a "cheap, obvious" micro-opt still needs the re-profile. This one looked like free
+  low-hanging fruit and was net-negative on CPU until measured. The frame-level self-cost fold caught
+  it where aggregate busy% (±1pp noise) could not. Reinforces [[feedback_cassandra_jar_rebuild]] /
+  [[feedback_verify_metrics_at_source]]: prove the win at the frame level, per-arm, before claiming it.
