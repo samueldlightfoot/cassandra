@@ -172,3 +172,39 @@ replaced. The allocation was gone (good for the GC tail) but on-CPU got worse.
   low-hanging fruit and was net-negative on CPU until measured. The frame-level self-cost fold caught
   it where aggregate busy% (±1pp noise) could not. Reinforces [[feedback_cassandra_jar_rebuild]] /
   [[feedback_verify_metrics_at_source]]: prove the win at the frame level, per-arm, before claiming it.
+
+## A new dropwizard metric `type` must be registered in metricGroups, or `<clinit>` kills every request (2026-07-13)
+CQL ingress routing built fine, unit-tested green, but the first native request on the rig died: a fresh
+metric group `CqlShardRouting` (via `new DefaultNameFactory("CqlShardRouting")`) is not in
+`CassandraMetricsRegistry.metricGroups` (a hand-maintained `ImmutableSet` of every allowed metric `type`),
+so `Metrics.counter(...)` → `verifyUnknownMetric` throws `IllegalStateException: Unknown metric group`.
+That throw is inside the class's static initializer, so it becomes `ExceptionInInitializerError` then
+`NoClassDefFoundError: Could not initialize class …` on EVERY subsequent access — the node stays up but
+serves nothing while the feature is enabled. Invisible to unit + in-JVM dtests (they never register the
+group under a live registry the way the running node does).
+- Rule: adding metrics under a brand-new `type` string requires ALSO adding it to
+  `CassandraMetricsRegistry.metricGroups` (the class comment says so) — or the build fails at runtime, not
+  compile. Prefer reusing an existing registered group: the internode sibling `ShardInboundRouter` puts its
+  counters under `MessagingMetrics.TYPE_NAME` ("Messaging"); the CQL/native analogue is
+  `ClientMetrics.TYPE_NAME` ("Client"). Name the counters distinctively (`CqlIngressRouted`) to avoid
+  collision within the shared group. Reuse is the smaller change (no core-registry / virtual-table churn).
+- Rule: a metric registration that runs lazily on first request (static field on a route class loaded from
+  `dispatch()`) is a live-path landmine a green unit suite hides. Exercise the real native transport
+  (drive one prepared write through a socket, watch the node's log for `<clinit>`/`NoClassDefFoundError`)
+  before trusting a newly-flagged path — the same "dormant path end-to-end" rule as the async teardown leak.
+
+## Check the documented runbook before declaring an operational blocker (2026-07-13)
+- Mistake: hit "loadgen deleted, must provision" and reported it as a BLOCKER needing the user, after
+  `hcloud context list` showed no active context → I concluded "hcloud unauthed." User corrected:
+  "Why is hcloud not auth'd. Instructions should be in runbook."
+- Reality: the project CLAUDE.md (`tasks/tpc-migration-planning/CLAUDE.md`) points at
+  `~/repos/agent-common/CLAUDE.md`, whose `rig/cloud.md` documents the whole flow: token at
+  `~/repos/agent-common/.secrets/hcloud.token`, used via `export HCLOUD_TOKEN=$(cat …)`. `hcloud` reads
+  the env var — an empty `context list` is EXPECTED (env-var auth, not a persisted CLI context), not
+  "unauthed." Provisioning a fresh ccx43 loadgen is routine and scripted there.
+- Rule: before surfacing any access/auth/provisioning/tooling gap as a blocker or an
+  AskUserQuestion, READ the operational runbooks the project CLAUDE.md links (here: agent-common/rig/*.md,
+  gotchas.md). "The tool looks unauthed / the box is gone" is usually a documented, self-serviceable
+  step, not a user decision. Reserve the user's attention for genuine choices.
+- Rule: don't infer "unauthed" from one auth surface (`context list`) — check how the token is actually
+  supplied (env var, config file, secret path) per the runbook.

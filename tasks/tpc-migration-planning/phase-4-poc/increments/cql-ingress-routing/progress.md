@@ -1,5 +1,201 @@
 # Progress — CQL-path ingress routing (single-node inbox hop)
 
+## PHASE 3 HANDOFF (2026-07-13) — rig validation of the built skeleton
+
+Phase 2 is built, compiles, unit-tested, uncommitted on `shard-dispatch-overhead`. Phase 3 = validate the
+flag-on native path on the rig. Read the entry point (§7 below) before acting.
+
+**(1) Plan deviations (+ why).** The design's §4 part-A/part-B split was collapsed: the loop predicate only
+excludes COORDINATE-time hazards (LWT/counter/triggers/local-system/denylist-write-gate/transient-replica),
+because `StorageProxy.performLocally` already re-runs the authoritative `MutationShardRouting.route(mutation)`
+on the shard thread, so apply-hazards (views/CDC/legacy-2i) are handled there — the loop needn't re-check them.
+This made `CqlShardRouter` smaller/safer than §10 implied. Scope narrowed to **single-column PK only** (composite
+= fallback) to avoid `CompositeType` assembly on the loop. §6 `hasQueueCapacity` shard-inbox backpressure term
+NOT built (deferred to Phase-3 hardening).
+
+**(2) As-built interfaces (verbatim).**
+- Flag: `CassandraRelevantProperties.CQL_INGRESS_ROUTING("cassandra.tpc.cql_ingress_routing", "false")`.
+  Master gate `CqlShardRouter.ENABLED = CQL_INGRESS_ROUTING.getBoolean() && MutationShardRouting.ROUTING_ENABLED`
+  (so ALSO needs `-Dcassandra.mutation.shard_routing=true` + periodic commitlog). Read once at startup.
+- `transport/CqlShardRouter.routeShard(Message.Request request) -> OptionalInt` (never throws; empty ⇒ NTR path).
+  `CqlShardRouter.routedCount()` / `fallbackCount()` (longs).
+- JMX metrics: type=`CqlShardRouting`, names `Routed` and `Fallbacks` (Counters). Rig check =
+  `nodetool sjk mxdump` or the metrics exporter for `...CqlShardRouting...Routed`. **Routed>0 proves the loop
+  route fired on the native path** — the single thing in-JVM dtests can't show.
+- `QueryProcessor.getPreparedNoTouch(MD5Digest id) -> QueryHandler.Prepared` (static; `asMap().get`, no eviction).
+- `MutationShardRouting.shardForKey(TableMetadata metadata, DecoratedKey key) -> OptionalInt`.
+- `Dispatcher.dispatch()`: routes when `CqlShardRouter.ENABLED && !isAuthQuery` and `routeShard` present +
+  `ShardExecutors.instance()!=null`, via `shards.execute(ExecutorLocals.current(), shard, new RequestProcessor(...))`;
+  else the original `executor.submit(...)`. Flag-off ⇒ ENABLED false ⇒ original path unchanged.
+- `StorageProxy.performLocally` owner-inline bypass: `if (ShardExecutors.currentThreadIsOwnerOf(shardId)) localMutationRunnable.run(); else shards.execute(...)`.
+
+**(3) Tested / deferred.** Tested: `ant build` OK; `MutationShardRoutingTest` 9/9 (2 new shardForKey tests);
+`ShardRoutedMutationApplyTest` 1/1 (performLocally regression-clean). Flag-off byte-identical by construction.
+NOT tested locally (i5-findings:40 — in-JVM bypasses `Dispatcher`): routeShard firing, owner-inline collapsing
+hop B. Deferred: composite-PK routing, §6 backpressure term. Not committed.
+
+**(4) Decisions.** Loop guards coordinate-hazards only (rationale above). Route the whole `RequestProcessor`
+(not a new coordinate) so no coordinate code changes. `ExecutorLocals.current()` snapshots loop locals (≈none;
+matches requestExecutor's localAware submit).
+
+**(5) Gotchas.** `CassandraRelevantProperties` enum MUST stay alphabetical by constant NAME (a `<clinit>` check
+fails the build otherwise — cost one build). `ant build` ≠ jar; deploy needs `ant jar` + verify class is IN the
+jar (`feedback_cassandra_jar_rebuild`). In-JVM dtests are vacuous for the route point. easy-cass-stress is NOT
+on the rig (build it; or provision a loadgen per `agent-common/rig/cloud.md`, token at `.secrets/hcloud.token`,
+`HCLOUD_TOKEN` env — empty `hcloud context list` is NOT unauthed). Loadgen bills hourly — delete when done.
+
+**(6) Assumptions given.** Baseline seam split: `SharedPool` (coordinate/NTR pool) = **43.5% of context switches
+(0.735/op)** at 214k/74.2%CPU/cs-op≈1.69 (`measure-seam-attribution.md` §RESULTS). Phase-3 success = routed run
+shows `SharedPool` switch share DROP (coordinate moved onto shards), writes correct, flag-off clean, shards not
+CPU-saturated (the bounded risk). Rig `157.180.98.112` runs the flip+step1 baseline jar (routing ON, no CQL flag);
+`/root/perf_wake.sh`, `/root/seam_run.sh`, `prep_flip.sh` staged. Deploy recipe: shard-dispatch-overhead task_plan
+"Verify" (`ant jar` → rsync → swap `…jar.tpc-migration-baseline` → restart) + add `-Dcassandra.tpc.cql_ingress_routing=true`
+to `/data/tpc-poc/conf/jvm-server.options`.
+
+**(7) Entry point for a fresh agent.** Read in order: THIS `progress.md` (top section) → `task_plan.md` (Phase 2
+BUILT + Phase 3 items) → `design-cql-ingress-routing.md` (§1 hop model, §5 non-blocking, §11 validation) →
+`measure-seam-attribution.md` §RESULTS (the baseline to beat). Then the as-built source:
+`transport/CqlShardRouter.java`, the `Dispatcher.dispatch()` branch, `StorageProxy.performLocally` bypass.
+Starting prompt to paste:
+
+> Phase 3 — validate the built CQL ingress-routing skeleton on the rig. Read
+> `tasks/tpc-migration-planning/phase-4-poc/increments/cql-ingress-routing/progress.md` (PHASE 3 HANDOFF) →
+> `task_plan.md` → `design-cql-ingress-routing.md` (§11) → `measure-seam-attribution.md` §RESULTS. Branch
+> `shard-dispatch-overhead` (uncommitted Phase-2 build). FIRST action: `ant jar` locally, verify `CqlShardRouter`
+> is in the jar, rsync-deploy to rig `157.180.98.112`, restart with BOTH `-Dcassandra.mutation.shard_routing=true`
+> and `-Dcassandra.tpc.cql_ingress_routing=true`. Then drive prepared single-partition writes (easy-cass-stress
+> KeyValue — build on rig or provision a loadgen per agent-common/rig/cloud.md) and confirm: (a) `CqlShardRouting.Routed`
+> counter climbs (route fires on the native path), (b) writes read back correct, (c) re-run `/root/seam_run.sh` — the
+> `SharedPool` switch share drops vs the 43.5% baseline (hop deleted), (d) flag-off regression-clean, (e) shards not
+> CPU-saturated. Gate on mechanism evidence + tail-neutrality, not a headline p99 (i5-findings:22). Delete any loadgen when done.
+
+
+## Session 2026-07-13 (later) — PHASE 3 VALIDATED ON RIG — PASS
+
+Deployed the fixed jar to `157.180.98.112`, drove prepared single-partition KeyValue writes from an
+off-box ccx43 loadgen (hel1, deleted after), routing ON. **All five Phase-3 gates pass. Mechanism proven
+on the real native path — the thing in-JVM dtests cannot show.**
+
+- **BUG FOUND + FIXED (rig-only, unit tests were vacuous).** First flag-on boot: every native request died
+  at `dispatch()` — `CqlShardRouter.<clinit>` threw `IllegalStateException: Unknown metric group:
+  CqlShardRouting` (`CassandraMetricsRegistry.verifyUnknownMetric`, its 279-line static `metricGroups`
+  whitelist). A metric `type` not in that set fails registration; the failed `<clinit>` then
+  `NoClassDefFoundError`s every request (node up but serves nothing). **Fix:** reuse the registered `Client`
+  group (`ClientMetrics.TYPE_NAME`) with distinctive names `CqlIngressRouted` / `CqlIngressFallbacks` — this
+  is what the I5 sibling does (`ShardInboundRouter` registers under `MessagingMetrics.TYPE_NAME`), so design
+  §10's "exposed like I5's" already implied group-reuse. Smaller than adding to the core registry, no
+  `JmxVirtualTableMetricsTest` impact. **Fix is uncommitted** in `transport/CqlShardRouter.java` (3 lines +
+  1 import) alongside the Phase-2 build. Lesson recorded.
+- **(a) Route fires on the native path — DECISIVE.** `CqlIngressRouted` counter climbed 0 → 8,384,242 over
+  a 43 s window ≈ 195k/s ≈ **100% of delivered writes**; `CqlIngressFallbacks` moved only +37 (driver
+  control/reads). ecs KeyValue = prepared `INSERT INTO keyvalue (key,value) VALUES (?,?)`, single-column PK
+  bound at index 0 — exactly the router's routable shape; its `SELECT` reads are non-`ModificationStatement`
+  so they correctly fall back.
+- **(b) Writes read back correct.** cqlsh sample of routed rows: well-formed keys (`001.6.862229`) + values
+  (100–200-char text per the ecs FieldGenerator); COUNT=339,650 (< write count because ecs recycles keys —
+  no loss). Unprepared cqlsh writes coexist correctly on the NTR path.
+- **(c) SharedPool switch share dropped 43.5% → 0.0% (hop A DELETED).** Reproduced the exact baseline metric
+  (`perf sched:sched_switch` waker⇒wakee matrix, "switches touching SharedPool"; my parser reproduces the
+  baseline's 43.5% from `switchmatrix4.txt` before applying it). Routing-ON: **touching SharedPool = 0.0%**
+  (NTR pool completely bypassed; `tpstats` NTR-completed 181 vs 19.6M flag-off). Cross-confirmed by
+  `seam_run.sh` wakeup rollup: **hopA epoll→SharedPool 0.0%, hopB SharedPool→Shard 0.0%**, hopC (flush,
+  structural) 10.4% — the new pattern is `epoll⇒Shard-N` (hop 1) + `Shard-N⇒epoll` (hop 2), the design's
+  2-hop model exactly. cs/op 1.69 → **1.154** (cs/s 361k → 223k).
+- **(d) Flag-off regression-clean (same jar, flag commented).** `Routed`=0 (router inert), touching
+  SharedPool back to **45.0%**, NTR-completed 19.6M, delivered 216k, CPU 74.4%, cs/op 1.461, shards
+  Blocked=0. Reverts to the baseline path exactly.
+- **(e) Shards NOT saturated (the bounded risk did not bite).** Routing-ON: shard switch share rose
+  40.9%→50.7% (coordinate folded on, as predicted) but all-time Blocked=0, ~74% CPU (26% idle), no core
+  pegged, Pending transient (tens, no backlog).
+- **Tail-neutral-to-favorable.** Clean 0-error runs: client CO-corrected p99 flag-on **191 ≤ flag-off 234**
+  (same units); client steady rate ~161k both. Honest caveat: hand-aligned server tablestats showed 193k
+  (on) vs 216k (off) — comparable within window-boundary noise; a definitive matched-throughput A/B (to
+  quantify any small shard-serialization throughput cost) needs a saturation sweep, beyond the Phase-3
+  mechanism gate. One flag-on window (`run_seam2`) hit 855k client CO drops (over-offer variance, not a
+  Cassandra fault) — its seam share is throughput-independent so hopA=0 still holds.
+- **Same-jar A/B (the cleanest comparison, ~200k offered, ~74% CPU):**
+  | metric | flag-OFF | flag-ON |
+  |---|---|---|
+  | Routed delta | 0 | 8.38M (~100% of writes) |
+  | SharedPool switch share | 45.0% | **0.0%** |
+  | Shard switch share | 39.6% | 50.7% |
+  | cs/op | 1.461 | **1.154** |
+  | client p99 (CO-corr) | 234 | **191** |
+  | shard Blocked | 0 | 0 |
+- **Rig end state:** fixed jar (sha `bf5e4356`) deployed at `/root/repos/fork/cassandra-tpc-i1/build/…jar`
+  (baseline preserved `.jar.pre-cql-ingress` = sha `19e44ac9`); both flags live in
+  `/data/tpc-poc/conf/jvm-server.options`; node UP routing-ON, serves cleanly. Capture script
+  `/root/seam_switch.sh` (new) + `/root/rcnt.sh` (counter reader); raw artifacts in `/root/results_seam/`
+  (`switchmatrix_ssr1`/`off1`, `wakematrix_ssr_wake`, `mpstat_*`, `tpstats_*`).
+- **NEXT (Phase-3 hardening, not gating):** commit the metrics fix + Phase-2 build; composite-PK routing;
+  §6 `hasQueueCapacity` shard-inbox term; if a throughput number is wanted, a matched-saturation A/B sweep.
+
+
+## Session 2026-07-13 — crux settled, design doc written, Fable critique in flight
+
+- **Crux SETTLED (verified on branch), and it overturns the increment's premise.** findings.md counted
+  2 hops by conflating the netty loop with the NTR pool. Verified: coordinate runs on `requestExecutor`
+  (a separate NTR pool, `Dispatcher.java:143`/`:663`), so today's single-node routed write is **3 hops**
+  (loop→NTR→shard→loop). **Server-side routing ON the netty loop — via cheap prepared-`ExecuteMessage`
+  key extraction (`getPartitionKeyBindVariableIndexes`, `CQLStatement.java:49`) — deletes the loop→NTR
+  hop (3→2), no client protocol change.** "Pure relocation" is only the route-after-parse+bind variant.
+  The shard-aware protocol is decoupled/later: under kept-Netty (design-target §3.2) per-shard ports buy
+  affinity, not fewer hops; 0-hop needs shard socket ownership (PoC rejects). Verdict recorded in
+  findings.md "CRUX VERDICT" section.
+- **User direction (2026-07-13):** frame = **build server-side, protocol later** (design doc's headline
+  recommendation).
+- **Design doc written:** `design-cql-ingress-routing.md` — corrected hop model (§1), route point in
+  `Dispatcher.dispatch` (§2), ingress-throw-safe key extraction (§3), allowlist reusing design-target §5
+  (§4), coordinate-on-shard non-blocking via the flip + owner-inline apply (§5), backpressure bypass (§6),
+  I5 mechanism reuse (§7), why the protocol is decoupled (§8), Scylla map (§9), build sketch (§10),
+  validation (§11), risk register for Fable (§12).
+- **Fable adversarial critique DONE — verdict PROCEED-WITH-CHANGES.** Confirmed the crux + 3→2 mechanism
+  against source; found 6 real defects (all verified by me at source before folding):
+  1. **Owner-inline apply bypass does NOT exist in `performLocally`** (`StorageProxy.java:2399-2410` is
+     unconditional; bypass exists only at `db/MutationVerbHandler.java:99`). It's a BUILD ITEM, not reuse.
+  2. **Predicate was apply-scoped, missing coordinate-time blockers** — triggers (`TriggerExecutor` inline
+     `:1310/1358`), partition denylist (sync distributed read on miss), transient-replication await
+     (`maybeTryAdditionalReplicas`→`writeResult.await` `AbstractWriteResponseHandler.java:521`), custom
+     QueryHandler, named-values `OptionsWithNames`. Added §4 part B (coordinate-hazard list).
+  3. **Loop-side `getPrepared` can run a synchronous system-table write** (Caffeine `ImmediateExecutor`
+     + removalListener → `removePreparedStatement`, `QueryProcessor.java:144-169`). Use `asMap().get()`.
+  4. cs/op arithmetic is hops≠context-switches; "~1.4" was a guess → §11 gates on seam-attributed evidence.
+  5. Backpressure hole real (`hasQueueCapacity` reads only NTR queue) → §6 specifies the fix.
+  6. My §8 over-claimed 0-hop unreachable → shard-as-EventLoop reaches it with Netty kept (strengthens
+     "protocol later"). Corrected §8/§9.
+  All 6 folded into `design-cql-ingress-routing.md` (marked ⟵FABLE). Nice-to-haves noted (short[] cache,
+  full-write-plan replica check, tpstats-goes-dark observability, in-JVM-dtest vacuousness).
+- **Gate decision (user, 2026-07-13): MEASURE FIRST, then build.** Pre-build seam attribution run on the
+  rig (off-box ccx43 loadgen, provisioned + torn down per `agent-common/rig/cloud.md`).
+- **MEASURE-FIRST DONE — GREEN-LIGHT** (`measure-seam-attribution.md` §RESULTS). `perf sched:sched_switch`
+  at 214k delivered / 74.2% CPU / cs/op≈1.69: the NTR/coordinate pool (`SharedPool-Work`) touches **43.5%
+  of all context switches (0.735/op)**. CQL routing bypasses it (coordinate folds onto the shard's
+  already-scheduled apply run). Est. net saving ~0.35–0.7 cs/op (~20–40%) — well above the bar. Bounded
+  risk (Phase-3): shard CPU rises as coordinate folds on. **The loop→NTR hop is where the cost lives.**
+  Method correction learned: coordinate on `SharedPool` cross-wakes shards on other cores, so the pool's
+  cost shows as its OWN core scheduling (43.5%), not as `SharedPool→Shard` switch pairs. Also: the
+  `hcloud`-unauthed false-blocker → lesson in `tasks/lessons.md` + [[feedback_check_runbook_before_blocker]].
+- **Gate PASSED (user, 2026-07-13): "Build Phase 2 now."**
+- **PHASE 2 BUILT + VERIFIED (2026-07-13).** 6 changes on `shard-dispatch-overhead`:
+  1. `CassandraRelevantProperties.CQL_INGRESS_ROUTING` flag (default off; alphabetical-order gotcha hit +
+     fixed — enum constants must sort by NAME).
+  2. `transport/CqlShardRouter.java` (new) — loop-side route: ingress-throw-safe (`catch(Throwable)`),
+     policy-neutral prepared lookup, single-column-PK extraction, coordinate-hazard predicate, shardForKey.
+  3. `Dispatcher.dispatch()` — route-or-NTR branch guarded by `CqlShardRouter.ENABLED` (flag-off identical).
+  4. `StorageProxy.performLocally` — owner-inline apply bypass (collapses hop B; mirrors MutationVerbHandler:99).
+  5. `QueryProcessor.getPreparedNoTouch` (asMap — no eviction write on the loop).
+  6. `MutationShardRouting.shardForKey(metadata, key)` (loop-side shard compute).
+  **Key design realization:** `performLocally` already re-decides the apply shard authoritatively via
+  `MutationShardRouting.route(mutation)`, so the loop predicate only needs to catch COORDINATE-time
+  hazards (LWT/counter/triggers/denylist/transient); apply hazards fall to performLocally.
+  **Verified:** `ant build` SUCCESSFUL; `MutationShardRoutingTest` 9/9 (2 new shardForKey tests);
+  `ShardRoutedMutationApplyTest` 1/1 (regression-clean). NOT committed (awaiting user).
+- **NEXT — Phase 3 (rig validation):** deploy flag-on jar, drive prepared writes on the real native path
+  (in-JVM can't — i5-findings:40), confirm routeShard fires (CqlShardRouting.Routed counter > 0) + writes
+  correct + owner-inline collapses hop B (re-run the seam attribution → SharedPool switches should drop) +
+  flag-off regression-clean + shard-CPU headroom (the bounded risk). Skeleton gaps to harden: composite-PK
+  routing, §6 `hasQueueCapacity` shard-inbox term.
+
 ## Start-of-context handoff (2026-07-13) — design not started
 
 This increment was spun up when `shard-dispatch-overhead` concluded that single-node CPU steps 1-3

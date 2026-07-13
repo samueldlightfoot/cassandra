@@ -58,6 +58,33 @@ without the shard-aware client protocol, or is the protocol the actual prerequis
 pressure-test whether to (a) build server-side routing now (measure the affinity/inline-apply win),
 (b) go straight for the shard-aware protocol, or (c) both, and in what order.
 
+## CRUX VERDICT (settled 2026-07-13, verified on branch) — the premise above was wrong
+
+The framing above (and design-target §0) undercounted the hops: it treated coordinate as running on
+"the NT thread." It does not. `Dispatcher.dispatch()` runs on the netty loop and hands off to
+`requestExecutor` — a **separate** NTR pool (`Dispatcher.java:143`; `processRequest` is "not expected to
+execute on the netty event loop", `:663`). The flip stopped that thread parking; the loop→NTR handoff is
+still a real hop. **Today's single-node routed write is 3 hops (loop→NTR→shard→loop), not 2.**
+
+Consequently **server-side CQL routing DOES delete a hop single-node** — the loop→NTR hop — **when routed
+on the netty loop via cheap prepared-`ExecuteMessage` key extraction** (the token IS knowable on the loop
+from `getPartitionKeyBindVariableIndexes()`, `CQLStatement.java:49`, shipped to drivers already). 3→2
+hops, no client protocol change. "Pure relocation" is true only for the *route-after-parse+bind-on-NTR*
+variant, which nobody should build. The shard-aware protocol is **decoupled and later**: under kept-Netty
+(design-target §3.2) per-shard ports buy affinity, not fewer hops; true 0-hop needs shard socket
+ownership, which the PoC rejects. **User direction 2026-07-13: build server-side, protocol later.**
+Full analysis + mechanism: `design-cql-ingress-routing.md`. Fable critique: PROCEED-WITH-CHANGES (6
+source-verified fixes folded).
+
+## MEASURED confirmation (2026-07-13, off-box rig, GREEN-LIGHT) — `measure-seam-attribution.md`
+
+Pre-build seam attribution (`perf sched:sched_switch`, 214k delivered write-only, 74.2% CPU): the
+NTR/coordinate pool (`SharedPool-Work`) is involved in **43.5% of all context switches (0.735/op)** of
+cs/op ≈ 1.69. CQL routing bypasses that pool for routed writes (coordinate folds onto the shard's
+already-scheduled apply run; switches-into-Shard stay ~0.383/op). Estimated net saving ~0.35–0.7 cs/op
+(~20–40%) — far above the ≳0.4–0.5 green-light bar. Bounded risk (Phase-3 gate): folding coordinate onto
+shards raises shard CPU. **The hop IS where the cost lives → build justified.**
+
 ## Hazards / constraints (pinned — memories)
 
 - **Ingress-throw kills the connection** (`feedback_ingress_throw_kills_connection`): work pulled onto
