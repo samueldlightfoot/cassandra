@@ -85,6 +85,20 @@ public class CoordinatorWarnings
         STATE.processAndReset(CoordinatorWarnings::processWarnings);
     }
 
+    /** Take this thread's warnings so a completion running on another thread can finish them. Pair with
+     *  {@link #restore}. */
+    public static Object captureAndClear()
+    {
+        return STATE.captureAndClear();
+    }
+
+    /** Re-establish warnings captured by {@link #captureAndClear} on the current thread, before {@link #done}. */
+    @SuppressWarnings("unchecked")
+    public static void restore(Object captured)
+    {
+        STATE.restore((Map<ReadCommand, WarningsSnapshot>) captured);
+    }
+
     private static void processWarnings(Map<ReadCommand, WarningsSnapshot> map)
     {
         if (map == INIT || map.isEmpty())

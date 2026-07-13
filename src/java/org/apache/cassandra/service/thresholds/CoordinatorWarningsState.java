@@ -131,6 +131,32 @@ public class CoordinatorWarningsState<S>
     }
 
     /**
+     * Take this thread's state and clear it, so a request whose completion runs on a different thread
+     * can hand the accumulated warnings across the hop. Pair with {@link #restore} on the completing
+     * thread; leaves this thread balanced (as if {@code reset} had run).
+     *
+     * @return the captured state (may be null if {@code init} was never called)
+     */
+    public S captureAndClear()
+    {
+        S state = threadLocal.get();
+        threadLocal.remove();
+        return state;
+    }
+
+    /**
+     * Re-establish state captured by {@link #captureAndClear} on the current thread, ahead of
+     * {@link #processAndReset}. A null capture clears the thread.
+     */
+    public void restore(S state)
+    {
+        if (state == null)
+            threadLocal.remove();
+        else
+            threadLocal.set(state);
+    }
+
+    /**
      * Process accumulated state and reset.
      * Must be called at the end of a client request.
      * The reset will occur even if the processor throws an exception.

@@ -34,6 +34,9 @@ import org.apache.cassandra.transport.Message;
 import org.apache.cassandra.transport.ProtocolException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 import io.netty.buffer.ByteBuf;
 
@@ -131,6 +134,64 @@ public class QueryMessage extends Message.Request
                 logger.error("Unexpected error during query", e);
             return ErrorMessage.fromException(e);
         }
+    }
+
+    @Override
+    protected Future<Message.Response> executeAsync(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
+    {
+        CQLStatement statement = null;
+        try
+        {
+            if (options.getPageSize() == 0)
+                throw new ProtocolException("The page size cannot be 0");
+
+            if (traceRequest)
+                traceQuery(state);
+
+            long queryStartTime = currentTimeMillis();
+
+            QueryHandler queryHandler = ClientState.getCQLQueryHandler();
+            statement = queryHandler.parse(query, state, options);
+            CQLStatement parsed = statement;
+
+            AsyncPromise<Message.Response> promise = new AsyncPromise<>();
+            queryHandler.processAsync(parsed, state, options, getCustomPayload(), requestTime)
+                        .addCallback((response, failure) -> {
+                            if (failure != null)
+                            {
+                                if (failure instanceof Exception)
+                                    promise.trySuccess(onQueryFailure(parsed, state, (Exception) failure));
+                                else
+                                    promise.tryFailure(failure);
+                                return;
+                            }
+                            try
+                            {
+                                QueryEvents.instance.notifyQuerySuccess(parsed, query, options, state, queryStartTime, response);
+                                if (options.skipMetadata() && response instanceof ResultMessage.Rows)
+                                    ((ResultMessage.Rows) response).result.metadata.setSkipMetadata();
+                                promise.trySuccess(response);
+                            }
+                            catch (Exception e)
+                            {
+                                promise.trySuccess(onQueryFailure(parsed, state, e));
+                            }
+                        });
+            return promise;
+        }
+        catch (Exception e)
+        {
+            return ImmediateFuture.success(onQueryFailure(statement, state, e));
+        }
+    }
+
+    private Message.Response onQueryFailure(CQLStatement statement, QueryState state, Exception e)
+    {
+        QueryEvents.instance.notifyQueryFailure(statement, query, options, state, e);
+        JVMStabilityInspector.inspectThrowable(e);
+        if (!((e instanceof RequestValidationException) || (e instanceof RequestExecutionException)))
+            logger.error("Unexpected error during query", e);
+        return ErrorMessage.fromException(e);
     }
 
     private void traceQuery(QueryState state)

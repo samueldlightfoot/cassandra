@@ -21,6 +21,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -52,9 +54,11 @@ import org.apache.cassandra.net.RequestCallback;
 import org.apache.cassandra.service.writes.thresholds.CoordinatorWriteWarnings;
 import org.apache.cassandra.service.writes.thresholds.WriteWarningContext;
 import org.apache.cassandra.service.writes.thresholds.WriteWarningsSnapshot;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.transport.Dispatcher;
-import org.apache.cassandra.utils.concurrent.Condition;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
@@ -72,7 +76,6 @@ import static org.apache.cassandra.locator.Replicas.countInOurDc;
 import static org.apache.cassandra.schema.Schema.instance;
 import static org.apache.cassandra.service.StorageProxy.WritePerformer;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
-import static org.apache.cassandra.utils.concurrent.Condition.newOneTimeCondition;
 
 public abstract class AbstractWriteResponseHandler<T> implements RequestCallback<T>
 {
@@ -80,7 +83,10 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
 
     //Count down until all responses and expirations have occured before deciding whether the ideal CL was reached.
     private AtomicInteger responsesAndExpirations;
-    private final Condition condition = newOneTimeCondition();
+    // Completed once the write reaches a terminal state. A successful completion means "a decision was
+    // reached" (CL met or too many failures), NOT that the write succeeded — the typed verdict comes from
+    // checkOutcome(), so consumers must call it rather than treating isSuccess() as write-ok.
+    private final AsyncPromise<Void> writeResult = new AsyncPromise<>();
     protected final ReplicaPlan.ForWrite replicaPlan;
 
     protected final Runnable callback;
@@ -134,7 +140,7 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
         boolean signaled;
         try
         {
-            signaled = condition.await(timeoutNanos, NANOSECONDS);
+            signaled = writeResult.await(timeoutNanos, NANOSECONDS);
         }
         catch (InterruptedException e)
         {
@@ -144,6 +150,82 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
         if (!signaled)
             throwTimeout();
 
+        checkOutcome();
+    }
+
+    /**
+     * The write's terminal completion, for callers that consume the result asynchronously instead of
+     * parking in {@link #get()}. Completed by {@link #signal()}; a successful completion means the write
+     * reached a terminal state — run {@link #checkOutcome()} for the typed verdict.
+     */
+    public Future<Void> writeResult()
+    {
+        return writeResult;
+    }
+
+    /**
+     * The write's outcome as a future, for async consumers that must not park in {@link #get()}. It
+     * completes successfully once the write is terminal and {@link #computeVerdict()} passes, or fails
+     * with the typed write exception. A scheduled timer on the request's executor enforces the write
+     * deadline, failing the future with the same {@link WriteTimeoutException} {@code get()} would
+     * throw — {@code writeResult} itself is left untouched (never fails, no self-timeout), so the
+     * speculative-retry await and ideal-CL bookkeeping keyed off it are unaffected.
+     */
+    public Future<Void> outcome()
+    {
+        AsyncPromise<Void> outcome = new AsyncPromise<>();
+
+        ScheduledExecutorService scheduler = requestTime.timeoutScheduler() != null
+                                             ? requestTime.timeoutScheduler()
+                                             : ScheduledExecutors.scheduledFastTasks;
+        ScheduledFuture<?> timer = scheduler.schedule(() -> {
+            if (!outcome.isDone())
+            {
+                try { throwTimeout(); }
+                catch (WriteTimeoutException e) { outcome.tryFailure(e); }
+            }
+        }, Math.max(0, currentTimeoutNanos()), NANOSECONDS);
+
+        writeResult.addListener(f -> {
+            timer.cancel(false);
+            if (outcome.isDone())
+                return;
+            try
+            {
+                computeVerdict();
+                outcome.trySuccess(null);
+            }
+            catch (Throwable t)
+            {
+                outcome.tryFailure(t);
+            }
+        });
+        return outcome;
+    }
+
+    // Verdict for a write that has reached a terminal state: throws the typed failure, or applies the
+    // success-side warning update. Must run on the consuming thread — the warning path writes the
+    // ClientWarn thread-local, so an off-thread async consumer has to restore it before calling this.
+    private void checkOutcome() throws WriteTimeoutException, WriteFailureException, RetryOnDifferentSystemException
+    {
+        computeVerdict();
+
+        if (replicaPlan.stillAppliesTo(ClusterMetadata.current()))
+        {
+            if (warningContext != null)
+            {
+                WriteWarningsSnapshot snapshot = warningContext.snapshot();
+                if (!snapshot.isEmpty() && hintOnFailure != null)
+                    CoordinatorWriteWarnings.update(hintOnFailure.get(), snapshot);
+            }
+        }
+    }
+
+    // The typed verdict for a terminal write: throws WriteTimeout/WriteFailure/RetryOnDifferentSystem/
+    // CoordinatorBehind on failure, returns cleanly on success. Pure — no thread-local side effects —
+    // so it is safe to run on the completing shard thread when the result is consumed via writeResult().
+    void computeVerdict() throws WriteTimeoutException, WriteFailureException, RetryOnDifferentSystemException
+    {
         int candidateReplicaCount = candidateReplicaCount();
         if (blockFor() + failures > candidateReplicaCount)
         {
@@ -180,16 +262,6 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
             }
 
             throw new WriteFailureException(replicaPlan.consistencyLevel(), ackCount(), blockFor(), writeType, getFailureReasonByEndpointMap());
-        }
-
-        if (replicaPlan.stillAppliesTo(ClusterMetadata.current()))
-        {
-            if (warningContext != null)
-            {
-                WriteWarningsSnapshot snapshot = warningContext.snapshot();
-                if (!snapshot.isEmpty() && hintOnFailure != null)
-                    CoordinatorWriteWarnings.update(hintOnFailure.get(), snapshot);
-            }
         }
     }
 
@@ -356,7 +428,7 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
             }
         }
 
-        condition.signalAll();
+        writeResult.trySuccess(null);
         if (callback != null)
             callback.run();
     }
@@ -415,9 +487,9 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
         int decrementedValue = responsesAndExpirations.decrementAndGet();
         if (decrementedValue == 0)
         {
-            // The condition being signaled is a valid proxy for the CL being achieved
+            // A successful completion is a valid proxy for the CL being achieved
             // Only mark it as failed if the requested CL was achieved.
-            if (!condition.isSignalled() && requestedCLAchieved)
+            if (!writeResult.isSuccess() && requestedCLAchieved)
             {
                 replicaPlan.keyspace().metric.writeFailedIdealCL.inc();
             }
@@ -446,7 +518,7 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
 
         try
         {
-            if (!condition.await(timeout, MICROSECONDS))
+            if (!writeResult.await(timeout, MICROSECONDS))
             {
                 for (ColumnFamilyStore cf : cfs)
                     cf.metric.additionalWrites.inc();

@@ -28,6 +28,8 @@ import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.MD5Digest;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 public interface QueryHandler
 {
@@ -56,6 +58,35 @@ public interface QueryHandler
                                BatchQueryOptions options,
                                Map<String, ByteBuffer> customPayload,
                                Dispatcher.RequestTime requestTime) throws RequestExecutionException, RequestValidationException;
+
+    // Asynchronous variants: default to running the synchronous form and wrapping the result. Handlers with
+    // a non-blocking execution path override these; unconverted callers keep using the synchronous methods.
+    default Future<ResultMessage> processAsync(CQLStatement statement,
+                                               QueryState state,
+                                               QueryOptions options,
+                                               Map<String, ByteBuffer> customPayload,
+                                               Dispatcher.RequestTime requestTime) throws RequestExecutionException, RequestValidationException
+    {
+        return ImmediateFuture.success(process(statement, state, options, customPayload, requestTime));
+    }
+
+    default Future<ResultMessage> processPreparedAsync(CQLStatement statement,
+                                                       QueryState state,
+                                                       QueryOptions options,
+                                                       Map<String, ByteBuffer> customPayload,
+                                                       Dispatcher.RequestTime requestTime) throws RequestExecutionException, RequestValidationException
+    {
+        return ImmediateFuture.success(processPrepared(statement, state, options, customPayload, requestTime));
+    }
+
+    default Future<ResultMessage> processBatchAsync(BatchStatement statement,
+                                                    QueryState state,
+                                                    BatchQueryOptions options,
+                                                    Map<String, ByteBuffer> customPayload,
+                                                    Dispatcher.RequestTime requestTime) throws RequestExecutionException, RequestValidationException
+    {
+        return ImmediateFuture.success(processBatch(statement, state, options, customPayload, requestTime));
+    }
 
     public static class Prepared
     {

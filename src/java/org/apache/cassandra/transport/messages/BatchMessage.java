@@ -44,6 +44,9 @@ import org.apache.cassandra.transport.ProtocolException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MD5Digest;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 import io.netty.buffer.ByteBuf;
 
@@ -238,6 +241,103 @@ public class BatchMessage extends Message.Request
             JVMStabilityInspector.inspectThrowable(e);
             return ErrorMessage.fromException(e);
         }
+    }
+
+    @Override
+    protected Future<Message.Response> executeAsync(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
+    {
+        List<QueryHandler.Prepared> prepared = null;
+        try
+        {
+            if (traceRequest)
+                traceQuery(state);
+
+            QueryHandler handler = ClientState.getCQLQueryHandler();
+            prepared = new ArrayList<>(queryOrIdList.size());
+            for (int i = 0; i < queryOrIdList.size(); i++)
+            {
+                Object query = queryOrIdList.get(i);
+                QueryHandler.Prepared p;
+                if (query instanceof String)
+                {
+                    p = QueryProcessor.parseAndPrepare((String) query,
+                                                       state.getClientState().cloneWithKeyspaceIfSet(options.getKeyspace()),
+                                                       false, false);
+                }
+                else
+                {
+                    p = handler.getPrepared((MD5Digest) query);
+                    if (null == p)
+                        throw new PreparedQueryNotFoundException((MD5Digest) query);
+                }
+
+                byte[][] queryValues = values.get(i);
+                if (queryValues.length != p.statement.getBindVariables().size())
+                    throw new InvalidRequestException(String.format("There were %d markers(?) in CQL but %d bound variables",
+                                                                    p.statement.getBindVariables().size(),
+                                                                    queryValues.length));
+
+                prepared.add(p);
+            }
+
+            BatchQueryOptions batchOptions = BatchQueryOptions.withPerStatementVariables(options, values, queryOrIdList);
+            List<ModificationStatement> statements = new ArrayList<>(prepared.size());
+            List<String> queries = QueryEvents.instance.hasListeners() ? new ArrayList<>(prepared.size()) : null;
+            for (int i = 0; i < prepared.size(); i++)
+            {
+                CQLStatement statement = prepared.get(i).statement;
+                if (queries != null)
+                    queries.add(prepared.get(i).rawCQLStatement);
+                batchOptions.prepareStatement(i, statement.getBindVariables());
+
+                if (!(statement instanceof ModificationStatement))
+                    throw new InvalidRequestException("Invalid statement in batch: only UPDATE, INSERT and DELETE statements are allowed.");
+
+                statements.add((ModificationStatement) statement);
+            }
+
+            // Note: It's ok at this point to pass a bogus value for the number of bound terms in the BatchState ctor
+            // (and no value would be really correct, so we prefer passing a clearly wrong one).
+            BatchStatement batch = new BatchStatement(batchType, VariableSpecifications.empty(), statements, Attributes.none());
+
+            long queryTime = currentTimeMillis();
+            List<QueryHandler.Prepared> preparedForEvent = prepared;
+            List<String> queriesForEvent = queries;
+            AsyncPromise<Message.Response> promise = new AsyncPromise<>();
+            handler.processBatchAsync(batch, state, batchOptions, getCustomPayload(), requestTime)
+                   .addCallback((response, failure) -> {
+                       if (failure != null)
+                       {
+                           if (failure instanceof Exception)
+                               promise.trySuccess(onBatchFailure(preparedForEvent, state, (Exception) failure));
+                           else
+                               promise.tryFailure(failure);
+                           return;
+                       }
+                       try
+                       {
+                           if (queriesForEvent != null)
+                               QueryEvents.instance.notifyBatchSuccess(batchType, statements, queriesForEvent, values, options, state, queryTime, response);
+                           promise.trySuccess(response);
+                       }
+                       catch (Exception e)
+                       {
+                           promise.trySuccess(onBatchFailure(preparedForEvent, state, e));
+                       }
+                   });
+            return promise;
+        }
+        catch (Exception e)
+        {
+            return ImmediateFuture.success(onBatchFailure(prepared, state, e));
+        }
+    }
+
+    private Message.Response onBatchFailure(List<QueryHandler.Prepared> prepared, QueryState state, Exception e)
+    {
+        QueryEvents.instance.notifyBatchFailure(prepared, batchType, queryOrIdList, values, options, state, e);
+        JVMStabilityInspector.inspectThrowable(e);
+        return ErrorMessage.fromException(e);
     }
 
     private void traceQuery(QueryState state)

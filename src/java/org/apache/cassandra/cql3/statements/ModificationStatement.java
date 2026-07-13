@@ -136,6 +136,8 @@ import org.apache.cassandra.triggers.TriggerExecutor;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MD5Digest;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkNull;
@@ -697,6 +699,55 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
         }
 
         return null;
+    }
+
+    @Override
+    public Future<ResultMessage> executeAsync(QueryState queryState, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        if (options.getConsistency() == null)
+            throw new InvalidRequestException("Invalid empty consistency level");
+
+        if (Guardrails.writeConsistencyLevels.enabled(queryState.getClientState())) // to avoid EnumSet allocation
+            Guardrails.writeConsistencyLevels.guard(EnumSet.of(options.getConsistency(), options.getSerialConsistency()),
+                                                    queryState.getClientState());
+
+        // LWTs keep the synchronous CAS path; only the plain write path is threaded through the async write.
+        return hasConditions()
+             ? ImmediateFuture.success(executeWithCondition(queryState, options, requestTime))
+             : executeWithoutConditionAsync(queryState, options, requestTime);
+    }
+
+    private Future<ResultMessage> executeWithoutConditionAsync(QueryState queryState, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        if (isVirtual())
+            return ImmediateFuture.success(executeInternalWithoutCondition(queryState, options, requestTime));
+
+        ConsistencyLevel cl = options.getConsistency();
+        if (isCounter())
+            cl.validateCounterForWrite(metadata());
+        else
+            cl.validateForWrite();
+
+        validateDiskUsage(options, queryState.getClientState());
+        validateTimestamp(queryState, options);
+
+        List<? extends IMutation> mutations =
+            getMutations(queryState.getClientState(),
+                         options,
+                         false,
+                         options.getTimestamp(queryState),
+                         options.getNowInSeconds(queryState),
+                         requestTime
+            );
+        if (mutations.isEmpty())
+            return ImmediateFuture.success(null);
+
+        return StorageProxy.mutateWithTriggersAsync(mutations, cl, false, requestTime, attrs.isTimestampSet() ? PreserveTimestamp.yes : PreserveTimestamp.no)
+                           .map(ignored -> {
+                               if (!SchemaConstants.isSystemKeyspace(metadata.keyspace))
+                                   ClientRequestSizeMetrics.recordRowAndColumnCountMetrics(mutations);
+                               return null;
+                           });
     }
 
     private ResultMessage executeWithCondition(QueryState queryState, QueryOptions options, Dispatcher.RequestTime requestTime)

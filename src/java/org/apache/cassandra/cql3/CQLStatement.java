@@ -28,6 +28,8 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 public interface CQLStatement
 {
@@ -93,6 +95,16 @@ public interface CQLStatement
      * @param requestTime request enqueue / and start times;
      */
     ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime);
+
+    /**
+     * Asynchronous variant of {@link #execute}: returns a future carrying the same result (or null when
+     * there is no result). Defaults to running {@link #execute} synchronously and wrapping the result;
+     * statements with a non-blocking execution path override this.
+     */
+    default Future<ResultMessage> executeAsync(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        return ImmediateFuture.success(execute(state, options, requestTime));
+    }
 
     /**
      * Variant of execute used for internal query against the system tables, and thus only query the local node.

@@ -104,6 +104,7 @@ import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.FutureCombiner;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.ENABLE_NODELOCAL_QUERIES;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
@@ -314,6 +315,27 @@ public class QueryProcessor implements QueryHandler
         return result == null ? new ResultMessage.Void() : result;
     }
 
+    public Future<ResultMessage> processStatementAsync(CQLStatement statement, QueryState queryState, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        try
+        {
+            logger.trace("Process {} @CL.{}", statement, options.getConsistency());
+            ClientState clientState = queryState.getClientState();
+            statement.authorize(clientState);
+            statement.validate(clientState);
+
+            Future<ResultMessage> result = options.getConsistency() == ConsistencyLevel.NODE_LOCAL
+                                         ? ImmediateFuture.success(processNodeLocalStatement(statement, queryState, options))
+                                         : statement.executeAsync(queryState, options, requestTime);
+
+            return result.map(r -> r == null ? new ResultMessage.Void() : r);
+        }
+        catch (Throwable t)
+        {
+            return ImmediateFuture.failure(t);
+        }
+    }
+
     private ResultMessage processNodeLocalStatement(CQLStatement statement, QueryState queryState, QueryOptions options)
     {
         if (!ENABLE_NODELOCAL_QUERIES.getBoolean())
@@ -405,6 +427,35 @@ public class QueryProcessor implements QueryHandler
             metrics.regularStatementsExecuted.inc();
 
         return processStatement(prepared, queryState, options, requestTime);
+    }
+
+    @Override
+    public Future<ResultMessage> processAsync(CQLStatement statement,
+                                              QueryState state,
+                                              QueryOptions options,
+                                              Map<String, ByteBuffer> customPayload,
+                                              Dispatcher.RequestTime requestTime)
+    {
+        return processAsync(statement, state, options, requestTime);
+    }
+
+    public Future<ResultMessage> processAsync(CQLStatement prepared, QueryState queryState, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        try
+        {
+            options.prepare(prepared.getBindVariables());
+            if (prepared.getBindVariables().size() != options.getValues().size())
+                throw new InvalidRequestException("Invalid amount of bind variables");
+
+            if (!queryState.getClientState().isInternal)
+                metrics.regularStatementsExecuted.inc();
+        }
+        catch (Throwable t)
+        {
+            return ImmediateFuture.failure(t);
+        }
+
+        return processStatementAsync(prepared, queryState, options, requestTime);
     }
 
     public static CQLStatement parseStatement(String queryStr, ClientState clientState) throws RequestValidationException
@@ -925,6 +976,45 @@ public class QueryProcessor implements QueryHandler
 
         metrics.preparedStatementsExecuted.inc();
         return processStatement(statement, queryState, options, requestTime);
+    }
+
+    @Override
+    public Future<ResultMessage> processPreparedAsync(CQLStatement statement,
+                                                      QueryState state,
+                                                      QueryOptions options,
+                                                      Map<String, ByteBuffer> customPayload,
+                                                      Dispatcher.RequestTime requestTime)
+    {
+        return processPreparedAsync(statement, state, options, requestTime);
+    }
+
+    public Future<ResultMessage> processPreparedAsync(CQLStatement statement, QueryState queryState, QueryOptions options, Dispatcher.RequestTime requestTime)
+    {
+        try
+        {
+            int variablesSize = options.getValuesSize();
+            // Check to see if there are any bound variables to verify
+            if (!(variablesSize == 0 && statement.getBindVariables().isEmpty()))
+            {
+                if (variablesSize != statement.getBindVariables().size())
+                    throw new InvalidRequestException(String.format("there were %d markers(?) in CQL but %d bound variables",
+                                                                    statement.getBindVariables().size(),
+                                                                    variablesSize));
+
+                // at this point there is a match in count between markers and variables that is non-zero
+                if (logger.isTraceEnabled())
+                    for (int i = 0; i < variablesSize; i++)
+                        logger.trace("[{}] '{}'", i + 1, options.getValues().get(i));
+            }
+
+            metrics.preparedStatementsExecuted.inc();
+        }
+        catch (Throwable t)
+        {
+            return ImmediateFuture.failure(t);
+        }
+
+        return processStatementAsync(statement, queryState, options, requestTime);
     }
 
     public ResultMessage processBatch(BatchStatement statement,

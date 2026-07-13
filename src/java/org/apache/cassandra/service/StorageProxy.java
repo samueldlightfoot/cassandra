@@ -33,6 +33,8 @@ import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -61,6 +63,7 @@ import accord.primitives.Txn;
 import org.apache.cassandra.batchlog.Batch;
 import org.apache.cassandra.batchlog.BatchlogManager;
 import org.apache.cassandra.concurrent.DebuggableTask.RunnableDebuggableTask;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.AccordConfig;
@@ -191,8 +194,10 @@ import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
 import org.apache.cassandra.utils.concurrent.CountDownLatch;
 import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 import static accord.primitives.Txn.Kind.Read;
@@ -1058,6 +1063,58 @@ public class StorageProxy implements StorageProxyMBean
     }
 
     /**
+     * Asynchronous form of {@link #mutate}: dispatches the writes (and any speculative retries) and
+     * returns a future that completes once every replica handler reaches a terminal state, failing
+     * with the first typed write exception (WriteTimeout/WriteFailure/Unavailable/…). Fail-slow, to
+     * match {@code mutate}'s collect-all semantics.
+     *
+     * Deliberately narrower than {@code mutate}: it applies none of the coordinator metrics/hint/
+     * latency bookkeeping (the caller does), and the returned future does NOT self-complete on write
+     * timeout — a scheduled timer is added when this path is wired to the coordinator — so only a
+     * caller that enforces its own timeout may await it directly.
+     */
+    public static Future<Void> mutateAsync(List<? extends IMutation> mutations, ConsistencyLevel consistencyLevel, Dispatcher.RequestTime requestTime)
+    {
+        Tracing.trace("Determining replicas for mutation");
+        final String localDataCenter = DatabaseDescriptor.getLocator().local().datacenter;
+        WriteType plainWriteType = mutations.size() <= 1 ? WriteType.SIMPLE : WriteType.UNLOGGED_BATCH;
+
+        AbstractWriteResponseHandler<IMutation>[] responseHandlers = new AbstractWriteResponseHandler[mutations.size()];
+        try
+        {
+            int j = 0;
+            for (IMutation mutation : mutations)
+            {
+                if (mutation instanceof CounterMutation)
+                    responseHandlers[j++] = mutateCounter((CounterMutation) mutation, localDataCenter, requestTime);
+                else
+                    responseHandlers[j++] = performWrite(mutation, consistencyLevel, localDataCenter, standardWritePerformer, null, plainWriteType, requestTime);
+            }
+
+            // upgrade to full quorum any failed cheap quorums
+            for (int i = 0; i < mutations.size(); ++i)
+            {
+                if (!(mutations.get(i) instanceof CounterMutation)) // at the moment, only non-counter writes support cheap quorums
+                    responseHandlers[i].maybeTryAdditionalReplicas(mutations.get(i), standardWritePerformer, localDataCenter);
+            }
+        }
+        catch (UnavailableException | OverloadedException e)
+        {
+            return ImmediateFuture.failure(e);
+        }
+
+        // Await each handler's outcome in index order, mirroring mutate()'s sequential
+        // responseHandler.get() loop: the first (index-order) failure short-circuits and fails the
+        // returned future. andThenAsync runs each continuation inline on the completing thread
+        // (Shard-N / messaging / timer) — NOT a global combiner thread, which would funnel every
+        // write onto one JVM-wide executor.
+        Future<Void> chain = ImmediateFuture.success(null);
+        for (AbstractWriteResponseHandler<IMutation> responseHandler : responseHandlers)
+            chain = chain.andThenAsync(ignored -> responseHandler.outcome());
+        return chain;
+    }
+
+    /**
      * Hint all the mutations (except counters, which can't be safely retried).  This means
      * we'll re-hint any successful ones; doesn't seem worth it to track individual success
      * just for this unusual case.
@@ -1266,6 +1323,69 @@ public class StorageProxy implements StorageProxyMBean
             dispatchMutationsWithRetryOnDifferentSystem(mutations, consistencyLevel, requestTime, preserveTimestamps);
     }
 
+    /**
+     * Asynchronous twin of {@link #mutateWithTriggers}: the non-atomic path returns
+     * {@link #dispatchMutationsWithRetryOnDifferentSystemAsync}'s future. The atomic/MV/trigger path is not
+     * yet async, so it runs synchronously and its result is wrapped. Any synchronous failure (denylist,
+     * trigger execution, atomic write) is delivered through the returned future.
+     */
+    @SuppressWarnings("unchecked")
+    public static Future<Void> mutateWithTriggersAsync(List<? extends IMutation> mutations,
+                                                       ConsistencyLevel consistencyLevel,
+                                                       boolean mutateAtomically,
+                                                       Dispatcher.RequestTime requestTime,
+                                                       PreserveTimestamp preserveTimestamps)
+    {
+        try
+        {
+            if (DatabaseDescriptor.getPartitionDenylistEnabled() && DatabaseDescriptor.getDenylistWritesEnabled())
+            {
+                for (final IMutation mutation : mutations)
+                {
+                    for (final TableId tid : mutation.getTableIds())
+                    {
+                        if (!partitionDenylist.isKeyPermitted(tid, mutation.key().getKey()))
+                        {
+                            denylistMetrics.incrementWritesRejected();
+                            final TableMetadata tmd = Schema.instance.getTableMetadata(tid);
+                            throw new InvalidRequestException(String.format("Unable to write to denylisted partition [0x%s] in %s/%s",
+                                                                            mutation.key().toString(), tmd.keyspace, tmd.name));
+                        }
+                    }
+                }
+            }
+
+            List<Mutation> augmented = TriggerExecutor.instance.execute(mutations);
+
+            String keyspaceName = mutations.iterator().next().getKeyspaceName();
+            boolean updatesView = Keyspace.open(keyspaceName)
+                                  .viewManager
+                                  .updatesAffectView(mutations, true);
+
+            long size = IMutation.dataSize(augmented != null ? augmented : mutations);
+            writeMetrics.mutationSize.update(size);
+            writeMetricsForLevel(consistencyLevel).mutationSize.update(size);
+            if (augmented != null || mutateAtomically || updatesView)
+            {
+                mutateAtomically(augmented != null ? augmented : (List<Mutation>) mutations, consistencyLevel, updatesView, requestTime);
+                return ImmediateFuture.success(null);
+            }
+            if (consistencyLevel == ConsistencyLevel.ANY)
+            {
+                // CL.ANY hints and returns success on write timeout/failure (see mutate()); the async
+                // dispatch omits that swallow, so keep CL.ANY on the synchronous path. It parks the
+                // caller, but CL.ANY writes are rare and this preserves the availability guarantee.
+                dispatchMutationsWithRetryOnDifferentSystem(mutations, consistencyLevel, requestTime, preserveTimestamps);
+                return ImmediateFuture.success(null);
+            }
+            return dispatchMutationsWithRetryOnDifferentSystemAsync(mutations, consistencyLevel, requestTime, preserveTimestamps);
+        }
+        catch (Throwable t)
+        {
+            return ImmediateFuture.failure(t);
+        }
+    }
+
     public static void dispatchMutationsWithRetryOnDifferentSystem(List<? extends IMutation> mutations, ConsistencyLevel consistencyLevel, Dispatcher.RequestTime requestTime, PreserveTimestamp preserveTimestamps)
     {
         while (true)
@@ -1353,6 +1473,211 @@ public class StorageProxy implements StorageProxyMBean
                 throw t;
             }
             break;
+        }
+    }
+
+    /**
+     * Asynchronous twin of {@link #dispatchMutationsWithRetryOnDifferentSystem}: returns a future that
+     * completes once the write reaches a terminal state. The {@code while(true)} retry loop becomes async
+     * recursion, and the already-async Accord arm is composed via {@link IAccordResult#addCallback} rather
+     * than blocking on {@code awaitAndGet()}.
+     *
+     * Like {@link #mutateAsync}, it omits the {@code mutate()}-level bookkeeping (CL.ANY hint-swallow,
+     * timeout/unavailable/latency metrics) and does not self-complete on timeout. The scheduled timer added
+     * when this path is wired to the coordinator must bound the Accord arm too: {@code awaitAndGet()} forces
+     * a timeout at Accord's deadline, but {@code addCallback} only fires on real completion.
+     */
+    public static Future<Void> dispatchMutationsWithRetryOnDifferentSystemAsync(List<? extends IMutation> mutations, ConsistencyLevel consistencyLevel, Dispatcher.RequestTime requestTime, PreserveTimestamp preserveTimestamps)
+    {
+        RetryingMutationDispatch dispatch = new RetryingMutationDispatch(mutations, consistencyLevel, requestTime);
+        dispatch.attempt(preserveTimestamps);
+        return dispatch.result;
+    }
+
+    /**
+     * One async run of the mutation-dispatch retry loop, completing {@link #result} when the write
+     * terminates. Each retry recurses through {@link #attempt} from an arm's completion callback, so the
+     * loop unwinds the stack between iterations rather than spinning in place.
+     */
+    private static final class RetryingMutationDispatch
+    {
+        private final AsyncPromise<Void> result = new AsyncPromise<>();
+        private final List<? extends IMutation> mutations;
+        private final ConsistencyLevel consistencyLevel;
+        private final Dispatcher.RequestTime requestTime;
+        // Set once, the first time an Accord arm appears, so a lost coordination cannot hang the
+        // write forever (sync awaitAndGet() self-times-out at Accord's deadline; addCallback does not).
+        // Retries run one-at-a-time via completion callbacks, so a plain field is safe.
+        private boolean accordDeadlineArmed = false;
+
+        private RetryingMutationDispatch(List<? extends IMutation> mutations, ConsistencyLevel consistencyLevel, Dispatcher.RequestTime requestTime)
+        {
+            this.mutations = mutations;
+            this.consistencyLevel = consistencyLevel;
+            this.requestTime = requestTime;
+        }
+
+        @SuppressWarnings("unchecked")
+        private void attempt(PreserveTimestamp preserveTimestamps)
+        {
+            // A retry re-enters attempt() from an arm's callback; if the write already terminated
+            // (e.g. the Accord backstop fired), do not re-dispatch a completed request.
+            if (result.isDone())
+                return;
+
+            ClusterMetadata cm = ClusterMetadata.current();
+            try
+            {
+                SplitMutations<?> splitMutations = splitMutationsIntoAccordAndNormal(cm, (List<IMutation>) mutations);
+                List<? extends IMutation> accordMutations = splitMutations.accordMutations();
+                List<? extends IMutation> normalMutations = splitMutations.normalMutations();
+                if (!preserveTimestamps.preserve && normalMutations != null)
+                    preserveTimestamps = PreserveTimestamp.yes;
+                if (accordMutations != null && preserveTimestamps == PreserveTimestamp.mixedTimeSource)
+                    checkMixedTimeSourceHandling();
+                IAccordResult<TxnResult> accordResult = accordMutations != null ? mutateWithAccordAsync(cm, accordMutations, consistencyLevel, requestTime, preserveTimestamps) : null;
+                if (accordResult != null && !accordDeadlineArmed)
+                {
+                    accordDeadlineArmed = true;
+                    armAccordDeadline();
+                }
+                Tracing.trace("Split mutations into Accord {} and normal {}", accordMutations, normalMutations);
+
+                // A synchronous throw from the normal arm is retry-eligible in onNormalComplete, matching the
+                // sync loop's inner try around mutate(normalMutations); split/mixed-source/Accord-launch
+                // failures fall to the outer catch below, which does not retry.
+                Future<Void> normalFuture;
+                try
+                {
+                    normalFuture = normalMutations != null ? mutateAsync(normalMutations, consistencyLevel, requestTime)
+                                                           : ImmediateFuture.success(null);
+                }
+                catch (Throwable t)
+                {
+                    normalFuture = ImmediateFuture.failure(t);
+                }
+
+                boolean hadNormalMutations = normalMutations != null;
+                PreserveTimestamp pts = preserveTimestamps;
+                IAccordResult<TxnResult> accord = accordResult;
+                normalFuture.addListener(f -> onNormalComplete(accord, hadNormalMutations, pts, (Future<Void>) f));
+            }
+            catch (Throwable t)
+            {
+                Tracing.trace("{}", getStackTraceAsToString(t));
+                result.tryFailure(t);
+            }
+        }
+
+        // Normal arm resolves before the Accord arm is inspected, preserving the sync ordering
+        // (mutate(normal) then accordResult.awaitAndGet()); a normal-arm retry abandons the pending Accord
+        // result exactly as the sync loop's `continue` does.
+        private void onNormalComplete(IAccordResult<TxnResult> accordResult, boolean hadNormalMutations, PreserveTimestamp preserveTimestamps, Future<Void> normalFuture)
+        {
+            try
+            {
+                Throwable normalFailure = normalFuture.isSuccess() ? null : normalFuture.cause();
+
+                if (normalFailure instanceof RetryOnDifferentSystemException)
+                {
+                    writeMetrics.retryDifferentSystem.mark();
+                    writeMetricsForLevel(consistencyLevel).retryDifferentSystem.mark();
+                    logger.debug("Retrying mutations on different system because some mutations were misrouted according to Cassandra");
+                    Tracing.trace("Got {} from normal mutations, will retry", normalFailure);
+                    attempt(preserveTimestamps);
+                    return;
+                }
+                if (normalFailure instanceof CoordinatorBehindException)
+                {
+                    writeMetrics.retryCoordinatorBehind.mark();
+                    writeMetricsForLevel(consistencyLevel).retryCoordinatorBehind.mark();
+                    mutations.forEach(IMutation::clearCachedSerializationsForRetry);
+                    logger.debug("Retrying mutations now that coordinator has caught up to cluster metadata");
+                    Tracing.trace("Got {} from normal mutations, will retry", normalFailure);
+                    attempt(preserveTimestamps);
+                    return;
+                }
+
+                if (hadNormalMutations && normalFailure == null)
+                    Tracing.trace("Successfully wrote normal mutations");
+
+                if (accordResult == null)
+                {
+                    finish(normalFailure);
+                    return;
+                }
+
+                Throwable collectedFailure = normalFailure;
+                accordResult.addCallback((txnResult, accordFailure) -> onAccordComplete(collectedFailure, preserveTimestamps, txnResult, accordFailure));
+            }
+            catch (Throwable t)
+            {
+                finish(t);
+            }
+        }
+
+        private void onAccordComplete(Throwable normalFailure, PreserveTimestamp preserveTimestamps, TxnResult txnResult, Throwable accordFailure)
+        {
+            Throwable failure = normalFailure;
+            try
+            {
+                if (accordFailure != null)
+                {
+                    failure = Throwables.merge(failure, accordFailure);
+                }
+                else if (txnResult.kind() == retry_new_protocol && failure == null)
+                {
+                    Tracing.trace("Accord returned retry new protocol");
+                    logger.debug("Retrying mutations on different system because some mutations were misrouted according to Accord");
+                    attempt(preserveTimestamps);
+                    return;
+                }
+                else
+                {
+                    TxnValidationRejection.maybeThrow(txnResult);
+                    Tracing.trace("Successfully wrote Accord mutations");
+                }
+            }
+            catch (Exception e)
+            {
+                failure = Throwables.merge(failure, e);
+            }
+            finish(failure);
+        }
+
+        private void finish(Throwable failure)
+        {
+            if (failure == null)
+            {
+                result.trySuccess(null);
+                return;
+            }
+            Throwable t = unchecked(failure);
+            // The sync loop's outer catch traces the stack of every exception it rethrows, including the
+            // final `throw unchecked(failure)`; keep that trace on the failure path.
+            Tracing.trace("{}", getStackTraceAsToString(t));
+            result.tryFailure(t);
+        }
+
+        // The normal arm is bounded by its per-handler timers, but the Accord arm is awaited via a
+        // non-timing addCallback. Bound the whole write at the write-rpc deadline so a lost Accord
+        // coordination cannot hang the client, mirroring the sync awaitAndGet() timeout.
+        private void armAccordDeadline()
+        {
+            ScheduledExecutorService scheduler = requestTime.timeoutScheduler() != null
+                                                 ? requestTime.timeoutScheduler()
+                                                 : ScheduledExecutors.scheduledFastTasks;
+            long timeoutNanos = Math.max(0, requestTime.computeTimeout(nanoTime(), DatabaseDescriptor.getWriteRpcTimeout(NANOSECONDS)));
+            ScheduledFuture<?> timer = scheduler.schedule(() -> {
+                if (!result.isDone())
+                {
+                    // received/blockFor are not modelled for the transactional arm; a typed timeout is
+                    // enough for the client to retry.
+                    WriteType writeType = mutations.size() <= 1 ? WriteType.SIMPLE : WriteType.UNLOGGED_BATCH;
+                    result.tryFailure(new WriteTimeoutException(writeType, consistencyLevel, 0, 1));
+                }
+            }, timeoutNanos, NANOSECONDS);
+            result.addListener(f -> timer.cancel(false));
         }
     }
 

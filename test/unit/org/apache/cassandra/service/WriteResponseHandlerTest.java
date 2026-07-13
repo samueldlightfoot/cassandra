@@ -38,6 +38,7 @@ import org.apache.cassandra.db.WriteType;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.exceptions.RequestFailure;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.locator.BaseProximity;
 import org.apache.cassandra.locator.EndpointsForToken;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -57,7 +58,9 @@ import static java.util.concurrent.TimeUnit.DAYS;
 import static org.apache.cassandra.net.NoPayload.noPayload;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class WriteResponseHandlerTest
 {
@@ -296,6 +299,41 @@ public class WriteResponseHandlerTest
         assertEquals(startingCountForIdealCLWriteLatency, ks.metric.idealCLWriteLatency.totalLatency.getCount());
     }
 
+
+    @Test
+    public void writeResultCompletesAndVerdictPassesWhenClMet()
+    {
+        AbstractWriteResponseHandler awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.EACH_QUORUM);
+        assertFalse(awr.writeResult().isDone());
+
+        // LOCAL_QUORUM over RF=3 in the local DC is satisfied by two local acks
+        awr.onResponse(createDummyMessage(0));
+        awr.onResponse(createDummyMessage(1));
+
+        assertTrue(awr.writeResult().isDone());
+        assertTrue(awr.writeResult().isSuccess());
+        awr.computeVerdict(); // CL met → no throw
+    }
+
+    @Test
+    public void writeResultVerdictThrowsWhenClUnreachable()
+    {
+        AbstractWriteResponseHandler awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.EACH_QUORUM);
+
+        // Two local-DC failures make LOCAL_QUORUM unreachable → terminal, and the verdict must throw
+        awr.onFailure(targets.get(0).endpoint(), RequestFailure.TIMEOUT);
+        awr.onFailure(targets.get(1).endpoint(), RequestFailure.TIMEOUT);
+
+        assertTrue(awr.writeResult().isDone());
+        try
+        {
+            awr.computeVerdict();
+            fail("expected the verdict to throw once the consistency level is unreachable");
+        }
+        catch (WriteTimeoutException expected)
+        {
+        }
+    }
 
     private static AbstractWriteResponseHandler createWriteResponseHandler(ConsistencyLevel cl, ConsistencyLevel ideal)
     {

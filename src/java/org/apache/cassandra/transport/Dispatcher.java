@@ -20,7 +20,9 @@ package org.apache.cassandra.transport;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -31,6 +33,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.DebuggableTask;
+import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.LocalAwareExecutorPlus;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.OverloadedException;
@@ -47,6 +50,9 @@ import org.apache.cassandra.transport.messages.EventMessage;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MonotonicClock;
 import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoop;
@@ -84,6 +90,12 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
                                                                           "Native-Transport-Auth-Requests");
 
     private static final ConcurrentMap<EventLoop, Flusher> flusherLookup = new ConcurrentHashMap<>();
+
+    // Async requests dispatched but not yet flushed. The NT-worker task now ends at dispatch (the
+    // write completes on another thread), so requestExecutor active/pending no longer reflects
+    // in-flight work; isDone() consults this so graceful drain waits for outstanding responses.
+    private static final AtomicLong inFlightAsyncRequests = new AtomicLong();
+
     private final boolean useLegacyFlusher;
 
     /**
@@ -136,6 +148,10 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
     {
         private final long enqueuedAtNanos;
         private final long startedAtNanos;
+        // Where the non-blocking write path arms its per-request deadline timer. Set to the request's
+        // netty EventLoop so arm/cancel distribute across event loops rather than contending one global
+        // scheduler. Null for internal/non-client callers, which fall back to ScheduledExecutors.
+        private final ScheduledExecutorService timeoutScheduler;
 
         public RequestTime(long createdAtNanos)
         {
@@ -144,9 +160,15 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
 
         public RequestTime(long enqueuedAtNanos, long startedAtNanos)
         {
+            this(enqueuedAtNanos, startedAtNanos, null);
+        }
+
+        public RequestTime(long enqueuedAtNanos, long startedAtNanos, ScheduledExecutorService timeoutScheduler)
+        {
             Preconditions.checkArgument(enqueuedAtNanos != -1);
             this.enqueuedAtNanos = enqueuedAtNanos;
             this.startedAtNanos = startedAtNanos;
+            this.timeoutScheduler = timeoutScheduler;
         }
 
         public static RequestTime forImmediateExecution()
@@ -156,7 +178,12 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
 
         public RequestTime withStartedAt(long startedAtNanos)
         {
-            return new RequestTime(enqueuedAtNanos, startedAtNanos);
+            return new RequestTime(enqueuedAtNanos, startedAtNanos, timeoutScheduler);
+        }
+
+        public ScheduledExecutorService timeoutScheduler()
+        {
+            return timeoutScheduler;
         }
 
         public long startedAtNanos()
@@ -314,7 +341,8 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         public void run()
         {
             startTimeNanos = MonotonicClock.Global.preciseTime.now();
-            processRequest(channel, request, forFlusher, backpressure, new RequestTime(request.createdAtNanos, startTimeNanos));
+            ScheduledExecutorService timeoutScheduler = channel != null ? channel.eventLoop() : null;
+            processRequest(channel, request, forFlusher, backpressure, new RequestTime(request.createdAtNanos, startTimeNanos, timeoutScheduler));
         }
 
         @Override
@@ -388,39 +416,7 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
             CoordinatorWriteWarnings.init();
         }
 
-        switch (backpressure)
-        {
-            case NONE:
-                break;
-            case REQUESTS:
-            {
-                String message = String.format("Request breached global limit of %d requests/second and triggered backpressure.",
-                                               ClientResourceLimits.getNativeTransportMaxRequestsPerSecond());
-
-                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
-                ClientWarn.instance.warn(message);
-                break;
-            }
-            case BYTES_IN_FLIGHT:
-            {
-                String message = String.format("Request breached limit(s) on bytes in flight (Endpoint: %d, Global: %d) and triggered backpressure.",
-                                               ClientResourceLimits.getEndpointLimit(), ClientResourceLimits.getGlobalLimit());
-
-                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
-                ClientWarn.instance.warn(message);
-                break;
-            }
-            case QUEUE_TIME:
-            {
-                String message = String.format("Request has spent over %s time of the maximum timeout %dms in the queue",
-                                               DatabaseDescriptor.getNativeTransportQueueMaxItemAgeThreshold(),
-                                               DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.MILLISECONDS));
-
-                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
-                ClientWarn.instance.warn(message);
-                break;
-            }
-        }
+        applyBackpressureWarnings(backpressure);
 
         QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion());
 
@@ -474,15 +470,259 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         }
     }
 
+    // Emit the client warning for a backpressure signal. Shared by the synchronous and asynchronous
+    // request paths.
+    private static void applyBackpressureWarnings(Overload backpressure)
+    {
+        switch (backpressure)
+        {
+            case NONE:
+                break;
+            case REQUESTS:
+            {
+                String message = String.format("Request breached global limit of %d requests/second and triggered backpressure.",
+                                               ClientResourceLimits.getNativeTransportMaxRequestsPerSecond());
+
+                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
+                ClientWarn.instance.warn(message);
+                break;
+            }
+            case BYTES_IN_FLIGHT:
+            {
+                String message = String.format("Request breached limit(s) on bytes in flight (Endpoint: %d, Global: %d) and triggered backpressure.",
+                                               ClientResourceLimits.getEndpointLimit(), ClientResourceLimits.getGlobalLimit());
+
+                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
+                ClientWarn.instance.warn(message);
+                break;
+            }
+            case QUEUE_TIME:
+            {
+                String message = String.format("Request has spent over %s time of the maximum timeout %dms in the queue",
+                                               DatabaseDescriptor.getNativeTransportQueueMaxItemAgeThreshold(),
+                                               DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.MILLISECONDS));
+
+                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
+                ClientWarn.instance.warn(message);
+                break;
+            }
+        }
+    }
+
+    /**
+     * Asynchronous sibling of {@link #processRequest(ServerConnection, Message.Request, Overload, RequestTime)}.
+     * Dispatches execution via {@link Message.Request#executeAsync} and returns a future that completes with
+     * the finalized response. It never fails — throwables become ErrorMessage responses, matching the
+     * synchronous wrapper's catch. The post-execute finalize (warnings done/reset, stream id, client
+     * warnings, attach, state transition) runs on whatever thread completes execution, with the request's
+     * thread-local context (trace/client-warn + coordinator warnings) re-established for its duration.
+     *
+     * Note: this method is not expected to execute on the netty event loop.
+     */
+    private static Future<Message.Response> processRequestAsync(Channel channel, ServerConnection connection, Message.Request request, Overload backpressure, RequestTime requestTime)
+    {
+        long queueTime = requestTime.timeSpentInQueueNanos();
+        ClientMetrics.instance.queueTime(queueTime, TimeUnit.NANOSECONDS);
+        if (queueTime > DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS))
+        {
+            ClientMetrics.instance.markTimedOutBeforeProcessing();
+            // As in the synchronous path, this early error is flushed without stream id/attach.
+            return ImmediateFuture.success(ErrorMessage.fromException(new OverloadedException("Query timed out before it could start")));
+        }
+
+        Future<Message.Response> exec;
+        try
+        {
+            if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
+                ClientWarn.instance.captureWarnings();
+
+            // even if ClientWarn is disabled, still setup CoordinatorTrackWarnings, as this will populate
+            // metrics and emit logs on the server; the warnings will just be ignored and not sent to the client
+            if (request.isTrackable())
+            {
+                CoordinatorWarnings.init();
+                CoordinatorWriteWarnings.init();
+            }
+
+            applyBackpressureWarnings(backpressure);
+
+            QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion());
+            Message.logger.trace("Received: {}, v={}", request, connection.getVersion());
+            connection.requests.inc();
+            exec = request.executeAsync(qstate, requestTime);
+        }
+        catch (Throwable t)
+        {
+            // A synchronous throw before/at dispatch: capture and clear the request's context, then finalize
+            // the error (the finalize re-establishes it) so this pooled worker is left balanced.
+            ExecutorLocals locals = ExecutorLocals.current();
+            Object cw = CoordinatorWarnings.captureAndClear();
+            Object cww = CoordinatorWriteWarnings.captureAndClear();
+            ExecutorLocals.clear();
+            return ImmediateFuture.success(finalizeResponse(channel, connection, request, null, t, locals, cw, cww));
+        }
+
+        // Capture the request-scoped context to re-establish around the finalize on the completing thread,
+        // then clear it here: the completion may hop to another thread, and this NT worker is pooled — it
+        // must not carry the request's trace/client-warn/coordinator-warning state into the next request
+        // (a leaked TraceState trips the newSession assertion on the next traced request).
+        ExecutorLocals locals = ExecutorLocals.current();
+        Object coordWarnings = CoordinatorWarnings.captureAndClear();
+        Object coordWriteWarnings = CoordinatorWriteWarnings.captureAndClear();
+        ExecutorLocals.clear();
+
+        AsyncPromise<Message.Response> finalized = new AsyncPromise<>();
+        exec.addCallback((response, failure) -> {
+            Message.Response toSend;
+            try
+            {
+                toSend = finalizeResponse(channel, connection, request, response, failure, locals, coordWarnings, coordWriteWarnings);
+            }
+            catch (Throwable t)
+            {
+                ErrorMessage error = ErrorMessage.fromException(t);
+                error.setStreamId(request.getStreamId());
+                toSend = error;
+            }
+            finalized.trySuccess(toSend);
+        });
+        return finalized;
+    }
+
+    /**
+     * Restore the request's thread-local context, run the post-execute finalize, then reset — all on the
+     * completing thread. Never throws: a throw building the response degrades to an ErrorMessage so the
+     * caller always has something to flush. {@code resetWarnings()} runs inside the restored-locals window
+     * so it clears this request's state, not the completing thread's own.
+     */
+    private static Message.Response finalizeResponse(Channel channel, ServerConnection connection, Message.Request request,
+                                                     Message.Response response, Throwable failure,
+                                                     ExecutorLocals locals, Object coordWarnings, Object coordWriteWarnings)
+    {
+        ExecutorLocals previous = locals.get();
+        try
+        {
+            CoordinatorWarnings.restore(coordWarnings);
+            CoordinatorWriteWarnings.restore(coordWriteWarnings);
+            try
+            {
+                return failure == null
+                       ? finalizeSuccess(connection, request, response)
+                       : finalizeFailure(channel, request, failure);
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                ErrorMessage error = ErrorMessage.fromException(t);
+                error.setStreamId(request.getStreamId());
+                return error;
+            }
+            finally
+            {
+                CoordinatorWarnings.reset();
+                CoordinatorWriteWarnings.reset();
+                ClientWarn.instance.resetWarnings();
+            }
+        }
+        finally
+        {
+            previous.close();
+        }
+    }
+
+    private static Message.Response finalizeSuccess(ServerConnection connection, Message.Request request, Message.Response response)
+    {
+        if (request.isTrackable())
+        {
+            CoordinatorWarnings.done();
+            CoordinatorWriteWarnings.done();
+        }
+        response.setStreamId(request.getStreamId());
+        response.setWarnings(ClientWarn.instance.getWarnings());
+        response.attach(connection);
+        connection.applyStateTransition(request.type, response.type);
+        return response;
+    }
+
+    private static Message.Response finalizeFailure(Channel channel, Message.Request request, Throwable failure)
+    {
+        JVMStabilityInspector.inspectThrowable(failure);
+        if (request.isTrackable())
+        {
+            CoordinatorWarnings.done();
+            CoordinatorWriteWarnings.done();
+        }
+        Predicate<Throwable> handler = ExceptionHandlers.getUnexpectedExceptionHandler(channel, true);
+        ErrorMessage error = ErrorMessage.fromException(failure, handler);
+        error.setStreamId(request.getStreamId());
+        error.setWarnings(ClientWarn.instance.getWarnings());
+        return error;
+    }
+
     /**
      * Note: this method is not expected to execute on the netty event loop.
+     *
+     * Dispatches asynchronously and flushes the response from the completion callback, so the calling
+     * (Native-Transport) worker is freed at dispatch instead of parking on the write acknowledgement.
      */
     void processRequest(Channel channel, Message.Request request, FlushItemConverter forFlusher, Overload backpressure, RequestTime requestTime)
     {
-        Message.Response response = processRequest(channel, request, backpressure, requestTime);
-        FlushItem<?> toFlush = forFlusher.toFlushItem(channel, request, response);
-        Message.logger.trace("Responding: {}, v={}", response, request.connection().getVersion());
-        flush(toFlush);
+        inFlightAsyncRequests.incrementAndGet();
+        Future<Message.Response> future;
+        try
+        {
+            future = processRequestAsync(channel, (ServerConnection) request.connection(), request, backpressure, requestTime);
+        }
+        catch (Throwable t)
+        {
+            // processRequestAsync is designed not to throw; never leave a request unanswered if it does.
+            future = ImmediateFuture.success(errorResponse(channel, request, t));
+        }
+
+        future.addCallback((response, failure) -> {
+            try
+            {
+                Message.Response toSend = failure == null ? response : errorResponse(channel, request, failure);
+                FlushItem<?> toFlush = forFlusher.toFlushItem(channel, request, toSend);
+                Message.logger.trace("Responding: {}, v={}", toSend, request.connection().getVersion());
+                flush(toFlush);
+            }
+            catch (Throwable t)
+            {
+                // A throw here (e.g. encoding) would be swallowed by the listener machinery, leaving the
+                // client hung and its in-flight bytes unreleased — flush a bare error instead.
+                handleFlushFailure(channel, request, forFlusher, t);
+            }
+            finally
+            {
+                inFlightAsyncRequests.decrementAndGet();
+            }
+        });
+    }
+
+    private static Message.Response errorResponse(Channel channel, Message.Request request, Throwable t)
+    {
+        JVMStabilityInspector.inspectThrowable(t);
+        Predicate<Throwable> handler = ExceptionHandlers.getUnexpectedExceptionHandler(channel, true);
+        ErrorMessage error = ErrorMessage.fromException(t, handler);
+        error.setStreamId(request.getStreamId());
+        return error;
+    }
+
+    private void handleFlushFailure(Channel channel, Message.Request request, FlushItemConverter forFlusher, Throwable t)
+    {
+        JVMStabilityInspector.inspectThrowable(t);
+        try
+        {
+            ErrorMessage error = ErrorMessage.fromException(t);
+            error.setStreamId(request.getStreamId());
+            FlushItem<?> toFlush = forFlusher.toFlushItem(channel, request, error);
+            flush(toFlush);
+        }
+        catch (Throwable t2)
+        {
+            logger.error("Failed to flush error response for {}", request, t2);
+        }
     }
 
     private void flush(FlushItem<?> item)
@@ -503,7 +743,9 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
 
     public boolean isDone()
     {
-        return requestExecutor.getPendingTaskCount() == 0 && requestExecutor.getActiveTaskCount() == 0;
+        return inFlightAsyncRequests.get() == 0
+               && requestExecutor.getPendingTaskCount() == 0
+               && requestExecutor.getActiveTaskCount() == 0;
     }
 
     public static void shutdown()

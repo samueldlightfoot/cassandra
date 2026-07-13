@@ -100,6 +100,19 @@ public class CoordinatorWriteWarnings
         STATE.processAndReset(CoordinatorWriteWarnings::processWarnings);
     }
 
+    /** Take this thread's warnings so a completion running on another thread can finish them. Pair with
+     *  {@link #restore}. */
+    public static Object captureAndClear()
+    {
+        return STATE.captureAndClear();
+    }
+
+    /** Re-establish warnings captured by {@link #captureAndClear} on the current thread, before {@link #done}. */
+    public static void restore(Object captured)
+    {
+        STATE.restore((Warnings) captured);
+    }
+
     /**
      * Reset/clear warnings for this thread.
      */

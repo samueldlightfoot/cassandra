@@ -28,6 +28,7 @@ import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tracing.Tracing;
@@ -52,6 +53,8 @@ import org.apache.cassandra.transport.messages.UnsupportedMessageCodec;
 import org.apache.cassandra.utils.MonotonicClock;
 import org.apache.cassandra.utils.ReflectionUtils;
 import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -284,6 +287,79 @@ public abstract class Message
                 response.setTracingId(tracingSessionId);
 
             return response;
+        }
+
+        /**
+         * Asynchronous variant of {@link #execute(QueryState, Dispatcher.RequestTime, boolean)}. Defaults to
+         * running it synchronously and wrapping the result; request types with a non-blocking execution path
+         * override this.
+         */
+        protected Future<Response> executeAsync(QueryState queryState, Dispatcher.RequestTime requestTime, boolean traceRequest)
+        {
+            return ImmediateFuture.success(execute(queryState, requestTime, traceRequest));
+        }
+
+        /**
+         * Asynchronous variant of {@link #execute(QueryState, Dispatcher.RequestTime)}: runs the same
+         * tracing-session lifecycle and completes once the (possibly asynchronous) execution finishes.
+         */
+        public Future<Response> executeAsync(QueryState queryState, Dispatcher.RequestTime requestTime)
+        {
+            boolean shouldTrace = false;
+            TimeUUID tracingSessionId = null;
+
+            if (isTraceable())
+            {
+                if (isTracingRequested())
+                {
+                    shouldTrace = true;
+                    tracingSessionId = nextTimeUUID();
+                    Tracing.instance.newSession(tracingSessionId, getCustomPayload());
+                }
+                else if (StorageService.instance.shouldTraceProbablistically())
+                {
+                    shouldTrace = true;
+                    Tracing.instance.newSession(getCustomPayload());
+                }
+            }
+
+            boolean traceSession = shouldTrace;
+            TimeUUID sessionId = tracingSessionId;
+            // Capture the locals carrying this request's TraceState. The future may complete on a thread
+            // that lacks it (shard/messaging/timer), where stopSession() would no-op and leak the session
+            // — so the teardown re-installs these before running.
+            ExecutorLocals tracingLocals = traceSession ? ExecutorLocals.current() : null;
+            Future<Response> future;
+            try
+            {
+                future = executeAsync(queryState, requestTime, shouldTrace);
+            }
+            catch (Throwable t)
+            {
+                if (traceSession)
+                    Tracing.instance.stopSession();
+                throw t;
+            }
+
+            // Stop the session once execution settles (success or failure), matching the synchronous finally.
+            if (traceSession)
+                future.addCallback((response, failure) -> {
+                    ExecutorLocals restore = tracingLocals.get();
+                    try
+                    {
+                        Tracing.instance.stopSession();
+                    }
+                    finally
+                    {
+                        restore.close();
+                    }
+                });
+
+            return future.map(response -> {
+                if (isTraceable() && isTracingRequested())
+                    response.setTracingId(sessionId);
+                return response;
+            });
         }
 
         void setTracingRequested()

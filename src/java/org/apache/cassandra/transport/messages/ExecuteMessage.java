@@ -43,6 +43,9 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MD5Digest;
 import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.concurrent.AsyncPromise;
+import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 
 import io.netty.buffer.ByteBuf;
 
@@ -209,6 +212,118 @@ public class ExecuteMessage extends Message.Request
             JVMStabilityInspector.inspectThrowable(e);
             return ErrorMessage.fromException(e);
         }
+    }
+
+    @Override
+    protected Future<Message.Response> executeAsync(QueryState state, Dispatcher.RequestTime requestTime, boolean traceRequest)
+    {
+        QueryHandler.Prepared prepared = null;
+        try
+        {
+            QueryHandler handler = ClientState.getCQLQueryHandler();
+            prepared = handler.getPrepared(statementId);
+            if (prepared == null)
+                throw new PreparedQueryNotFoundException(statementId);
+
+            if (!prepared.fullyQualified && prepared.statement.eligibleAsPreparedStatement() && !Objects.equals(state.getClientState().getRawKeyspace(), prepared.keyspace))
+            {
+                state.getClientState().warnAboutUseWithPreparedStatements(statementId, prepared.keyspace);
+
+                String msg = String.format("Tried to execute a prepared unqualified statement on a keyspace it was not prepared on. " +
+                                           " Executing the resulting prepared statement will return unexpected results: %s (on keyspace %s, previously prepared on %s)",
+                                           statementId, state.getClientState().getRawKeyspace(), prepared.keyspace);
+                nospam.error(msg);
+            }
+
+            CQLStatement statement = prepared.statement;
+            options.prepare(statement.getBindVariables());
+
+            if (options.getPageSize() == 0)
+                throw new ProtocolException("The page size cannot be 0");
+
+            if (traceRequest)
+                traceQuery(state, prepared);
+
+            if (options.isEligibleForArtificialLatency())
+                ArtificialLatency.setEligibleForArtificialLatency(true);
+
+            // Some custom QueryHandlers are interested by the bound names. We provide them this information
+            // by wrapping the QueryOptions.
+            QueryOptions queryOptions = QueryOptions.addColumnSpecifications(options, prepared.statement.getBindVariables());
+
+            long requestStartTime = currentTimeMillis();
+
+            QueryHandler.Prepared preparedFinal = prepared;
+            AsyncPromise<Message.Response> promise = new AsyncPromise<>();
+            handler.processPreparedAsync(statement, state, queryOptions, getCustomPayload(), requestTime)
+                   .addCallback((response, failure) -> {
+                       if (failure != null)
+                       {
+                           if (failure instanceof Exception)
+                               promise.trySuccess(onExecuteFailure(preparedFinal, state, (Exception) failure));
+                           else
+                               promise.tryFailure(failure);
+                           return;
+                       }
+                       try
+                       {
+                           promise.trySuccess(onExecuteSuccess(preparedFinal, statement, requestStartTime, state, response));
+                       }
+                       catch (Exception e)
+                       {
+                           promise.trySuccess(onExecuteFailure(preparedFinal, state, e));
+                       }
+                   });
+            return promise;
+        }
+        catch (Exception e)
+        {
+            return ImmediateFuture.success(onExecuteFailure(prepared, state, e));
+        }
+    }
+
+    private Message.Response onExecuteSuccess(QueryHandler.Prepared prepared, CQLStatement statement, long requestStartTime, QueryState state, Message.Response response)
+    {
+        QueryEvents.instance.notifyExecuteSuccess(prepared.statement, prepared.rawCQLStatement, options, state, requestStartTime, response);
+
+        if (response instanceof ResultMessage.Rows)
+        {
+            ResultMessage.Rows rows = (ResultMessage.Rows) response;
+
+            ResultSet.ResultMetadata resultMetadata = rows.result.metadata;
+
+            if (options.getProtocolVersion().isGreaterOrEqualTo(ProtocolVersion.V5))
+            {
+                // For LWTs, always send a resultset metadata but avoid setting a metadata changed flag. This way
+                // Client will always receive fresh metadata, but will avoid caching and reusing it. See CASSANDRA-13992
+                // for details.
+                if (!statement.hasConditions())
+                {
+                    // Starting with V5 we can rely on the result metadata id coming with execute message in order to
+                    // check if there was a change, comparing it with metadata that's about to be returned to client.
+                    if (!resultMetadata.getResultMetadataId().equals(resultMetadataId))
+                        resultMetadata.setMetadataChanged();
+                    else if (options.skipMetadata())
+                        resultMetadata.setSkipMetadata();
+                }
+            }
+            else
+            {
+                // Pre-V5 code has to rely on the difference between the metadata in the prepared message cache
+                // and compare it with the metadata to be returned to client.
+                if (options.skipMetadata() && prepared.resultMetadataId.equals(resultMetadata.getResultMetadataId()))
+                    resultMetadata.setSkipMetadata();
+            }
+        }
+
+        return response;
+    }
+
+    private Message.Response onExecuteFailure(QueryHandler.Prepared prepared, QueryState state, Exception e)
+    {
+        QueryEvents.instance.notifyExecuteFailure(prepared, options, state, e);
+        JVMStabilityInspector.inspectThrowable(e);
+        return ErrorMessage.fromException(e);
     }
 
     private void traceQuery(QueryState state, QueryHandler.Prepared prepared)
