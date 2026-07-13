@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.transport;
 
+import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ScheduledExecutorService;
@@ -35,6 +36,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.DebuggableTask;
 import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.LocalAwareExecutorPlus;
+import org.apache.cassandra.concurrent.ShardExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.OverloadedException;
 import org.apache.cassandra.metrics.ClientMetrics;
@@ -139,6 +141,22 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
 
         // Importantly, the authExecutor will handle the AUTHENTICATE message which may be CPU intensive.
         LocalAwareExecutorPlus executor = isAuthQuery ? authExecutor : requestExecutor;
+
+        // CQL ingress routing: run a routable prepared single-partition write's coordinate on its owning
+        // shard, deleting the loop->NTR handoff (its local apply then runs inline on the owner). Flag-off,
+        // ENABLED is false and this collapses to the NTR-pool submit below, byte-identical.
+        if (CqlShardRouter.ENABLED && !isAuthQuery)
+        {
+            OptionalInt shard = CqlShardRouter.routeShard(request);
+            ShardExecutors shards = ShardExecutors.instance();
+            if (shard.isPresent() && shards != null)
+            {
+                shards.execute(ExecutorLocals.current(), shard.getAsInt(),
+                               new RequestProcessor(channel, request, forFlusher, backpressure));
+                ClientMetrics.instance.markRequestDispatched();
+                return;
+            }
+        }
 
         executor.submit(new RequestProcessor(channel, request, forFlusher, backpressure));
         ClientMetrics.instance.markRequestDispatched();

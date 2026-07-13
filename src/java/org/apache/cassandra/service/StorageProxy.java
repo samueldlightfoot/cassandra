@@ -2403,7 +2403,13 @@ public class StorageProxy implements StorageProxyMBean
             OptionalInt shardId = MutationShardRouting.route((Mutation) description);
             if (shardId.isPresent())
             {
-                shards.execute(shardId.getAsInt(), localMutationRunnable);
+                // Owner-inline bypass: when CQL ingress routing has already put this coordinate on the
+                // apply's owner shard, run the apply inline instead of self-enqueuing behind it on the same
+                // shard queue (a self-wake). Mirrors MutationVerbHandler's inbound-dispatch bypass.
+                if (ShardExecutors.currentThreadIsOwnerOf(shardId.getAsInt()))
+                    localMutationRunnable.run();
+                else
+                    shards.execute(shardId.getAsInt(), localMutationRunnable);
                 return;
             }
         }

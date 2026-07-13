@@ -201,6 +201,10 @@ public enum CassandraRelevantProperties
     CONSISTENT_DIRECTORY_LISTINGS("cassandra.consistent_directory_listings"),
     CONSISTENT_RANGE_MOVEMENT("cassandra.consistent.rangemovement", "true"),
     CONSISTENT_SIMULTANEOUS_MOVES_ALLOW("cassandra.consistent.simultaneousmoves.allow"),
+    /** Route a prepared single-partition CQL write's coordinate to the owning shard at native ingress, so
+     * coordinate + local apply share one thread (deleting the loop-&gt;NTR handoff). Requires
+     * {@link #MUTATION_SHARD_ROUTING}. Read once at startup. */
+    CQL_INGRESS_ROUTING("cassandra.tpc.cql_ingress_routing", "false"),
     CRYPTO_PROVIDER_CLASS_NAME("cassandra.crypto_provider_class_name"),
     CURSOR_COMPACTION_ENABLED("cassandra.cursor_compaction_enabled", "true"),
     CUSTOM_DISK_ERROR_HANDLER("cassandra.custom_disk_error_handler"),

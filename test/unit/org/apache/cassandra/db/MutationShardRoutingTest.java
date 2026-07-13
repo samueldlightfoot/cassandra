@@ -89,6 +89,27 @@ public class MutationShardRoutingTest extends CQLTester
     }
 
     @Test
+    public void shardForKeyMatchesTheMemtableBoundaries()
+    {
+        // CQL ingress routing places coordinate on this shard on the loop; it must equal the shard the
+        // apply's own memtable put (and route()) selects, so the owner-inline bypass fires.
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int) WITH memtable = 'trie'");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        DecoratedKey key = key(cfs, 42);
+
+        int expected = ((AbstractShardedMemtable) cfs.getCurrentMemtable()).getShardBoundaries().getShardForKey(key);
+        assertEquals(OptionalInt.of(expected), MutationShardRouting.shardForKey(cfs.metadata(), key));
+    }
+
+    @Test
+    public void shardForKeySkipsNonShardedMemtable()
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int) WITH memtable = 'skiplist'");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        assertFalse(MutationShardRouting.shardForKey(cfs.metadata(), key(cfs, 42)).isPresent());
+    }
+
+    @Test
     public void skipsCounterTable()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, c counter) WITH memtable = 'trie'");

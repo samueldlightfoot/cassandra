@@ -137,6 +137,25 @@ public final class MutationShardRouting
     }
 
     /**
+     * The shard that owns {@code key} in {@code metadata}'s current memtable, or empty if that memtable
+     * is not sharded. Used by CQL ingress routing to place a request's coordinate on the apply's likely
+     * owner; the apply's shard is re-decided authoritatively by {@link #route} on the shard thread, so a
+     * stale answer here only costs the optimization, never correctness.
+     */
+    public static OptionalInt shardForKey(TableMetadata metadata, DecoratedKey key)
+    {
+        ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(metadata.id);
+        if (cfs == null)
+            return OptionalInt.empty();
+
+        Memtable memtable = cfs.getTracker().getView().getCurrentMemtable();
+        if (!(memtable instanceof AbstractShardedMemtable))
+            return OptionalInt.empty();
+
+        return OptionalInt.of(((AbstractShardedMemtable) memtable).getShardBoundaries().getShardForKey(key));
+    }
+
+    /**
      * Routable index-wise iff the table has no indexes, or every index is SAI (parallel in-memory
      * structures, no memtable write). Legacy 2i and custom non-SAI indexes are excluded.
      */

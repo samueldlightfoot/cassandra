@@ -283,6 +283,18 @@ public class QueryProcessor implements QueryHandler
         return preparedStatements.getIfPresent(id);
     }
 
+    /**
+     * Policy-neutral prepared lookup for use on the netty event loop (CQL ingress routing).
+     * {@code asMap().get} bypasses Caffeine's access bookkeeping and maintenance, so — unlike
+     * {@link #getPrepared} — it can never trigger the size-eviction removal listener, which writes to a
+     * system table ({@link #evictPreparedStatement}). That write must never run on the loop. The LRU
+     * touch is left to the authoritative {@link #getPrepared} on the shard thread.
+     */
+    public static Prepared getPreparedNoTouch(MD5Digest id)
+    {
+        return preparedStatements.asMap().get(id);
+    }
+
     public static void validateKey(ByteBuffer key) throws InvalidRequestException
     {
         if (key == null || key.remaining() == 0)
