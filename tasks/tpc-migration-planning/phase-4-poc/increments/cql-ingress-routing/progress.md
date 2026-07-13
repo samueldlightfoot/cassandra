@@ -1,5 +1,28 @@
 # Progress — CQL-path ingress routing (single-node inbox hop)
 
+## CPU FIXES IMPLEMENTED (2026-07-13) — awaiting rig re-measure
+
+Two fixes from the CPU-hunt, committed on `tpc-migration`, unit-tested, NOT yet perf-validated (rig re-run
+pending). See `cpu-opt-memoization-plan.md` + `perf-ab-methodology.md` §RESULTS-VS-TRUNK CPU-hunt.
+
+- **#1 Memoize the routing verdict** (`CqlShardRouter`, commit `4d27780d47`). The invariant part of the
+  predicate (two `isLocalSystemKeyspace` scans + keyspace lookup = the profiled 2.48%) now computed once per
+  prepared statement in a weak-keyed cache (statement identity; re-prepare on schema change → new object →
+  fresh verdict). Runtime-mutable gates (denylist config, transient replicas via the live-read cached
+  `Keyspace`) stay per-request. Flag-off untouched. Tests: MutationShardRoutingTest 9/9, ShardRoutedMutationApplyTest 1/1.
+- **#2 Single-mutation async-write fast path** (`StorageProxy.mutateAsync`, commit `cb036fbc9c`, from the
+  Fable investigation). For `responseHandlers.length == 1` (every routed single-partition write) return the
+  one handler's `outcome()` directly instead of seeding `ImmediateFuture.success(null)` + one `andThenAsync`
+  — drops a future+listener+lambda per write (~1.4–1.8pp of the +18% alloc). QUORUM await + write-timeout
+  timer untouched; batches/empty unchanged. Tests: WriteResponseHandler(Transient) 9/9+4/4, StorageProxyTest 5/5.
+- **Fable's other findings (not done):** #2b replace `ExecuteMessage.promise` adapter with map/recover
+  (~1.0–1.4pp, medium risk — must preserve the success-wrap-Exception/fail-Throwable split); #2c `OptionalInt`
+  →int sentinel (~0.35pp). TRAPS (do not touch): `AWRH.outcome` timer (= the flip's write timeout),
+  `Dispatcher.finalized` callback (thread-local restore), listener executor-affinity, listener-list presizing.
+- **NEXT:** rig re-measure — trunk vs routing(+both fixes), same A/B, does routing CPU move toward trunk 58%
+  and does the 2.48% + the async-alloc go? Re-provision the ccx43 loadgen; jars: `.jar.trunk` still staged,
+  rebuild routing from `tpc-migration` tip (now carries both fixes) → new validated jar.
+
 ## vs-TRUNK MEASUREMENT DONE (2026-07-13) — PoC-criterion read + CPU-hunt
 
 Full data + method in `perf-ab-methodology.md` §RESULTS-VS-TRUNK. Headlines:
