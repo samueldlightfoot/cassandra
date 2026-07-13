@@ -1,6 +1,33 @@
 # Progress — CQL-path ingress routing (single-node inbox hop)
 
-## PHASE 4 HANDOFF (2026-07-13) — vs-TRUNK measurement (fresh context)
+## vs-TRUNK MEASUREMENT DONE (2026-07-13) — PoC-criterion read + CPU-hunt
+
+Full data + method in `perf-ab-methodology.md` §RESULTS-VS-TRUNK. Headlines:
+
+- **Baseline correction (load-bearing):** the handoff below said build "parent-of-flip `55a1a71f0a`" as
+  pre-TPC trunk — **WRONG**, it still carries I1+I5+step1. Real pre-TPC trunk = the fork point
+  **`50ddce8455`** (= local `trunk` tip, zero drift). User-confirmed. Trunk jar built on the rig (same
+  JDK 17/ant as routing), verified no TPC/io-uring classes; staged as `…build/…jar.trunk`.
+- **Same-session A/B (trunk vs routing, G1, off-box ccx43):**
+  sub-knee CPU **58.0% (trunk) vs 64.9% (routing)**; cs/op 1.94 vs 1.62 (−16%, mechanism holds);
+  p99 **200.3 vs 218.1ms**; sat peak **272.8k vs 277.7k**; Blocked=0 both.
+- **PoC verdict:** **throughput ≥ trunk PASSES** (matched sub-knee; sat 277.7k ≥ 272.8k). **p99 ≤ trunk is
+  UNANSWERABLE on G1** — mean service time identical (11.5≈11.75ms); the +9% p99 gap is entirely GC
+  (p99≈18× mean, `MaxGCPauseMillis=300`). On raw numbers routing's tail is slightly worse. Routing costs
+  ~7pp CPU vs stock trunk (drift-caveated; interleaved would firm it).
+- **CPU-hunt (asprof 3.0 differential, routing−trunk @182k):** routing = +20% CPU / +18% alloc. Targets:
+  (1) **`SchemaConstants.containsIgnoreCase` 2.48%** — per-request keyspace scans from `CqlShardRouter:143`
+  `isLocalSystemKeyspace` + extra `Schema.getKeyspaceInstance`; invariant per `TableMetadata` → **memoize**
+  the routability/shard decision per prepared statement (~2.5pp, low-risk, the clean next fix). (2) async-
+  future alloc ~7pp (flip's `AsyncPromise`/`AsyncFuture`/`ListenerList` churn + `OptionalInt` boxing). (3)
+  `DecayingEstimatedHistogramReservoir.findIndex` 1.82% (hot-path metrics histogram).
+- **Rig end state:** routing-ON restored (flags on, 12 shard pools, native active). Loadgen DELETED.
+  Jars preserved incl. `…jar.trunk`, `…jar.routing-validated`.
+- **NEXT (candidates, user to steer):** (a) implement the memoization fix + re-measure; (b) ZGC tail arm
+  to make the p99 gate answerable (non-gen ZGC on JDK 17 now, or generational after a JDK 21 upgrade);
+  (c) interleaved A/B/B/A to settle the CPU delta.
+
+## PHASE 4 HANDOFF (2026-07-13) — vs-TRUNK measurement (fresh context) [SUPERSEDED by the section above; baseline note in it was wrong — parent-of-flip ≠ trunk]
 
 Mechanism (Phase 3) + the clean flip+step1-vs-routing A/B are DONE (see the two 2026-07-13 sections
 below and `perf-ab-methodology.md` §RESULTS). **The one thing left to answer the actual PoC criterion

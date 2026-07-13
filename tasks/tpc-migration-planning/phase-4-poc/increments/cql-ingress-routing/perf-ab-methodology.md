@@ -89,3 +89,56 @@ tail-neutral) and a **small saturation-throughput cost** (−4% peak, 12-shard-t
 the A/B is vs **flip+step1**, not trunk — it isolates the routing increment; a vs-trunk PoC-criterion read
 (p99 ≤ trunk at throughput ≥ trunk) needs a separate trunk build. Numbers are 3-window means (sub-knee) /
 single window (saturation); raw in `/root/results_ab/` on the rig.
+
+---
+
+## RESULTS-VS-TRUNK (2026-07-13) — the PoC-criterion read
+
+The A/B above is vs flip+step1. This one answers `poc-criteria.md §1` directly: **routing-ON vs stock
+trunk**. Baseline = the exact pre-TPC fork point `50ddce8455` (= local `trunk` tip; the whole TPC stack —
+I1 shard executors, I5 inbound dispatch, step1, the flip — forks from it; the handoff's "parent-of-flip
+`55a1a71f0a`" was wrong, it still carries I1+I5+step1). Trunk jar built on the rig with the same JDK/ant as
+the routing jar (no toolchain confound); verified no TPC/io-uring classes. Both arms measured **same
+session, back-to-back** (fresh `prep_flip` each), off-box ccx43 loadgen (busy ~38% = headroom). p99 via ecs
+`--hdr` (CO-corrected whole-run, ms).
+
+| metric | TRUNK `50ddce8455` | ROUTING `bf5e4356` | Δ |
+|---|---|---|---|
+| sub-knee deliv/s (3-win mean) | ~184.2k | ~181.9k | matched |
+| **sub-knee CPU** | **58.0%** (57.6/58.8/57.6) | **64.9%** (65.6/64.8/64.3) | **+6.9pp**¹ |
+| cs/op | 1.94 | 1.62 | −16% (mechanism: fewer hops) |
+| **p99** (`--hdr` mutations) | **200.3ms** | **218.1ms** | **+9%**² |
+| p999 | 325ms | 419ms | +29%² |
+| mean service time | 11.49ms | 11.75ms | ~equal |
+| **saturation peak/s** | **272.8k** @97.7% | **277.7k** @98.0% | **+1.8%** |
+
+¹ **Drift caveat:** arms run **sequentially, not interleaved** — trunk (cool, first) vs routing (~1h into
+sustained load). So +6.9pp is partly a thermal/ordering confound; the earlier *interleaved* session had
+routing at 60.1% (≈+2pp over a trunk-equivalent). True delta is between. An interleaved A/B/B/A would settle it.
+² **GC-dominated → gate BLIND.** Mean service time is identical (11.5≈11.75ms); the whole p99/p999 gap sits
+in the G1-pause region (p99 ≈ 18× mean under `MaxGCPauseMillis=300`, 16G heap). Per `poc-criteria §1` a tail
+delta that lives only in GC-adjacent windows is not a verdict.
+
+### PoC-criterion verdict
+- **throughput ≥ trunk → PASS** (sub-knee matched; sat peak 277.7k ≥ 272.8k, shard Blocked=0 both).
+- **p99 ≤ trunk → UNANSWERABLE on G1**, and on raw numbers routing is +9% (worse). The tail is GC-noise;
+  to adjudicate the p99 half honestly the tail must be de-GC'd (ZGC — generational needs JDK 21+; rig is 17).
+- **CPU (not a gate):** routing costs vs stock trunk — the TPC stack (async flip + shard dispatch + route/
+  lookup) adds per-op compute even though it cuts context switches. Attributed below.
+
+### CPU-hunt (async-profiler 3.0 differential, routing−trunk, matched 182k)
+Routing burns **+20% CPU samples** and **+18% allocation** at matched throughput. Top routing-added
+self-time frames (trunk 0% → routing X%) = enhancement targets:
+- **`SchemaConstants.containsIgnoreCase` 2.48%** (trunk 0). Per-request case-insensitive keyspace scans from
+  TWO routing-only callers: `CqlShardRouter:143` `isLocalSystemKeyspace` hazard check **and** extra
+  `Schema.getKeyspaceInstance` calls in shard resolution. Both **invariant per `TableMetadata`** → memoize
+  the routability/shard decision once per prepared statement. Highest-value, low-risk (~2.5pp).
+- **Async-future allocation ~7pp** — the flip's per-write `AsyncPromise`/`AsyncFuture`/`ListenerList`
+  callback churn (top alloc frames) drives the +18% alloc → extra G1 work (`G1ParScanThreadState` +0.68pp).
+  Also boxes `OptionalInt` per `routeShard`/`shardForKey` return (0.68pp alloc) — return an int sentinel.
+- **`DecayingEstimatedHistogramReservoir.findIndex` 1.82%** — metrics histogram on the hot path; investigate
+  which histogram (shard-executor pool metrics?) and whether it can be cheaper/off.
+- Minor: `itable stub` (megamorphic dispatch), thread-local churn, `ShardBoundaries.getShardForToken`.
+
+Raw: rig `/root/results_ab/` (A/B) + `/root/results_prof/{cpu,alloc}_{trunk,routing}.collapsed`. Jars
+preserved: `…jar.trunk` (50ddce8455), `…jar.routing-validated` (bf5e4356).
