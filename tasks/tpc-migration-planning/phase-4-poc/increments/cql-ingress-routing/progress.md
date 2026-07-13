@@ -1,5 +1,69 @@
 # Progress — CQL-path ingress routing (single-node inbox hop)
 
+## PHASE 4 HANDOFF (2026-07-13) — vs-TRUNK measurement (fresh context)
+
+Mechanism (Phase 3) + the clean flip+step1-vs-routing A/B are DONE (see the two 2026-07-13 sections
+below and `perf-ab-methodology.md` §RESULTS). **The one thing left to answer the actual PoC criterion
+(`poc-criteria.md`: p99 ≤ trunk at throughput ≥ trunk) is a clean TRUNK baseline on the same rig.**
+Everything measured so far is vs **flip+step1** (the async-write branch), NOT trunk.
+
+**(1) What's established (clean, rig, 2026-07-13):** flip+step1 (flag-off) = 65.5% CPU @ 182k, cs/op 2.10,
+peak 310k, client p99 ~193ms. CQL routing (flag-on) = 60.1% @ 182k, cs/op 1.54, peak 298k, p99 ~194ms.
+Regime crossover: routing −5.4pp CPU at moderate load, −4% peak at saturation, tail-neutral.
+
+**(2) The task:** build a TRUNK jar, deploy to the rig, run the SAME A/B protocol, get trunk's CPU /
+sub-knee throughput / saturation peak / p99. Then the PoC read: is routing-ON's p99 ≤ trunk's at
+throughput ≥ trunk's? Report vs trunk with the same variance discipline.
+
+**(3) Trunk-baseline choice (confirm with user):** for a clean "only the TPC stack differs" comparison,
+build the **parent of the flip commit `3ccf35950e`** (pre-TPC trunk on this lineage) rather than the
+`trunk` branch tip (avoids unrelated trunk drift). `git log 3ccf35950e~1 --oneline -1` to see it.
+
+**(4) p99 apples-to-apples (CRITICAL):** the async flip does NOT record `ClientRequest.Write.Latency`
+(proxyhistograms + JMX read 0 on our branch); TRUNK DOES. So do NOT compare trunk-server-p99 to
+branch-client-p99. Use the **client `--hdr` (CO-corrected) p99 for ALL arms** as the common denominator —
+OR first fix the flip's metric (stop the ClientRequest.Write timer on the async completion path) so every
+arm has a server p99. The steady console p99 (~193ms here) is GC/flush-dominated; a big-op workload or
+GC read is needed if the tail must be de-noised (`gc_dominates_cassandra_tail`).
+
+**(5) Method + harness (all on the rig):** identical to `perf-ab-methodology.md`. Per arm: `prep_flip`
+(fresh JVM + truncate + autocompaction off) → 3× `/root/abwin.sh <tag> <warm>` 60s windows (warm 40/2/2)
+→ 1 saturation window. Sub-knee `--rate 180000 --concurrency 3000 --threads 32 --readrate 0.0 --hdr`;
+saturation `--rate 350000 --concurrency 4000 --threads 40`. Off-box ccx43 hel1 loadgen (cloud-init builds
+easy-cass-stress; recipe in `perf-ab-methodology.md` + `agent-common/rig/cloud.md`) — **delete when done**.
+`abwin.sh` = CLEAN window (mpstat busy% + vmstat cs/op + tablestats throughput; NO profiling inside it).
+
+**(6) Trunk-specific gotchas:** trunk has NO shard executors — `prep_flip.sh` verifies `Shard-N` pools
+and expects ON; on trunk it will read `pools=OFF` — EXPECTED, not a failure (edit the check or ignore).
+Trunk ignores `-Dcassandra.mutation.shard_routing` / `cassandra.tpc.cql_ingress_routing` (harmless
+no-ops; comment them out of `jvm-server.options` for cleanliness). Loadgen `--hdr` files: confirm where
+ecs writes them (they didn't appear last run — used the steady console p99 instead).
+
+**(7) Rig deploy:** current live jar = `bf5e4356` (validated routing, both flags on). **Back it up before
+swapping in trunk** (`cp …jar …jar.routing-validated`), and RESTORE it after (rig should end in the
+validated routing state). Existing backups: `.jar.pre-cql-ingress`=`19e44ac9` (flip+step1),
+`.jar.step1`, `.jar.tpc-migration-baseline`. Raw A/B data in `/root/results_ab/`. Scripts:
+`/root/{abwin,rcnt,prep_flip,seam_switch,seam_run}.sh`.
+
+**(8) Harness lessons (cost real time this session — don't repeat):** NO `asprof`/`perf` inside the CPU
+window (inflated busy% ~14pp → false "CPU flat"); each ecs invocation is a COLD JVM (whole-run `--hdr`
+p99 is cold-contaminated — read steady console p99 or use a long run + mid-run window); the 3rd 60s window
+overruns a 300s loadgen (use ≥400s for 3 windows, or the window catches the run ending → garbage);
+FRESH `prep_flip` per arm (matched JVM + table state); table-state matters at saturation, not sub-knee.
+
+**(9) Branch:** work is on **`tpc-migration`** (consolidated, pushed to origin). `shard-dispatch-overhead`
++ `tpc-nonblocking-write` deleted. Commit trunk-measurement notes here on `tpc-migration`.
+
+**Start prompt to paste:**
+> vs-trunk measurement for CQL ingress routing. Read `tasks/tpc-migration-planning/phase-4-poc/increments/
+> cql-ingress-routing/progress.md` (PHASE 4 HANDOFF) → `perf-ab-methodology.md` §RESULTS. Everything
+> measured is vs flip+step1; the PoC criterion needs TRUNK. Build the pre-TPC trunk (parent of flip commit
+> `3ccf35950e` — confirm with me), deploy to rig `157.180.98.112` (back up the live `bf5e4356` routing jar,
+> restore after), run the SAME A/B protocol (`prep_flip` → 3× `abwin.sh` sub-knee windows + 1 saturation,
+> off-box ccx43 loadgen, delete after). Use CLIENT `--hdr`/steady console p99 for all arms (the flip broke
+> server `ClientRequest.Write.Latency`). Answer: is routing-ON p99 ≤ trunk at throughput ≥ trunk? Branch
+> `tpc-migration`. Harness gotchas in the handoff §8 — no profiling in the CPU window.
+
 ## PHASE 3 HANDOFF (2026-07-13) — rig validation of the built skeleton
 
 Phase 2 is built, compiles, unit-tested, uncommitted on `shard-dispatch-overhead`. Phase 3 = validate the
