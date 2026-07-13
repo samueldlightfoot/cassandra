@@ -1103,6 +1103,12 @@ public class StorageProxy implements StorageProxyMBean
             return ImmediateFuture.failure(e);
         }
 
+        // A single mutation — every routed single-partition write, and the common non-batch case — needs no
+        // sequencer: the index-order await below reduces to this one handler's outcome. Returning it directly
+        // saves the seed+andThenAsync future/listener/lambda per write. (Length 0 falls through to the seed.)
+        if (responseHandlers.length == 1)
+            return responseHandlers[0].outcome();
+
         // Await each handler's outcome in index order, mirroring mutate()'s sequential
         // responseHandler.get() loop: the first (index-order) failure short-circuits and fails the
         // returned future. andThenAsync runs each continuation inline on the completing thread
