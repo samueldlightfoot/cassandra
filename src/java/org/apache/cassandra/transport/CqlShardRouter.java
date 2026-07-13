@@ -24,6 +24,8 @@ import java.util.OptionalInt;
 import java.util.concurrent.TimeUnit;
 
 import com.codahale.metrics.Counter;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -91,6 +93,13 @@ public final class CqlShardRouter
     /** Requests left on the NTR pool: not an allowlisted single-partition write, unprepared, or an error. */
     private static final Counter fallbacks = Metrics.counter(FACTORY.createMetricName("CqlIngressFallbacks"));
 
+    // The invariant part of the predicate (everything derived from the statement's frozen metadata snapshot
+    // and fixed CQL shape) is the per-write CPU cost — two isLocalSystemKeyspace scans and a keyspace lookup.
+    // Memoize it per statement. Weak keys: the entry is collected once the statement is GC'd after the
+    // prepared-statement cache evicts it, and any table schema change re-prepares to a NEW statement object,
+    // so a stale metadata snapshot can never be served. The value never references the statement key.
+    private static final Cache<ModificationStatement, Plan> PLANS = Caffeine.newBuilder().weakKeys().build();
+
     private CqlShardRouter() {}
 
     public static long routedCount() { return routed.getCount(); }
@@ -123,44 +132,34 @@ public final class CqlShardRouter
                 return fallback();
 
             ModificationStatement stmt = (ModificationStatement) prepared.statement;
-            if (stmt.hasConditions())                       // LWT -> paxos path, not the routed write path
+
+            // The metadata-snapshot-invariant part of the predicate is memoized per statement; only the two
+            // runtime-mutable gates and the per-key work below are re-evaluated each request.
+            Plan plan = PLANS.get(stmt, CqlShardRouter::computePlan);
+            if (!plan.routable)
                 return fallback();
 
-            // Single-column partition key, fully bound as one marker: getPartitionKeyBindVariableIndexes
-            // returns one index per PK component only when every component is a bind marker, so length == 1
-            // means a single-column PK given by exactly one bound value (the whole key).
-            short[] pkIndexes = stmt.getPartitionKeyBindVariableIndexes();
-            if (pkIndexes == null || pkIndexes.length != 1)
-                return fallback();
-
-            TableMetadata metadata = stmt.metadata();
-
-            // Coordinate-time hazards — all run before performLocally, so they must be excluded here.
-            if (metadata.isCounter())                       // read-modify-write under a Striped lock
-                return fallback();
-            if (!metadata.triggers.isEmpty())               // arbitrary user code inline in coordinate
-                return fallback();
-            if (SchemaConstants.isLocalSystemKeyspace(metadata.keyspace))
-                return fallback();
+            // Runtime-mutable, so NOT memoized. Denylist gate is JMX-settable; a miss does a synchronous
+            // distributed read, which must not run on a shard thread.
             if (DatabaseDescriptor.getPartitionDenylistEnabled() && DatabaseDescriptor.getDenylistWritesEnabled())
-                return fallback();                          // a denylist miss does a synchronous distributed read
-
-            Keyspace keyspace = Schema.instance.getKeyspaceInstance(metadata.keyspace);
-            if (keyspace == null)
                 return fallback();
-            if (keyspace.getReplicationStrategy().hasTransientReplicas())
-                return fallback();                          // maybeTryAdditionalReplicas can park the shard
+            // Transient replication is set by ALTER KEYSPACE, which has NO prepared-statement invalidation, so
+            // re-read the strategy every request. getReplicationStrategy() reads it off the live keyspace
+            // metadata (the Keyspace object is stable), so the cached reference still sees the change.
+            // maybeTryAdditionalReplicas can park the shard.
+            if (plan.keyspace.getReplicationStrategy().hasTransientReplicas())
+                return fallback();
 
             List<ByteBuffer> values = exec.options.getValues();
-            int idx = pkIndexes[0];
+            int idx = plan.pkIndex;
             if (idx < 0 || idx >= values.size())
                 return fallback();
             ByteBuffer keyBytes = values.get(idx);
             if (keyBytes == null || keyBytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                 return fallback();
 
-            DecoratedKey key = metadata.partitioner.decorateKey(keyBytes);
-            OptionalInt shard = MutationShardRouting.shardForKey(metadata, key);
+            DecoratedKey key = plan.metadata.partitioner.decorateKey(keyBytes);
+            OptionalInt shard = MutationShardRouting.shardForKey(plan.metadata, key);
             if (shard.isEmpty())
                 return fallback();
 
@@ -176,9 +175,76 @@ public final class CqlShardRouter
         }
     }
 
+    /**
+     * The invariant portion of the predicate — the checks that depend only on the statement's frozen
+     * {@link TableMetadata} snapshot and fixed CQL shape. Computed once per statement and memoized in
+     * {@link #PLANS}. Coordinate-time hazards are excluded here because coordinate runs on the shard thread
+     * before {@code performLocally}'s authoritative apply check: LWT (paxos path), a non-single-column or
+     * partially-bound partition key, counters (locked read-modify-write), and triggers (arbitrary user code
+     * inline). The resolved {@link Keyspace} is captured so the per-request transient-replica check skips the
+     * keyspace lookup. Runs inside {@code routeShard}'s try/catch; Caffeine does not cache a thrown exception.
+     */
+    private static Plan computePlan(ModificationStatement stmt)
+    {
+        if (stmt.hasConditions())                           // LWT -> paxos path, not the routed write path
+            return Plan.NOT_ROUTABLE;
+
+        // getPartitionKeyBindVariableIndexes returns one index per PK component only when every component is a
+        // bind marker, so length == 1 means a single-column PK given by exactly one bound value (the whole key).
+        short[] pkIndexes = stmt.getPartitionKeyBindVariableIndexes();
+        if (pkIndexes == null || pkIndexes.length != 1)
+            return Plan.NOT_ROUTABLE;
+
+        TableMetadata metadata = stmt.metadata();
+        if (metadata.isCounter())                           // read-modify-write under a Striped lock
+            return Plan.NOT_ROUTABLE;
+        if (!metadata.triggers.isEmpty())                   // arbitrary user code inline in coordinate
+            return Plan.NOT_ROUTABLE;
+        if (SchemaConstants.isLocalSystemKeyspace(metadata.keyspace))
+            return Plan.NOT_ROUTABLE;
+
+        Keyspace keyspace = Schema.instance.getKeyspaceInstance(metadata.keyspace);
+        if (keyspace == null)
+            return Plan.NOT_ROUTABLE;
+
+        return new Plan(pkIndexes[0], metadata, keyspace);
+    }
+
     private static OptionalInt fallback()
     {
         fallbacks.inc();
         return OptionalInt.empty();
+    }
+
+    /**
+     * Memoized invariant verdict for a prepared statement (see {@link #computePlan}). Holds no reference to
+     * the statement (the {@link #PLANS} key), so weak-key collection is not defeated. The runtime-mutable
+     * predicates (denylist config, transient replication) are deliberately absent — {@code routeShard}
+     * re-reads them live.
+     */
+    private static final class Plan
+    {
+        static final Plan NOT_ROUTABLE = new Plan();
+
+        final boolean routable;
+        final int pkIndex;                // bind index of the single-column partition key (valid iff routable)
+        final TableMetadata metadata;     // the statement's frozen snapshot
+        final Keyspace keyspace;          // resolved once; its live strategy is re-read per request
+
+        private Plan()
+        {
+            this.routable = false;
+            this.pkIndex = -1;
+            this.metadata = null;
+            this.keyspace = null;
+        }
+
+        Plan(int pkIndex, TableMetadata metadata, Keyspace keyspace)
+        {
+            this.routable = true;
+            this.pkIndex = pkIndex;
+            this.metadata = metadata;
+            this.keyspace = keyspace;
+        }
     }
 }
