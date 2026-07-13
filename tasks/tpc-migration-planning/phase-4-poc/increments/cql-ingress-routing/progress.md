@@ -1,5 +1,84 @@
 # Progress — CQL-path ingress routing (single-node inbox hop)
 
+## RIG RE-RUN HANDOFF (2026-07-13) — measure the two CPU fixes vs trunk (fresh context)
+
+Two CPU optimizations are committed on `tpc-migration` (tip `054f14e484`); unit-tested, **perf NOT validated**.
+The job: rebuild the routing jar (now carries both fixes), re-provision the loadgen, re-run the SAME A/B as
+`perf-ab-methodology.md` §RESULTS-VS-TRUNK, and re-profile — does routing CPU move from **64.9%** toward
+trunk's **58.0%** at ~182k, and did the profiled costs (`containsIgnoreCase` 2.48%, async-future alloc) drop?
+
+**(1) Deviations from the plan (`cpu-opt-memoization-plan.md`).** The memo caches the resolved `Keyspace`
+reference too (not just the structural verdict), so BOTH `isLocalSystemKeyspace` callers vanish (the router's
+own call AND the one inside `Schema.getKeyspaceInstance`). Safe because `keyspace.getReplicationStrategy()`
+reads the strategy off the live keyspace metadata (stable `Keyspace` object) so the transient-replica check
+still sees ALTER KEYSPACE, and DROP invalidates the statement. Fix #2 = Fable's #1 (`mutateAsync` single-
+mutation fast path); Fable's #2b (`ExecuteMessage.promise`→map/recover, medium risk) and #2c (`OptionalInt`
+→int) were NOT done.
+
+**(2) As-built (verbatim).**
+- `CqlShardRouter` (`transport/CqlShardRouter.java`): `private static final Cache<ModificationStatement, Plan>
+  PLANS = Caffeine.newBuilder().weakKeys().build();` `routeShard` does `Plan plan = PLANS.get(stmt,
+  CqlShardRouter::computePlan); if (!plan.routable) return fallback();` then LIVE denylist + LIVE
+  `plan.keyspace.getReplicationStrategy().hasTransientReplicas()` + per-key `shardForKey`. `computePlan(
+  ModificationStatement)->Plan` runs the frozen-metadata checks once. `Plan{boolean routable; int pkIndex;
+  TableMetadata metadata; Keyspace keyspace}`, `Plan.NOT_ROUTABLE` singleton. Public API unchanged
+  (`routeShard`, `routedCount`, `fallbackCount`, `ENABLED`).
+- `StorageProxy.mutateAsync` (`service/StorageProxy.java:1108`): `if (responseHandlers.length == 1) return
+  responseHandlers[0].outcome();` BEFORE the seed+`andThenAsync` loop. Length 0 + batches unchanged.
+- Both flag-gated by construction (CqlShardRouter only runs when `ENABLED`; the StorageProxy fast path is a
+  pure equivalent so it's on for all writes but changes nothing functionally).
+
+**(3) Tested / deferred.** `ant build` OK; MutationShardRoutingTest 9/9, ShardRoutedMutationApplyTest 1/1,
+WriteResponseHandlerTest 9/9, WriteResponseHandlerTransientTest 4/4, StorageProxyTest 5/5. **No perf/e2e run.**
+Deferred: Fable #2b/#2c; the rig re-measure IS the e2e integration test (millions of single-partition writes +
+read-back — a broken future would hang/error immediately).
+
+**(4) Decisions.** Measure **trunk vs routing+fixes BACK-TO-BACK this session** (kill the sequential-drift
+caveat that muddied the +6.9pp last time; ideally an A/B/B/A or a repeat-trunk window to bound drift). Install
+**async-profiler 4.4** for the re-profile (rig has 3.0 at `/usr/local/bin/asprof`; keep BOTH arms on the same
+version). Rebuild routing-fixed in a SEPARATE clone (mirror `/root/build-trunk.sh`) — do NOT use
+`/root/build-i1.sh` (it `rm -rf`s `cassandra-tpc-i1`, nuking the staged `.jar.*`).
+
+**(5) Gotchas (cost real time — see also the SUPERSEDED PHASE 4 HANDOFF §5–8 below).** Rig has NO `unzip`
+(use `jar tf` to verify jar contents). `prep_flip.sh` reads `pools=OFF` on trunk — EXPECTED. `prep_flip` takes
+~60–90s and overruns a 120s ssh — launch then poll `/root/results_flip/prep.done`. Foreground `sleep` is
+blocked in the harness (server-side `until`-loops instead). Loadgen reuses a freed IP → stale host key
+(`ssh -o UserKnownHostsFile=/dev/null` for the throwaway loadgen). ecs console `1min(req/s)` is a lagging EMA
+— take throughput SERVER-side (`abwin.sh` tablestats delta). Each ecs run is a COLD JVM; `--hdr` whole-run p99
+is the CO-corrected read (`hdr_<tag>-mutations.txt`, ms). ecs `run KeyValue` writes are single-column-PK
+prepared INSERTs = exactly the routable shape. NO profiling inside the `abwin` CPU window.
+
+**(6) Assumptions given (rig `157.180.98.112`, verify before trusting).** Node UP routing-ON (OLD routing jar
+`bf5e4356`, no fixes) = `.jar.routing-validated`; both TPC flags live in `/data/tpc-poc/conf/jvm-server.options`
+(lines 217/218). Staged jars in `…/cassandra-tpc-i1/build/`: `.jar.trunk` (50ddce8455, md5 745ce392),
+`.jar.routing-validated` (bf5e4356, md5 81399e9f). Rig binds `0.0.0.0:9042` broadcast `157.180.98.112`
+(off-box reachable, no firewall). Keyspace `cassandra_easy_stress.keyvalue`, memtable trie. Loadgen DELETED.
+Scripts on rig: `/root/{abwin,prep_flip,rcnt,prof,build-trunk}.sh`. Loadgen helper (rebuild on the new box):
+`/opt/ces/ecsrun.sh <rate> <cc> <threads> <dur> <tag>`. A/B params: sub-knee `--rate 180000 --concurrency 3000
+--threads 32 --readrate 0.0 --queue 2000000 --duration 420s --hdr <p> --csv <p>` + rig `abwin.sh <tag> 40|2|2`
+(3 windows); saturation `--rate 350000 --concurrency 4000 --threads 40 --duration 160` + `abwin.sh <tag> 40`.
+Loadgen cloud-init: `packages [openjdk-17-jdk,git,sysstat]`; clone `apache/cassandra-easy-stress` main,
+`./gradlew shadowJar installDist`, symlink `/usr/local/bin/cassandra-easy-stress`. hcloud token env
+`HCLOUD_TOKEN=$(cat ~/repos/agent-common/.secrets/hcloud.token)`, ssh-key `mac-ed25519`, ccx43 hel1. **Delete
+the loadgen when done.** Restore rig to routing state after (which routing jar is the end-state = user's call:
+old `bf5e4356` or the new fixed one).
+
+**(7) Entry point for a fresh agent.** Read in order: THIS handoff → `perf-ab-methodology.md` §RESULTS-VS-TRUNK
+(the numbers to beat + the CPU-hunt targets) → `cpu-opt-memoization-plan.md` (fix #1 rationale) → the diff
+`git show 4d27780d47 cb036fbc9c`. Then act. Starting prompt to paste:
+
+> Rig re-measure of the two CQL-routing CPU fixes vs trunk. Read `tasks/tpc-migration-planning/phase-4-poc/
+> increments/cql-ingress-routing/progress.md` (RIG RE-RUN HANDOFF) → `perf-ab-methodology.md` §RESULTS-VS-TRUNK.
+> Rig `157.180.98.112`; `tpc-migration` tip `054f14e484` carries both fixes (memoize routing verdict +
+> single-mutation async-write fast path). FIRST: build a routing-fixed jar in a SEPARATE clone on the rig
+> (mirror `/root/build-trunk.sh`, checkout `tpc-migration` tip; verify `CqlShardRouter`+`Plan` in the jar via
+> `jar tf`; stage as `…/cassandra-tpc-i1/build/…jar.routing-fixed`) — do NOT run `build-i1.sh` (it wipes the
+> staged jars). Then provision a ccx43 hel1 loadgen (build ecs), and run the SAME A/B back-to-back: TRUNK
+> (`.jar.trunk`) vs ROUTING-FIXED, 3× sub-knee `abwin` windows + 1 saturation each, off-box, client `--hdr`
+> p99. Install async-profiler 4.4 and re-profile both arms (cpu+alloc collapsed, differential) to confirm the
+> 2.48% `containsIgnoreCase` and the async-future alloc dropped. Answer: did routing CPU move from 64.9% toward
+> trunk 58% at ~182k? Delete the loadgen when done; restore the rig routing end-state. Harness gotchas in §5.
+
 ## CPU FIXES IMPLEMENTED (2026-07-13) — awaiting rig re-measure
 
 Two fixes from the CPU-hunt, committed on `tpc-migration`, unit-tested, NOT yet perf-validated (rig re-run
