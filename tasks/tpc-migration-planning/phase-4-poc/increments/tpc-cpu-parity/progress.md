@@ -38,14 +38,17 @@ already emit them. Read via a small JMX client `MemtableContention.java` (compil
 `c2c_ab.sh` instead). Data dirs: `results_{contention,sxs,sweep,c2c}/`. All committed to the repo task folder.
 
 **(5) Rig/box state.** Rig `157.180.98.112` live on **routing-alloc** (81e13444; c2c_ab's last arm was
-routing-alloc round2). All load stopped (rig + loadgen idle). Loadgen box `62.238.35.142` (ccx43) **UP —
-KEEP (user directive, bills hourly)**; delete only when user says done. Conf `/data/tpc-poc/conf`
-(TrieMemtable — the table's `memtable='default'` resolves to trie there, NOT the repo-conf skiplist),
-data `/data/tpc-poc/data`, JMX local 7199.
+routing-alloc round2). **Loadgen box `tpc-scale-lg` / 62.238.35.142 DELETED** (`hcloud server delete`, 2026-07-14
+eve — billing stopped; off-box work done). Co-located load only from here (alloc/op is co-location-invariant).
+Conf `/data/tpc-poc/conf` (TrieMemtable — the table's `memtable='default'` resolves to trie there, NOT the
+repo-conf skiplist), data `/data/tpc-poc/data`, JMX local 7199.
 
-**(6) Next (open).** Nothing gating. Remaining backlog unchanged: bigger-box scaling slope for tail-at-scale;
-close the +10% async alloc gap (map-path listener node + AsyncPromise per-handler, both architectural);
-RF=3 multi-node gate (parity is RF=1-conditional). Phase 2 findIndex is an independent upstream win.
+**(6) Next = Tier 0 (agreed direction).** ROI strategy in `roi-path.md`; the null ROI is expected (all results
+sit in TPC's loss regime). Tier order (user directive: no ≥32-core run until the very end): **Tier 0 close the
++10% alloc gap [Fable] → Tier 1 current-box CPU-bound+loaded+IRQ test → Tier 2 io_uring + read-sharding → Tier 3
+≥32-core LAST.** **Tier 0 start prompt for a fresh context: `tier0-alloc-gap-start.md`** (targets AsyncPromise
+~673 at Dispatcher.java:592 + StorageProxy.java:1510, map-path RunnableWithExecutor ~540; Fable designs the
+AsyncPromise inline-complete fix first). Also open: RF=3 multi-node gate; Phase 2 findIndex (independent upstream).
 
 ---
 
