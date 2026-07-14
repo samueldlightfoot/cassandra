@@ -49,9 +49,11 @@ Without this, a 1pp fix is invisible under thermal/session drift.
   not-done result falls through to today's path (zero concurrency risk). Bonus: removes a per-write
   cross-thread timer schedule+cancel (a `EpollEventLoop.wakeup` feeder). Verified: `WriteResponseHandlerTest`
   9/9 + `ShardRoutedReplicaApplyTest` (in-JVM) 1/1, `ant build` green.
-- [ ] **Tier 2 (core, additive):** ready-path in `AsyncFuture.appendListener` — `isDone(result) &&
-  listeners == null` → resolve executor as `notifyExclusive` does (`ListenerList.java:145-148`) and invoke
-  `notifySelf` inline, never touching the field. Ordering-safe via the in-field `NOTIFYING` hold (:110-121).
+- [~] **Tier 2 — ATTEMPTED & REVERTED.** The naive "fire inline, never touch the field" form double-fires
+  re-entrant listeners (`AsyncPromiseTest` → `order.size()`=count+2): the `NOTIFYING` sentinel must be claimed
+  so a listener that adds a listener *while firing* defers to the single drainer. Safe form = `CAS(null →
+  NOTIFYING)` + inline notify + `notify()`'s re-drain tail; saves only the `push` + a 1-elem reverse. Gate on
+  the rig showing `notifyExclusive` is still a gap after Tier 1 before spending more risk on the core primitive.
 - [ ] **Tier 3 (optional):** done-checks in `addCallback`/`map` (`AbstractFuture.java:273-355`) before node
   construction, scoped to `notifyExecutor()==null && executor==null`; `map` returns `ImmediateFuture`.
 - [ ] Measure: asprof **alloc** differential (async-future alloc → near-0), GC-log pause analysis (fewer/

@@ -101,10 +101,18 @@ Handler.outcome()` attaches on the inline path, so attaches land on an already-d
    `AsyncPromise` + `scheduler.schedule` timer + `timer.cancel` + listener + drain. `computeVerdict()` is pure
    (:224-227). Zero concurrency risk. Also kills a per-write cross-thread timer schedule+cancel — a likely
    feeder of the `EpollEventLoop.wakeup` samples §2 booked as "TPC steering tax."
-2. **Tier 2 (core, additive):** ready-path in `AsyncFuture.appendListener` — when `isDone(result) &&
-   listeners == null`, resolve the executor as `notifyExclusive` does (`ListenerList.java:145-148`) and invoke
-   `notifySelf` inline; never touch the field. Ordering-safe (a drain holds `NOTIFYING` in-field until done,
-   :110-121, so null+done ⇒ all earlier listeners already ran). Low-moderate risk; gate on future/promise units.
+2. **Tier 2 (core, additive) — ATTEMPTED & REVERTED 2026-07-14; the naive form is UNSAFE.** The proposed
+   "when `isDone(result) && listeners == null`, invoke `notifySelf` inline and never touch the field" **double-
+   fires re-entrant listeners** — `AsyncPromiseTest` failed (`order.size()` = count+2). Why: a listener may add
+   another listener *while firing* (the test's `getRecursive*`); the `NOTIFYING` sentinel exists to make such
+   re-entrant adds **defer to the single active drainer** so each fires once, in order. Firing inline without
+   claiming the field means the re-entrant add also sees `null && done` and fires nested, breaking the
+   single-drain invariant. (Fable's ordering argument covered *earlier* listeners but missed *re-entrant* ones;
+   the primitive's own unit test caught it.) A SAFE version must still claim the field:
+   `CAS(listeners: null → NOTIFYING)`, notify the one listener inline, then run `notify()`'s exact re-drain tail
+   (`while (!CAS(NOTIFYING→null)) { list = getAndSet(NOTIFYING); notifyExclusive(list, this); }`) so re-entrant
+   adds defer and drain in order. That saves only the `push` + a 1-element `reverse` — modest. **Gate on the rig
+   measurement:** only pursue it if the async drain (`notifyExclusive`) is still a meaningful gap after Tier 1.
 3. **Tier 3 (optional):** done-checks in `addCallback`/`map` (`AbstractFuture.java:273-355`) before node
    construction, scoped to `notifyExecutor()==null && executor==null`; where node allocs actually die.
 - **KILL:** bare-listener field; recycled node (pooling 24-byte TLAB objects is a wash).

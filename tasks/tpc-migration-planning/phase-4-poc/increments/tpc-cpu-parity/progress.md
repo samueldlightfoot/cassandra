@@ -153,3 +153,10 @@ the Phase 0 ruler exists; ~3pp drift floor hides both).
 **Next (unchanged order):** Phase 0 rig ruler (verify rig state first — `157.180.98.112`, bills hourly) →
 measure 1a+Tier1 vs trunk in instructions/op → 1b Tier 2/3 → re-measure → Phase 3 memtable. Deferred: 1b
 Tier 2 (`AsyncFuture.appendListener` ready-path) and `validateSafe` classification (needs the rig profile diff).
+
+**Update (same session): 1b Tier 2 attempted & reverted.** The inline ready-path in `AsyncFuture.appendListener`
+double-fired re-entrant listeners (`AsyncPromiseTest` → `order.size()`=count+2). The `NOTIFYING` sentinel is
+load-bearing for re-entrant adds (a listener that adds a listener while firing must defer to the single
+drainer), which "fire inline, never touch the field" violates. Reverted (tree clean, `AsyncPromiseTest` 4/4
+again). Safe form claims the field (`CAS null→NOTIFYING` + re-drain tail) but saves little; gated on the rig
+showing `notifyExclusive` still matters after Tier 1. **Landed this session: 1a + Tier 1 only.**
