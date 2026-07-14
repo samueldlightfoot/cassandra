@@ -1,5 +1,143 @@
 # Progress — TPC CPU parity (Scylla-guided implementation fixes)
 
+## RESIDUAL-ALLOC FIX (2026-07-14) — attach-on-done fast path for addCallback(BiConsumer); Tier-3 landed safely
+
+Phase 6 found routing's tail is masked by its **15%-higher allocation** (45,040 vs trunk 39,287 alloc samples).
+Root-caused by diffing the attribution alloc profiles: the routing-added allocation is dominated by the **async
+future/listener/callback machinery** — types ~absent on trunk: `ListenerList$$Lambda` 1,131 · `CallbackBi
+ConsumerListener` 661 · `AsyncPromise` 659 · `ListenerList$RunnableWithExecutor` 539 (~52% of the ~5,753-sample
+gap). Call paths: the fork's async CQL dispatch + shard-routing chain (`Dispatcher.processRequestAsync→
+addCallback`, `ModificationStatement.executeAsync→map`, `ShardExecutors.shardTagged`) — each attach allocates a
+fused node where trunk (more synchronous) allocates none. This is the deferred **Tier-3 "attach-on-done"** from
+findings §3.1.
+
+**Landed (this session): the fast path for `addCallback(BiConsumer)`** — the single biggest node
+(`CallbackBiConsumerListener` 661, what the hot Dispatcher paths use). In `AsyncFuture.addCallback(BiConsumer)`:
+when `isDone() && notifyExecutor()==null` and we can claim the empty slot (`CAS null→NOTIFYING`), run the
+callback inline (mirroring `CallbackBiConsumerListener.run` + its `ExecutionFailure.handle` path) and skip the
+node; `ListenerList.drainAfterInline` releases + drains re-entrant adds. **Safe because it reduces to `notify()`'s
+exact NOTIFYING claim/drain protocol** — a re-entrant add sees NOTIFYING, defers, drains in order (firing nested
+was the reverted Tier-2 bug). NO lambda wrapper (that would re-allocate what it saves — escape analysis won't
+strip it once it crosses into the claim method), so the callback is invoked directly.
+
+**Verified.** `ant build` clean. New focused tests (`AsyncPromiseTest`): already-done success/failure fire inline
+once with correct `(value,null)`/`(null,cause)`; not-done falls through to node path; **re-entrant callback fires
+once, deferred, order [0,2,1]** (the Tier-2-killer case). `AsyncPromiseTest` 7/7 (4 original run the full
+`AbstractTestAsyncPromise` recursive/already-done harness = no regression), `ImmediateFutureTest` 3/3 (always-done
+→ exercises the fast path). Files: `AsyncFuture.java`, `ListenerList.java`, `AsyncPromiseTest.java`. NOT committed.
+
+**Alloc drop CONFIRMED on rig** (asprof alloc A/B, same session, co-located ~90k/s — alloc/op is co-location-
+invariant; jar `.jar.routing-alloc` md5 81e13444, `drainAfterInline` javap-verified in-jar): `CallbackBiConsumer
+Listener` **654 → 0** (raw: 16 stacks → 0 — the fast path fires on the hot dispatch path; the attaches are
+inline-completion, not executor-bound). Total alloc 44,326 → 43,718 (**−608 same-session**, and total went DOWN
+not up ⇒ the no-lambda design added nothing). Integration smoke: 4.88M writes, **0 errors**. So the fast path
+eliminates its whole allocation type and closes ~654/5,753 ≈ 11% of the routing-vs-trunk alloc gap.
+**Deferred (next alloc targets):** `map`'s listener-lambda (`RunnableWithExecutor` ~480 + Lambda; `result` alloc
+unavoidable, only the listener node is saveable) and the `AsyncPromise` per-handler alloc (620, largely
+architectural). perf/tail benefit of the reduced alloc needs a bigger box to show (this rig's tail is GC-pause-
+frequency bound).
+
+---
+
+## PHASE 6 RESULT (2026-07-14) — mechanism WINS (c2c −31% HITM); net latency does NOT on this rig; tail-at-scale deferred to a bigger box
+
+Trunk vs routing-newfixes, off-box loadgen (`62.238.35.142`, hel1, RTT 0.46ms). Fable-critiqued methodology
+(`phase6-methodology-critique.md`): lead on the GC-independent mechanism + honest-ceiling, not on p99.
+
+**(A) Mechanism — perf c2c: routing WINS, −31% cross-core contention (the clean, GC-independent result).**
+Matched load (total mem records within 0.3%: trunk 1,105,309 · routing 1,108,858), 20s, ldlat=30, single-socket
+(all HITM = Local):
+| | trunk | routing-newfixes | Δ |
+|---|---|---|---|
+| Load Local HITM (cross-core hit-modified) | 8,596 | 5,901 | **−31.4%** |
+| shared cache lines | 4,162 | 2,842 | −31.7% |
+| HITM rate (per record) | 0.778% | 0.532% | −31.6% |
+Per-shard routing bounces ~⅓ fewer modified cache lines across cores at matched write load — the shared-
+everything→per-shard mechanism, real and measurable even on 6 cores. (Symbols are JIT-unresolved, so this is a
+count/rate result, not per-line named; `perf c2c` is the right instrument because it measures cross-core
+coherence traffic, which plain cache-miss VOLUME does not — confirmed below.)
+
+**(B) Latency/throughput — rate ladder (fixed `--concurrency 3000`, 90s/rung): NO tail win; marginally worse.**
+Delivered is IDENTICAL per rung (both ramp-limited to ~0.70× offered — an I/O/stall-bound knee, not CPU: at the
+knee loadgen 21% + cass box 45% busy, neither saturated). p50 at parity; p90 + the 1–20ms "contention band" mass
+are marginally HIGHER on routing:
+| rate | deliv | p50 T/R | p90 T/R | 1–20ms% T/R (HDR band) |
+|---|---|---|---|---|
+| 80k | 56.6k | 0.69/0.72 | 0.88/0.94 | 1.25 / 3.75 |
+| 120k | 84.8k | 0.76/0.79 | 0.97/1.07 | 5.63 / 15.00 |
+| 160k | 113k | 0.82/0.83 | 1.11/1.28 | 18.1 / 25.0 |
+| 200k | 140k | 0.85/0.84 | 1.36/1.45 | 28.75 / 28.75 |
+This is the OPPOSITE of the thesis prediction and is consistent with routing's residual **15%-higher allocation**
+(attribution alloc totals: trunk 39,287 vs routing 45,040) feeding more young-GC pause events. p99/p999 are pure
+GC noise (single windows, no clean signal). **Caveat:** single ascending pass — directional, not conclusive;
+needs interleaved N≥3 to confirm (Fable §5).
+
+**(C) Why the mechanism win doesn't pay off here (cache-miss profile, asprof `-e cache-misses`, symbolic).**
+GC dominates and is EQUAL across arms (G1 total cache-miss: trunk 160,782 vs routing 162,970; `G1ParScan
+ThreadState::trim_queue` alone ~108k = the single top source, ~19% of all misses on both). The −31% HITM is a
+tens-of-ns cache-coherence saving; on 6 cores / single L3 it is tiny in absolute terms and swamped by 0.46ms RTT
++ GC pauses. Memtable work is comparable volume (trunk shared `InMemoryTrie.attachChild` 41k; routing
+`InMemoryTrie.applyContent` + per-shard `TrieMemtable$MemtableShard.apply`) — sharding changes cross-core SHARING
+(HITM), not total miss volume, which is why c2c catches the win and cache-miss volume doesn't.
+
+**(D) Honest ceiling + baseline (the defensible claim).** This rig proves the **mechanism (−31% HITM) + no
+material regression**, NOT tail-at-scale. The tail win needs (1) ≥32 cores / multi-NUMA to grow the contention
+delta past the RTT/GC floor, and (2) closing routing's residual allocation gap so GC stops masking it.
+Baseline is FAIR (§0): the parity fix removes 106 lines of branch-added `outcome()` machinery trunk never had
+(source-verified) — RF=1-conditional (fast path can't fire when RF=3 awaits remote acks) and with a portable-
+`containsIgnoreCase` caveat (fair "trunk+that" baseline ⇒ routing ~+3%, not +1.4%). Next instrument = core-count
+**scaling slope** (`/root/scaling_ladder.sh`, SMT-off, pinning-verified) on a bigger box. Full critique +
+resolutions: `phase6-methodology-critique.md`. Rig data: `/root/results_{c2c,sweep,profcache}/`.
+
+---
+
+## ATTRIBUTION RESULT (2026-07-14) — the win is the outcome() fast path; the route fix is real but tiny; a prior §2 frame was mis-booked
+
+**Method.** asprof 4.4 CPU+alloc collapsed, 3 arms (trunk / routing-fixed / routing-newfixes) in ONE session,
+matched co-located ~94k/s, cpu 60s + alloc 40s each. RAW inclusive sample deltas (not self-normalized %).
+Scripts `/root/{prof_attr.sh,analyze_attr.sh}`; data `/root/results_prof_attr/{cpu,alloc}_<arm>.collapsed`.
+CPU sample totals: trunk 25,262 · routing-fixed 24,945 · routing-newfixes 23,326 (totals are for frame
+attribution only — the ins/op capstone is the authoritative per-op gap; this session's fix_delta = 1a+Tier1).
+
+**(1) outcome() terminal-write fast path (1b Tier 1) = essentially the ENTIRE win.** Confirmed on three signals:
+- CPU: `AbstractWriteResponseHandler.outcome` inclusive **1061 → 90** (−971, −92%). Under it: `AsyncPromise`
+  **249 → 0**, timer `schedule` **821 → 0**. The per-write cross-thread timer schedule was the single biggest
+  frame the fix removed (bigger than the promise alloc itself).
+- Wakeup relief: `EpollEventLoop.wakeup` **869 → 758** (−111), landing between routing-fixed (+188 over trunk)
+  and trunk (681) — the per-write timer schedule+cancel wakeup, dropped as the handoff predicted.
+- Alloc: outcome()'s five-object chain (`ScheduledFutureTask` 466 + `AsyncPromise` 169 + two lambdas 355 +
+  `GenericFutureListenerList` 146 = 1136) collapses to **one `ImmediateFuture` (155)**. `ScheduledFutureTask`
+  TOTAL alloc **474 → 6** (= trunk's 7) — the per-write deadline timer is fully eliminated, back to trunk.
+
+**(2) route schema-handle (1a) = landed, but only ~24 samples.** `MutationShardRouting.route → isLocalSystem
+Keyspace` is a caller of that method at **24 samples** in routing-fixed and **ABSENT** in routing-newfixes —
+the fix did exactly what it was designed to. But 24 samples (~1‰) is a rounding error next to outcome(). The
+coarse `route&containsIgnoreCase` grep (220→192, ~unchanged) is a TRANSITIVE artifact: `route → Schema.get
+KeyspaceInstance → isLocalSystemKeyspace → containsIgnoreCase` (schema resolution inside route), which 1a
+never touched.
+
+**(3) CORRECTION — the §2 "~1.2pp containsIgnoreCase routing tax" was mis-attributed; do NOT chase it.**
+`containsIgnoreCase` shows 719 (fork) vs **0 (trunk)**, which §2 booked as routing-added. It is not. It is a
+NAMING artifact of a fork refactor (`SchemaConstants.java`, this branch vs trunk) that is **cheaper than trunk**:
+trunk does `contains(toLowerCaseLocalized(name))` — an unconditional per-call lowercase alloc — measured at
+`toLowerCaseLocalized` **466 (trunk) → 0 (routing-fixed) / 16 (newfixes)**. The fork tries the direct set
+`contains(name)` first and only lowercases on a genuine uppercase char, so trunk's 466 lowercasing samples
+vanish; the `containsIgnoreCase` label just re-homes the `RegularImmutableSet.contains` work trunk also pays.
+Net: trunk's `isLocalSystemKeyspace` inclusive (466) ≥ newfixes' (384) — the fork's schema check WINS. The
+membership check was never a routing gap contributor; both routing arms already carry the optimization (prior
+session). Removing it from the routing backlog. (This is the same self-normalized-% trap §2 warned about, hit
+one level down at frame naming.)
+
+**(4) validateSafe:318 = GAP-NEUTRAL (classified, as requested).** `validateSafeToExecuteNonTransactionally &
+containsIgnoreCase`: **89 (routing-fixed) vs 86 (routing-newfixes)** = equal within noise; held all along,
+untouched by the fixes. Leave it. (It's the same cheap fork schema check as #3, not a further win.)
+
+**Bottom line.** This session's 4,758 ins/op improvement is the outcome() terminal-write fast path, full stop
+(promise + deadline-timer + listener machinery per local write → one `ImmediateFuture`), corroborated on CPU,
+alloc, and wakeup. The route fix is a genuine but negligible confirmation. Attribution DONE → pivot to Phase 6.
+
+---
+
 ## HANDOFF (2026-07-14, end of day) — CPU parity REACHED; attribute the win, then pivot to Phase 6
 
 **Result (settled, do not re-run to re-confirm):** the two committed fixes bring the routing build to

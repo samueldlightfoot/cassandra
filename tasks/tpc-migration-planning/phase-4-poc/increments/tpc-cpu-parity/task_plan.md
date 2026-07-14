@@ -99,10 +99,12 @@ Without this, a 1pp fix is invisible under thermal/session drift.
   we've never tuned it; may directly move the p99 gate.
 
 ## Phase 6 — prove where TPC actually wins (strategic; informs whether CPU-parity-on-6-cores is the right gate)
-- [ ] **`perf c2c`** on trunk vs routing to visualize cross-core cache-line bouncing — if trunk contends on
-  its shared NTR pool / shared memtable and routing doesn't, that is the TPC win made visible.
-- [ ] **Concurrency sweep** with client `--hdr` per rung — look for the rung where trunk's tail blows up
-  (contention onset) but routing's stays flat.
+- [x] **`perf c2c`** trunk vs routing — DONE: routing −31% cross-core HITM (8,596→5,901) at matched write load.
+  The mechanism made visible; GC-independent. (JIT-unresolved symbols → count/rate, not per-line named.)
+- [x] **Rate ladder** (fixed `--concurrency 3000`) with `--hdr` per rung — DONE: NO tail blowup divergence.
+  Delivered identical (IO-bound knee); p50 parity; routing's p90/1–20ms-band marginally WORSE (its higher
+  alloc → young-GC). Answer to the gate question: 6-core single-L3 CANNOT show tail-at-scale (GC/RTT swamp the
+  tens-of-ns contention delta) — CPU-parity + mechanism is what this rig proves; the tail claim needs a big box.
 - [ ] **Optional: Scylla-on-rig control** — same `cassandra-easy-stress` KeyValue workload against real
   ScyllaDB. If mature TPC is at/below trunk CPU with better tail, it proves the model wins and our residual is
   implementation. Read the *shape* (tail-vs-concurrency, c2c, cross-shard ops), not the absolute (C++/no-GC
@@ -117,7 +119,17 @@ a real TPC floor or still more of our own overhead, and whether the PoC gate sho
 (the paper says the win is tail-at-scale, not single-node CPU).
 
 ## Review section (fill as phases land)
-- Phase 0: …
-- Phase 1a/1b: …
-- Phase 2: …
-- Phase 3: …
+- Phase 0: instructions/op ruler (perf stat -p ÷ server-side write delta) — co-location & frequency invariant.
+- Phase 1a/1b: landed. Capstone: routing-newfixes +1.4% NS vs trunk (was +6.1%); fix_delta 4,758 ins/op, 76%.
+  Attribution (asprof, 2026-07-14): the win is 1b Tier-1 (outcome() fast path) — CPU outcome() 1061→90, alloc
+  5-obj chain→1 ImmediateFuture, ScheduledFutureTask 474→6. 1a route fix landed but tiny (24 samples). The §2
+  containsIgnoreCase "~1.2pp routing tax" was mis-attributed (fork check is cheaper than trunk). See progress.md.
+- Phase 2: deferred (upstream findIndex; gap-neutral).
+- Phase 3: DROPPED (memtable CAS — not worth HIGH risk for a closed gap).
+- Phase 6: DONE (this rig). perf c2c: routing −31% cross-core HITM at matched write load (8,596→5,901) = the
+  mechanism, GC-independent — WINS. Rate ladder + HDR bands: NO net latency win (delivered identical/IO-bound;
+  p50 parity; p90 + 1–20ms band marginally WORSE on routing, tracking its 15%-higher alloc → young-GC). asprof
+  cache-misses: GC dominates & is equal across arms (~19%), so the tens-of-ns HITM saving is swamped by RTT+GC
+  on 6 cores. Conclusion: rig proves MECHANISM + no-regression, NOT tail-at-scale. Next = core-count scaling
+  slope (scaling_ladder.sh) on ≥32-core/multi-NUMA box + close routing's residual alloc. §0 baseline fair;
+  RF=1-conditional. Full: progress.md §PHASE 6 RESULT + phase6-methodology-critique.md.

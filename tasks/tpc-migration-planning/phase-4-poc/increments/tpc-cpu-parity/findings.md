@@ -59,6 +59,16 @@ The async row above dropped its `recycler`117 frame (2026-07-14): it has no prov
 plausibly Netty transport buffer pooling, not our futures. So the honest async-future bucket is **~0.9pp**
 (328 samples), not the ~1.2 first booked. Don't re-add the recycler to the future cost without attributing it.
 
+The `containsIgnoreCase` row is **NOT in the routing gap either** (attribution profile, 2026-07-14 — supersedes
+its `~1.2 / OURS` booking above). It reads 719 (fork) vs 0 (trunk) only because the fork renamed the check:
+trunk pays `contains(toLowerCaseLocalized(name))` — an unconditional per-call lowercase alloc — measured at
+`toLowerCaseLocalized` 466 (trunk) → 0 (fork), while the fork's `SchemaConstants.containsIgnoreCase` tries the
+direct set contains first. Same self-normalized-% trap as the metrics row, one level down at frame naming: the
+membership check runs on BOTH arms and the fork's is *cheaper* (trunk `isLocalSystemKeyspace` inclusive 466 ≥
+newfixes 384). The only genuinely routing-added schema cost was `MutationShardRouting.route`'s own direct call
+(24 samples), now removed by 1a. Do not chase apply-side keyspace scans as a routing win — the fork already
+beats trunk. Full attribution: progress.md §ATTRIBUTION RESULT.
+
 ---
 
 ## 3. What Scylla does differently (four source teardowns) — the fixes
