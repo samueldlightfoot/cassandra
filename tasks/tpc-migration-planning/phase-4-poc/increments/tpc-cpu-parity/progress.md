@@ -1,5 +1,54 @@
 # Progress — TPC CPU parity (Scylla-guided implementation fixes)
 
+## HANDOFF (2026-07-14, evening) — contention counter + full side-by-side DONE; mechanism proven twice (counter→0, c2c −27%)
+
+Both prior-handoff tasks finished. Full detail in `contention-result.md` (TASK 1) and `sidebyside-result.md`
+(TASK 2); this is only what a fresh context can't re-derive.
+
+**(1) The results.**
+- **TASK 1 — memtable per-shard contention, GC-immune domain counter (the headline).** Over a matched
+  ~8.09M-put steady window (both arms within 0.03%): **trunk 71.9 contended/1k puts (7.19%), routing-alloc
+  0.0/1k (0.000%), misrouted 0.** Exactly the "trunk N/1k, routing ~0" the Phase-6 critique asked for.
+- **TASK 2 — routing-alloc (81e13444) vs trunk (745ce392), one table:** ins/op **−0.28%** (parity; 102,459
+  vs 102,751, was +1.4% pre-fix) · alloc **+10.1%** (43,591 vs 39,577; narrowed from +14.6%) · c2c
+  Load-Local HITM **−27.3%** (6,876 vs 9,456, 2 tight rounds) · rate-ladder p50/p90 **flat** across
+  80/120/160/200k, p99+ GC-noise, no tail win/regression.
+- Net: current build is at CPU + p50/p90 parity, eliminates memtable shard-lock contention (counter→0)
+  AND cuts cross-core HITM −27%; the only residual is the +10% async-machinery alloc gap that keeps GC as
+  the tail ceiling on 6 cores. Mechanism proven; tail-at-scale still needs a bigger box (Phase 6 ceiling).
+
+**(2) No code change was needed for TASK 1.** `Contended/Uncontended memtable puts` + the `tryLock`
+contention pattern are **upstream** in `TrieMemtable` (only `misroutedPuts` is fork-added), so both jars
+already emit them. Read via a small JMX client `MemtableContention.java` (compiled on rig, local port 7199).
+
+**(3) THE data-validity gotchas (both bit this session — bake into any rerun).**
+- **`c2c.sh` does NOT swap/prep** (its header says "run AFTER swap+prep_flip"). My first `task2_all.sh`
+  called it twice with no swap, so both c2c runs measured the sweep's last-live jar (routing-alloc) →
+  false ~0 gap (6,478 vs 6,555). Redone with **`c2c_ab.sh`** (swaps+preps each arm, 2 interleaved rounds)
+  → real −27%. Lesson: verify `pools=OFF`(trunk)/`pools=ON`(routing) in `prep_state.txt` per arm.
+- **Contention counter must be a DELTA over a steady window, not lifetime.** routing-alloc's *cumulative*
+  contended was 193,421 (5.7%) — ALL of it the startup/commitlog-replay transient (unrouted applies); the
+  T1−T0 window delta was exactly 0. Reading the lifetime counter would have wrongly reported routing ~5%.
+- Detached-launch redirect: `setsid bash x.sh >DIR/log` fails if `DIR` doesn't exist yet (script mkdir's
+  it too late). `mkdir -p DIR` before launching. And `pgrep -f <script>.sh` self-matches the ssh cmdline.
+
+**(4) As-built rig assets (all under `/root/`).** `MemtableContention.java` (+`.class`), `contention_ab.sh`
+(→`results_contention/`), `sidebyside_colocated.sh` (ins/op+alloc, →`results_sxs/`), `c2c_ab.sh`
+(→`results_c2c/c2c_ab.txt`), `task2_all.sh` (orchestrator — but its c2c leg is the buggy no-swap one; use
+`c2c_ab.sh` instead). Data dirs: `results_{contention,sxs,sweep,c2c}/`. All committed to the repo task folder.
+
+**(5) Rig/box state.** Rig `157.180.98.112` live on **routing-alloc** (81e13444; c2c_ab's last arm was
+routing-alloc round2). All load stopped (rig + loadgen idle). Loadgen box `62.238.35.142` (ccx43) **UP —
+KEEP (user directive, bills hourly)**; delete only when user says done. Conf `/data/tpc-poc/conf`
+(TrieMemtable — the table's `memtable='default'` resolves to trie there, NOT the repo-conf skiplist),
+data `/data/tpc-poc/data`, JMX local 7199.
+
+**(6) Next (open).** Nothing gating. Remaining backlog unchanged: bigger-box scaling slope for tail-at-scale;
+close the +10% async alloc gap (map-path listener node + AsyncPromise per-handler, both architectural);
+RF=3 multi-node gate (parity is RF=1-conditional). Phase 2 findIndex is an independent upstream win.
+
+---
+
 ## HANDOFF (2026-07-14, late) — two alloc fast paths landed+committed; NEXT: contention counters + trunk-vs-latest side-by-side
 
 Session did: attribution of the CPU-parity win, Phase 6 (c2c mechanism + honest ceiling), root-caused the residual
