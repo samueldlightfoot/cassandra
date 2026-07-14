@@ -1,5 +1,88 @@
 # Progress — TPC CPU parity (Scylla-guided implementation fixes)
 
+## HANDOFF (2026-07-14, late) — two alloc fast paths landed+committed; NEXT: contention counters + trunk-vs-latest side-by-side
+
+Session did: attribution of the CPU-parity win, Phase 6 (c2c mechanism + honest ceiling), root-caused the residual
+alloc gap and **shipped two async fast paths**, and killed the scaling-ladder line (confounded). Detail below in
+the dated sections; this handoff is only what a fresh context can't re-derive.
+
+**(1) Deviations from plan.**
+- Went past the plan: after Phase 6 showed routing's tail is masked by its ~15%-higher allocation, root-caused it
+  (async dispatch listener/callback nodes) and implemented+committed **two attach-on-done fast paths**
+  (`addCallback(BiConsumer)`, `map`) — not in the original increment plan.
+- **Scaling ladder ABANDONED (I/O-confound).** The write knee is I/O/commitlog-bound, NOT CPU-bound: trunk at 2
+  pinned cores delivered 143,745/s ≈ the 6-core knee (~140k); at the knee cass box is only ~45% busy. So a
+  core-scaling ladder on write throughput cannot show CPU/contention scaling **on any box** (a bigger box won't
+  fix it). `scaling_ladder.sh` exists but is a dead end for this metric.
+- **Bigger box dropped.** ccx63 (48 vCPU) hit the Hetzner dedicated-core limit; user confirmed 16 vCPU is the
+  realistic customer ceiling, so >16 vCPU is out of scope.
+
+**(2) As-built interfaces (verbatim — the next phase builds on these).**
+- `ListenerList.drainAfterInline(AtomicReferenceFieldUpdater<? super T, ListenerList> updater, T in)` — new
+  package-private static. Releases a `null->NOTIFYING` claim and drains re-entrant pushes; = `notify()`'s re-drain
+  tail. Callers must already hold NOTIFYING.
+- `AsyncFuture.addCallback(BiConsumer<? super V, Throwable> callback)` — new `@Override`, returns
+  `AbstractFuture<V>`. Fast path guard (verbatim): `if (isDone() && notifyExecutor() == null &&
+  listenersUpdater.compareAndSet(this, null, NOTIFYING))` → run `if (isSuccess()) callback.accept(getNow(), null);
+  else callback.accept(null, cause());` in try, `catch (Throwable t) { ExecutionFailure.handle(t); }`, `finally {
+  ListenerList.drainAfterInline(listenersUpdater, this); }`, `return this;` else `return super.addCallback(callback)`.
+- `AsyncFuture.map(AbstractFuture<T> result, Function<? super V, ? extends T> mapper, @Nullable Executor executor)`
+  — new `protected @Override`. Same guard plus `&& executor == null`; body `if (isSuccess())
+  result.trySet(mapper.apply(getNow())); else result.tryFailure(cause());`, catch → `result.tryFailure(t);
+  ExecutionFailure.handle(t);`, finally drainAfterInline, `return result` else `super.map(...)`.
+- Pattern for any further fast paths (flatMap/andThenAsync/addCallback(FutureCallback)): SAME guard, invoke the
+  callback DIRECTLY (no wrapper lambda — it re-allocates what you save), drainAfterInline in finally.
+
+**(3) Tested / deferred / not-done.** Green: `AsyncPromiseTest` 9/9 (incl. re-entrant `addCallback` + `map`,
+order `[0,2,1]` — the case that killed the reverted Tier-2), `ImmediateFutureTest` 3/3, `ant build`, `ant jar`.
+Rig-confirmed under write load: `CallbackBiConsumerListener` alloc **654→0**, total alloc down, **0 write errors**.
+Deferred (low ROI): `map`'s `result` alloc (unavoidable), `AsyncPromise` per-handler alloc (~620, architectural),
+flatMap/andThenAsync/`addCallback(FutureCallback)` fast paths (same pattern, not hot). **NOT DONE (next phase):
+contention counters + trunk-vs-latest side-by-side (there is NO current-vs-trunk comparison with the alloc-fix jar
+— all existing comparisons are trunk vs routing-newfixes, pre-fix).**
+
+**(4) Decisions + rationale.** Fast path lives in `AsyncFuture`, NOT `AbstractFuture`: `SyncFuture` shares
+`listenersUpdater` but uses a DIFFERENT protocol (`synchronized` + `pushExclusive`, no NOTIFYING), so the
+CAS-claim would be wrong for it. Safety = the fast path reduces to `notify()`'s exact NOTIFYING claim/drain; a
+re-entrant add sees NOTIFYING, defers, drains in order. §0 baseline is fair (the `outcome()` machinery is
+branch-added, trunk has zero) — recorded in the ATTRIBUTION section; RF=1-conditional caveat stands.
+
+**(5) Gotchas.** (a) `pkill -f <pat>` over SSH SELF-MATCHES the ssh command line (it contains `<pat>`) → kills its
+own session → rc 255. Use PID kill, or split the literal: `P=$(printf 'scal'; printf 'ing_ladder'); pkill -f "$P"`.
+(b) Rig SSH intermittently drops longer commands (Helsinki link) — retry 2-3×. (c) `unzip` absent on rig — inspect
+jar classes with `javap -cp <jar> <FQCN>`. (d) `ant build` ≠ jar; use `ant jar`, then javap-verify the class is
+inside. (e) alloc/op & ins/op are co-location-invariant → co-located loadgen fine for those; TAIL needs off-box.
+
+**(6) Assumptions to treat as given.**
+- **Loadgen box UP — KEEP IT (user directive), bills hourly:** `tpc-scale-lg` = `62.238.35.142` (ccx43, 16 vCPU /
+  8 phys AMD EPYC-Milan, hel1, RTT 0.46ms). easy-stress at `/usr/local/bin/cassandra-easy-stress` (jar md5
+  ae2b804e). Rig's pubkey authorized on it; `rig -> loadgen` rsync works. loadgen→rig:9042 OPEN.
+- Rig `157.180.98.112`: cassandra UP, currently on **routing-newfixes (1ff5de1b)** — swap to the fix jar for the
+  next work. SMT restored to ON. Staged jars in `…/build/`: `.jar.trunk` 745ce392, `.jar.routing-newfixes`
+  1ff5de1b, **`.jar.routing-alloc` 81e13444 = newfixes + BOTH fast paths** (`drainAfterInline` javap-verified in-jar).
+- Rig scripts: `swap.sh` `prep_flip.sh` `capstone.sh`/`ipo.sh` (ins/op) `prof44.sh` `alloc_ab.sh` `c2c.sh`
+  `sweep.sh` `profcache.sh`. Data dirs `/root/results_{ipo,prof_attr,c2c,sweep,profcache,alloc}/`.
+- Write knee is I/O/commitlog-bound (~140k, cass ~45% busy) — do NOT use write-throughput-knee for CPU/contention.
+- Code committed on `tpc-migration` (NOT pushed): `d0eb25ad2d` addCallback, `7db2bb3c09` map, `309c33b096` docs.
+
+**(7) Entry point.** Read in order: THIS handoff → `phase6-methodology-critique.md` (why counters, not tail) →
+`findings.md §3.1/§3.4` (async + memtable-CAS teardowns) → source `AsyncFuture.java` (the 2 fast paths),
+`ListenerList.java:133` (`drainAfterInline`), and for the CAS target `AtomicBTreePartition`/`TrieMemtable$Memtable
+Shard.apply`. Then act. Paste-able prompt:
+
+> Continue TPC alloc/contention work. Read `tasks/tpc-migration-planning/phase-4-poc/increments/tpc-cpu-parity/
+> progress.md` (top HANDOFF), then `phase6-methodology-critique.md` and `findings.md §3.1/§3.4`. Two alloc fast
+> paths (addCallback + map) are landed+committed on `tpc-migration` and the `.jar.routing-alloc` (81e13444) is
+> staged on rig `157.180.98.112`; loadgen box `62.238.35.142` (ccx43) is UP. TASK 1 — **domain contention
+> counters**: count CAS-retries on the shared memtable apply (`AtomicBTreePartition`/`TrieMemtable$MemtableShard`)
+> and NTR-pool wait, trunk vs routing-alloc at matched load — GC-immune, NOT confounded by the I/O-bound write
+> knee (unlike the abandoned scaling ladder); goal "trunk N retries/1k writes, routing ~0". TASK 2 — produce the
+> **current(routing-alloc) vs trunk side-by-side**: ins/op (capstone.sh), alloc (alloc_ab vs trunk), c2c HITM,
+> rate-ladder p50/p90 — one consolidated table (none exists with the fix jar). Swap to `.jar.routing-alloc` first.
+> Keep the loadgen box; delete it only when the user says done. Rig/box facts + gotchas in this handoff §5/§6.
+
+---
+
 ## RESIDUAL-ALLOC FIX (2026-07-14) — attach-on-done fast path for addCallback(BiConsumer); Tier-3 landed safely
 
 Phase 6 found routing's tail is masked by its **15%-higher allocation** (45,040 vs trunk 39,287 alloc samples).
