@@ -59,6 +59,7 @@ import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.concurrent.AsyncPromise;
 import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
@@ -173,6 +174,21 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
      */
     public Future<Void> outcome()
     {
+        // Fast path for the common inline-apply case: writeResult is already terminal, so decide the verdict
+        // now and skip the per-write promise, deadline timer, and listener. computeVerdict is side-effect free.
+        if (writeResult.isDone())
+        {
+            try
+            {
+                computeVerdict();
+                return ImmediateFuture.success(null);
+            }
+            catch (Throwable t)
+            {
+                return ImmediateFuture.failure(t);
+            }
+        }
+
         AsyncPromise<Void> outcome = new AsyncPromise<>();
 
         ScheduledExecutorService scheduler = requestTime.timeoutScheduler() != null
