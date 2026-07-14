@@ -174,6 +174,36 @@ public class AsyncPromiseTest extends AbstractTestAsyncPromise
         }
     }
 
+    @Test
+    public void testMapInlineOnAlreadyDone()
+    {
+        // map on an already-terminal future applies the mapper inline (fast path) and yields the mapped value.
+        AsyncPromise<Integer> p = new AsyncPromise<>();
+        p.setSuccess(3);
+        org.apache.cassandra.utils.concurrent.Future<Integer> mapped = p.map(v -> v + 100);
+        Assert.assertTrue(mapped.isDone());
+        Assert.assertEquals(Integer.valueOf(103), mapped.getNow());
+    }
+
+    @Test
+    public void testMapInlineReentrant()
+    {
+        // A mapper that re-enters and adds a callback while running on the map fast path must fire that
+        // callback once, deferred in order, and still produce the mapped value. Order: 0 (mapper), 2
+        // (re-entrant callback, drained after the mapper), 1 (a later fast-path attach). Value: 1 + 100.
+        for (boolean tryOrSet : new boolean[]{ false, true })
+        {
+            AsyncPromise<Integer> p = new AsyncPromise<>();
+            if (tryOrSet) p.trySuccess(1); else p.setSuccess(1);
+            List<Integer> order = new ArrayList<>();
+            org.apache.cassandra.utils.concurrent.Future<Integer> mapped =
+                p.map(v -> { order.add(0); p.addCallback((v2, t2) -> order.add(2)); return v + 100; });
+            p.addCallback((v, t) -> order.add(1));
+            Assert.assertEquals(ImmutableList.of(0, 2, 1), order);
+            Assert.assertEquals(Integer.valueOf(101), mapped.getNow());
+        }
+    }
+
     private static final class TestInExecutor implements ExecutorPlus
     {
         static final TestInExecutor INSTANCE = new TestInExecutor();

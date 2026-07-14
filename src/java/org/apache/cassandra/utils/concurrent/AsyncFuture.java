@@ -193,6 +193,39 @@ public class AsyncFuture<V> extends AbstractFuture<V>
     }
 
     /**
+     * Attach-on-done fast path (mirrors {@link #addCallback}): when this future is already terminal and would
+     * notify inline, apply the mapper straight into {@code result}, skipping the listener node and lambda that
+     * {@code super.map} allocates via {@code addListener}. {@code result} is still allocated -- it is the return
+     * value; only the notification wrapper is saved. Claiming the slot {@code null -> NOTIFYING} keeps a
+     * re-entrant add ordered via {@link ListenerList#drainAfterInline}. Failure is recorded in {@code result}
+     * and routed to {@link ExecutionFailure} exactly as the listener body's {@code result.tryFailure(t); throw t}
+     * is (the throw lands in the listener executor's handler).
+     */
+    @Override
+    protected <T> Future<T> map(AbstractFuture<T> result, Function<? super V, ? extends T> mapper, @Nullable Executor executor)
+    {
+        if (isDone() && executor == null && notifyExecutor() == null && listenersUpdater.compareAndSet(this, null, NOTIFYING))
+        {
+            try
+            {
+                if (isSuccess()) result.trySet(mapper.apply(getNow()));
+                else result.tryFailure(cause());
+            }
+            catch (Throwable t)
+            {
+                result.tryFailure(t);
+                ExecutionFailure.handle(t);
+            }
+            finally
+            {
+                ListenerList.drainAfterInline(listenersUpdater, this);
+            }
+            return result;
+        }
+        return super.map(result, mapper, executor);
+    }
+
+    /**
      * Support {@link com.google.common.util.concurrent.Futures#transformAsync(ListenableFuture, AsyncFunction, Executor)} natively
      *
      * See {@link #addListener(GenericFutureListener)} for ordering semantics.
