@@ -64,6 +64,8 @@ Without this, a 1pp fix is invisible under thermal/session drift.
   path) but its pp-win is weighted to the RF=1 inline-apply rig — don't over-claim on that number.
 
 ## Phase 2 — metrics `findIndex` O(1) (NOT a gap-closer; ~4% absolute on BOTH arms, upstreamable) — findings §3.3
+> REFRAMED 2026-07-14: pursue as an independent *upstream Cassandra* win on its own timeline, not as part of
+> TPC parity (the gap is closed). Still the biggest *absolute* item; unrelated to the routing delta.
 - [ ] Replace `DecayingEstimatedHistogramReservoir.findIndex` binary-search bucket lookup with O(1) bit-math
   (count-leading-zeros) bucket index; Scylla ref `utils/estimated_histogram.hh:158-168`.
 - [ ] Audit which per-op metric points on the shard path are still **shared/decaying** (striped/atomic) vs
@@ -73,6 +75,8 @@ Without this, a 1pp fix is invisible under thermal/session drift.
   labelled gap-neutral so nobody credits it to routing.
 
 ## Phase 3 — memtable single-writer CAS removal (~1.4pp) — findings §3.4
+> DROPPED 2026-07-14: the per-op gap is already ~closed (routing +1.4% NS vs trunk after 1a+Tier1), so this
+> HIGH-risk core-primitive change is no longer justified. Revive only if a near-knee/RF=3 re-measure reopens it.
 - [ ] Confirm the shard apply path (`TrieMemtable$MemtableShard` / `AtomicBTreePartition`) still executes a
   CAS/`AtomicReference`/volatile update despite single-writer-per-shard ownership.
 - [ ] **Prove the single-writer invariant** (no concurrent flush thread or other writer touches the partition

@@ -1,5 +1,96 @@
 # Progress — TPC CPU parity (Scylla-guided implementation fixes)
 
+## HANDOFF (2026-07-14, end of day) — CPU parity REACHED; attribute the win, then pivot to Phase 6
+
+**Result (settled, do not re-run to re-confirm):** the two committed fixes bring the routing build to
+statistical CPU parity with trunk in instructions/op. Same-session capstone (3 arms × 6×40s, ~94k/s
+co-located, RF=1): trunk 102,225 · **routing-newfixes 103,698 (+1.4%, t≈1.2 NS)** · routing-fixed 108,456
+(+6.1%, t≈4.9). Fixes cut **4,758 ins/op (p<0.005) = 76% of the gap.** Full table + caveats: the RIG RESULT
+section at the bottom of this file. So "close the CPU gap" is **done** at this operating point; the remaining
+CPU backlog is re-prioritized (Phase 3 memtable DROPPED — not worth HIGH risk for a closed gap; Phase 2
+findIndex reframed as an independent *upstream* win, not a parity gate; Tier 2/3 async stay deferred).
+
+**Next phase (agreed): (1) attribute, then (2) pivot to the TPC win case.**
+- **(1) asprof attribution** (rig warm, ~15 min): CPU-profile routing-newfixes vs routing-fixed under matched
+  load (`/root/prof44.sh`, asprof 4.4), diff **raw sample deltas** (NOT self-normalized %). Confirm the 4,758
+  ins/op maps to the two fixes: the `MutationShardRouting.route → isLocalSystemKeyspace/containsIgnoreCase`
+  frame → ~0, and `AbstractWriteResponseHandler.outcome`'s `AsyncPromise` alloc + `…schedule`/`cancel` timer
+  frames → ~0. Also classify `ConsensusMigrationMutationHelper.validateSafeToExecuteNonTransactionally:318`
+  (held all along): if its `containsIgnoreCase` frame is equal on both arms it's gap-neutral (leave it), else
+  it's a further route-side win.
+- **(2) Phase 6 — prove the win** (`task_plan.md §Phase 6`): CPU parity was only the floor. Show TPC's actual
+  promise (Enberg: tail-at-scale/contention): **concurrency sweep** (off-box loadgen, client `--hdr` p99 per
+  rung, trunk vs routing) to find the rung where trunk's tail blows up but routing stays flat; **`perf c2c`**
+  trunk vs routing to visualize cross-core cache-line bouncing (trunk's shared NTR pool / shared memtable vs
+  per-shard). NOTE: tail needs an **off-box** loadgen (co-located contaminates the tail) — provision ccx43
+  hel1, **delete it when done (bills hourly)**. ins/op did NOT need one; the tail does.
+
+**(1) Deviations from the plan.**
+- 1a did the **route-side only** (a flag on `Keyspace`, not `TableMetadata` — `route` already holds the
+  `Keyspace`). `validateSafe` was NOT touched (likely gap-neutral; deferred to the profile above).
+- 1b: the planned "single-listener bare field" was **impossible as written** (the `listeners` field is
+  `ListenerList`-typed; the updater rejects a bare listener at runtime). Redesigned as a 3-tier attach-on-done
+  family. **Only Tier 1 landed.** Tier 2 (`AsyncFuture.appendListener` inline ready-path) was implemented,
+  **double-fired re-entrant listeners** (`AsyncPromiseTest`), and was **reverted**. Tier 3 shares that hinge →
+  not attempted. See findings §3.1 + task_plan §1b for the safe-but-marginal Tier-2 form.
+- Phase 0 ruler: chose **instructions/op via `perf stat -p <cass_pid>`** and realized it's frequency- AND
+  co-location-invariant → **co-located loadgen, no 2-node/interleaved rig, no turbo change** (simpler than the
+  planned interleaved A/B).
+
+**(2) As-built interfaces (verbatim).**
+- `Keyspace.java`: `private final boolean localSystem;` set in BOTH terminal ctors as
+  `this.localSystem = SchemaConstants.isLocalSystemKeyspace(metadata.name);`. New public getter
+  `public boolean isLocalSystemKeyspace() { return localSystem; }`.
+- `MutationShardRouting.route`: the per-mutation check is now `if (keyspace.isLocalSystemKeyspace())` (was
+  `SchemaConstants.isLocalSystemKeyspace(keyspaceName)`); the `SchemaConstants` import was removed.
+- `AbstractWriteResponseHandler.outcome()`: prepended
+  `if (writeResult.isDone()) { try { computeVerdict(); return ImmediateFuture.success(null); } catch (Throwable t) { return ImmediateFuture.failure(t); } }`
+  before the existing promise+timer path (new import `…concurrent.ImmediateFuture`).
+
+**(3) Tested / deferred / broken.** Green: `MutationShardRoutingTest` 9/9, `WriteResponseHandlerTest` 9/9,
+`AsyncPromiseTest` 4/4 (post-revert), `ImmediateFutureTest` 3/3, in-JVM `ShardRoutedReplicaApplyTest` 1/1,
+`ant build`. Deferred: `validateSafe` classify · Tier 2 (safe form marginal) · Tier 3 · Phase 2 findIndex
+(upstream) · Phase 3 (dropped). Broken: none.
+
+**(4) Rig gotchas (cost real time).**
+- `ant jar` OVERWRITES the live classpath jar → corrupts the *running* JVM's lazy class-loading
+  (`NoClassDefFoundError` server-side; `nodetool tablestats` parse goes empty). Harmless because each arm
+  restarts via `prep_flip.sh` — but never measure the live node right after a build without restarting.
+- Loadgen **floats (no taskset)** to deliver ~94k co-located; `taskset`-ing it to 4 HTs makes the *loadgen*
+  CPU-bound (~14k). `--rate` alone (never with `--maxlat`), `--prometheusport 0`, `--readrate 0.0` for writes.
+  `mkdir -p /root/results_ipo` before redirecting into it.
+- **Cross-run absolute ins/op drifts ~3%** (GC/warmup on fresh restart) → only **same-session** arm deltas are
+  trustworthy; always put compared arms in ONE run (why the capstone did all 3 together).
+- `swap.sh` prints a harmless `cut: '"'` error; the `cp` works. macOS has no `timeout`. Rig repo was at old
+  `c5c2994` → `rsync -az --delete src/` mac→rig before `ant jar` (already done for the current jars).
+
+**(5) Assumptions to treat as given.** Rig `157.180.98.112` (`cassandra-waf-rig`), governor=performance, perf
+6.8.12, asprof 4.4 at `/opt/async-profiler-4.4-linux-x64/bin/asprof`. Repo `/root/repos/fork/cassandra-tpc-i1`.
+Staged jars in `…/build/`: `.jar.trunk` (md5 745ce392, **verified TPC-free** via `jar tf`), `.jar.routing-fixed`
+(6a346b24, prior 2 fixes), `.jar.routing-newfixes` (**1ff5de1b = +1a+Tier1**, `javap`-verified). **Rig is
+currently live on routing-newfixes.** New scripts: `/root/{ipo.sh, capstone.sh}`; data `/root/results_ipo/`
+(`cap_summary.txt` = the capstone). Existing: `/root/{swap.sh, prep_flip.sh, abwin.sh, prof44.sh, winrun.sh}`.
+Code fixes committed+... on branch `tpc-migration` (NOT pushed to origin). **No loadgen box is provisioned**
+(co-located); Phase 6 tail work must provision one and delete it.
+
+**(6) Entry point.** Read in order: THIS handoff → the **RIG RESULT** section (bottom of this file) → `findings.md`
+§3.1–3.2 (what the fixes target) → `task_plan.md` §Phase 6 (the pivot) → source: `Keyspace.java:196-210,275-306`,
+`MutationShardRouting.java:98-104`, `AbstractWriteResponseHandler.java:174-204`. Then act. Paste-able prompt:
+
+> Continue TPC CPU-parity → Phase 6. Read `tasks/tpc-migration-planning/phase-4-poc/increments/tpc-cpu-parity/
+> progress.md` (top HANDOFF + the RIG RESULT section), then `findings.md` and `task_plan.md §Phase 6`. Context:
+> two fixes (Keyspace system-keyspace cache + AbstractWriteResponseHandler.outcome() terminal-write fast path)
+> reached CPU parity with trunk in instructions/op (routing +1.4% NS vs +6.1% before; 76% of the gap closed,
+> capstone in `/root/results_ipo/cap_summary.txt`). FIRST run the asprof attribution: profile routing-newfixes
+> vs routing-fixed on rig `157.180.98.112` (`/root/prof44.sh`, asprof 4.4, matched load), diff RAW sample
+> deltas, confirm the `isLocalSystemKeyspace/containsIgnoreCase` route frame and the `outcome()` AsyncPromise+
+> timer frames dropped to ~0, and classify `validateSafe:318` (gap-neutral or a further win). THEN pivot to
+> Phase 6 (prove the TPC tail-at-scale win): concurrency sweep with an OFF-BOX loadgen (`--hdr` p99 per rung,
+> trunk vs routing) + `perf c2c` trunk vs routing. Rig facts + gotchas in this handoff §4/§5. Jars staged
+> (`.jar.{trunk,routing-fixed,routing-newfixes}`); rig live on routing-newfixes. Delete any loadgen box when done.
+
+---
+
 ## HANDOFF (2026-07-14) — 1a landed; 1b bare-listener KILLED, redesigned (supersedes the 1b parts below)
 
 **1a (apply-side schema handle) — DONE in the working tree (not committed, not yet dtested).** Cached
