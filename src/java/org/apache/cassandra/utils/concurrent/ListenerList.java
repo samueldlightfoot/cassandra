@@ -131,6 +131,32 @@ abstract class ListenerList<V> extends IntrusiveStack<ListenerList<V>>
     }
 
     /**
+     * Complete an inline notification that already claimed the listener slot as {@code null -> NOTIFYING}
+     * (a caller that ran a single callback directly on an already-terminal future, skipping the node
+     * allocation): release ownership and drain anything pushed re-entrantly while it ran, so those
+     * additions fire once, in order. This is exactly {@link #notify}'s re-drain tail — holding NOTIFYING
+     * across the inline callback is what makes a re-entrant add defer to us instead of firing nested.
+     * The caller must already hold NOTIFYING.
+     */
+    static <V, T extends Future<V>> void drainAfterInline(AtomicReferenceFieldUpdater<? super T, ListenerList> updater, T in)
+    {
+        try
+        {
+            while (!updater.compareAndSet(in, NOTIFYING, null))
+            {
+                ListenerList<V> listeners = updater.getAndSet(in, NOTIFYING);
+                notifyExclusive(listeners, in);
+            }
+        }
+        catch (Throwable t)
+        {
+            Thread thread = Thread.currentThread();
+            try { thread.getUncaughtExceptionHandler().uncaughtException(thread, t); }
+            catch (Throwable t2) { t.addSuppressed(t2); t.printStackTrace(); }
+        }
+    }
+
+    /**
      * Requires exclusive ownership of {@code head}.
      *
      * Task submission occurs in the order the operations were submitted; if all of the executors

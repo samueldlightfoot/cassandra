@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.utils.concurrent;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
@@ -115,6 +116,62 @@ public class AsyncPromiseTest extends AbstractTestAsyncPromise
         for (Supplier<Promise<Integer>> supplier : suppliers)
             testOneTimeout(supplier.get());
         Assert.assertEquals(0, initialListeners.get());
+    }
+
+    @Test
+    public void testAddCallbackBiConsumerAlreadyDone()
+    {
+        // Attach-on-done fast path: on an already-terminal promise the callback must run inline and
+        // deliver exactly (value, null) on success / (null, cause) on failure, once.
+        for (boolean tryOrSet : new boolean[]{ false, true })
+        {
+            AsyncPromise<Integer> s = new AsyncPromise<>();
+            if (tryOrSet) s.trySuccess(7); else s.setSuccess(7);
+            List<Object[]> got = new ArrayList<>();
+            s.addCallback((v, t) -> got.add(new Object[]{ v, t }));
+            Assert.assertEquals("callback must fire inline exactly once", 1, got.size());
+            Assert.assertEquals(Integer.valueOf(7), got.get(0)[0]);
+            Assert.assertNull(got.get(0)[1]);
+
+            AsyncPromise<Integer> f = new AsyncPromise<>();
+            RuntimeException ex = new RuntimeException("boom");
+            if (tryOrSet) f.tryFailure(ex); else f.setFailure(ex);
+            List<Object[]> gotf = new ArrayList<>();
+            f.addCallback((v, t) -> gotf.add(new Object[]{ v, t }));
+            Assert.assertEquals(1, gotf.size());
+            Assert.assertNull(gotf.get(0)[0]);
+            Assert.assertSame(ex, gotf.get(0)[1]);
+        }
+    }
+
+    @Test
+    public void testAddCallbackBiConsumerNotYetDone()
+    {
+        // Not terminal at attach time: falls through to the listener-node path and fires on completion.
+        AsyncPromise<Integer> p = new AsyncPromise<>();
+        List<Object> got = new ArrayList<>();
+        p.addCallback((v, t) -> got.add(v));
+        Assert.assertTrue("must not fire before completion", got.isEmpty());
+        p.setSuccess(9);
+        Assert.assertEquals(ImmutableList.of(9), got);
+    }
+
+    @Test
+    public void testAddCallbackBiConsumerInlineReentrant()
+    {
+        // The invariant the reverted naive inline form broke: a callback that re-enters and adds a
+        // callback while running on the fast path must fire that addition once, deferred in order —
+        // never nested or twice. cb0 runs inline; its re-entrant cb2 defers behind NOTIFYING and drains
+        // after cb0 returns; cb1 is a fresh fast-path attach on the now-empty slot. Order: 0, 2, 1.
+        for (boolean tryOrSet : new boolean[]{ false, true })
+        {
+            AsyncPromise<Integer> p = new AsyncPromise<>();
+            if (tryOrSet) p.trySuccess(1); else p.setSuccess(1);
+            List<Integer> order = new ArrayList<>();
+            p.addCallback((v, t) -> { order.add(0); p.addCallback((v2, t2) -> order.add(2)); });
+            p.addCallback((v, t) -> order.add(1));
+            Assert.assertEquals(ImmutableList.of(0, 2, 1), order);
+        }
     }
 
     private static final class TestInExecutor implements ExecutorPlus

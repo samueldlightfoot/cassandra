@@ -20,6 +20,7 @@ package org.apache.cassandra.utils.concurrent;
 
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 import javax.annotation.Nullable;
@@ -30,7 +31,10 @@ import com.google.common.util.concurrent.ListenableFuture; // checkstyle: permit
 import accord.utils.Invariants;
 import accord.utils.async.AsyncResult;
 
+import org.apache.cassandra.concurrent.ExecutionFailure;
 import org.apache.cassandra.utils.concurrent.ListenerList.Waiting;
+
+import static org.apache.cassandra.utils.concurrent.ListenerList.Notifying.NOTIFYING;
 
 import io.netty.util.concurrent.GenericFutureListener;
 
@@ -131,6 +135,39 @@ public class AsyncFuture<V> extends AbstractFuture<V>
     boolean appendListenerIfNotNotifying(ListenerList<V> newListener)
     {
         return ListenerList.pushIfNotNotifying(listenersUpdater, this, newListener);
+    }
+
+    /**
+     * Attach-on-done fast path: a synchronously-applied write completes this future before the caller
+     * attaches, so the common case would allocate a {@code CallbackBiConsumerListener} only to drain it
+     * immediately. When the future is already terminal and would notify inline (no notify executor), and
+     * we can claim the empty listener slot ({@code null -> NOTIFYING}), run the callback directly and skip
+     * the allocation. Claiming NOTIFYING is what keeps this safe: a callback that re-enters and adds a
+     * listener sees NOTIFYING, defers, and is drained in order by {@link ListenerList#drainAfterInline}
+     * (firing nested was the bug in the earlier naive inline form). The callback body mirrors
+     * {@code CallbackBiConsumerListener.run}; exceptions are routed exactly as its executor path.
+     */
+    @Override
+    public AbstractFuture<V> addCallback(BiConsumer<? super V, Throwable> callback)
+    {
+        if (isDone() && notifyExecutor() == null && listenersUpdater.compareAndSet(this, null, NOTIFYING))
+        {
+            try
+            {
+                if (isSuccess()) callback.accept(getNow(), null);
+                else callback.accept(null, cause());
+            }
+            catch (Throwable t)
+            {
+                ExecutionFailure.handle(t);
+            }
+            finally
+            {
+                ListenerList.drainAfterInline(listenersUpdater, this);
+            }
+            return this;
+        }
+        return super.addCallback(callback);
     }
 
     /**
