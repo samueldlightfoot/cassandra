@@ -109,6 +109,7 @@ public class Keyspace
     private final KeyspaceRepairManager repairManager;
     private final SchemaProvider schema;
     private final String name;
+    private final boolean localSystem;
 
     private static volatile boolean initialized = false;
 
@@ -193,6 +194,16 @@ public class Keyspace
         return metadataRef.get();
     }
 
+    /**
+     * Cached at construction (system-ness is a function of the immutable name). Prefer this over
+     * {@link SchemaConstants#isLocalSystemKeyspace} on any per-write path — it avoids re-scanning
+     * the system-keyspace name sets for every mutation.
+     */
+    public boolean isLocalSystemKeyspace()
+    {
+        return localSystem;
+    }
+
     public Collection<ColumnFamilyStore> getColumnFamilyStores()
     {
         return Collections.unmodifiableCollection(columnFamilyStores.values());
@@ -264,6 +275,7 @@ public class Keyspace
     {
         this.schema = schema;
         this.name = metadata.name;
+        this.localSystem = SchemaConstants.isLocalSystemKeyspace(metadata.name);
 
         assert metadata != null : "Unknown keyspace " + metadata.name;
 
@@ -291,6 +303,7 @@ public class Keyspace
     {
         this.schema = Schema.instance;
         this.name = metadata.name;
+        this.localSystem = SchemaConstants.isLocalSystemKeyspace(metadata.name);
 
         this.metric = new KeyspaceMetrics(this);
         this.viewManager = new ViewManager(this);

@@ -30,7 +30,6 @@ import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
-import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.MUTATION_SHARD_ROUTING;
@@ -99,7 +98,7 @@ public final class MutationShardRouting
             return OptionalInt.empty();
 
         // Local-system keyspaces carry non-routable traffic and use ShardBoundaries.NONE anyway.
-        if (SchemaConstants.isLocalSystemKeyspace(keyspaceName))
+        if (keyspace.isLocalSystemKeyspace())
             return OptionalInt.empty();
 
         DecoratedKey key = mutation.key();
