@@ -1,5 +1,66 @@
 # Progress — CQL-path ingress routing (single-node inbox hop)
 
+## RIG RE-RUN DONE (2026-07-13) — the two CPU fixes measured vs trunk
+
+Full data + method in `perf-ab-methodology.md` §RESULTS-VS-TRUNK-FIXED. Built `.jar.routing-fixed`
+(054f14e484, md5 `6a346b24`, carries both fixes) in a separate rig clone; ran TRUNK vs ROUTING-FIXED
+back-to-back **plus a repeat-trunk arm (T2)** to bound thermal drift; re-profiled both with **async-profiler
+4.4**. Loadgen deleted, rig restored routing-ON on `.jar.routing-fixed`.
+
+**Headline answer — did routing CPU move from 64.9% toward trunk 58%? NO, not the gap.**
+- Absolute routing CPU dropped **64.9%→61.6%**, but **trunk (unchanged code) dropped in lockstep 58.0%→55.5%**
+  (pure session/thermal drift — proven by T2: trunk warmed +1.8pp over ~27 min). So the **routing-vs-trunk gap
+  is unchanged: +6.9pp → +6.1pp**, inside the drift band (within-session T1↔T2 drift = 1.8pp).
+- **The two fixes DID their specific jobs** (verified in the asprof-4.4 differential):
+  - **#1 memoize** — `computePlan`=0 samples (cache hits every request); `CqlShardRouter` decision-side
+    `containsIgnoreCase` down to **0.32%**. The `containsIgnoreCase` *headline* only fell 2.48%→2.04% because
+    the rest is **apply-side, never memoized**: `MutationShardRouting.route` (0.94%, the I1 re-route in
+    `performLocally`), `ConsensusMigration` apply check (0.56%), `Schema.getKeyspaceInstance` coordinate
+    lookups (~0.94%). The prior "2.48% = CqlShardRouter" attribution over-credited the CQL-ingress decision.
+  - **#2 async fast-path** — `ImmediateFuture` seed alloc = **0** (removed); total alloc **+18%→+16.6%**
+    (−1.4pp, exactly the predicted 1.4–1.8pp); cs/op **1.62→1.40 (−14%)**. QUORUM-await futures (necessary) stay.
+- **The ~6pp routing premium is STRUCTURAL**, not decision-side: apply-side keyspace scans, `TrieMemtable`
+  shard apply (+1.05pp), async listener churn (`ListenerList.notifyExclusive`/`AsyncFuture.trySet/appendListener`
+  ~+1.5pp), megamorphic `itable stub` (+0.69), `EpollEventLoop.wakeup` (+0.39, the loop↔shard handoff).
+
+**Other reads (all improved vs the prior unfixed run):**
+- **p99** (`--hdr`): routing-fixed **223ms vs trunk ~218ms** — within trunk's own T1/T2 spread (217/219),
+  p50 identical 0.93ms → **NEUTRAL, GC-dominated**. Tighter than the prior +9%; the alloc cut plausibly helped.
+- **Saturation:** routing-fixed **274.7k ≥ trunk 260.7k (+5.3%)**, cs/op 0.82 vs 1.49, Blocked=0. Flips the
+  earlier −4% cost; caveat — trunk's 260.7k ran low vs prior 272.8k, so read as "routing ≥ trunk at sat".
+- **PoC criterion:** throughput ≥ trunk **PASS**; p99 ≤ trunk now **NEUTRAL** (was +9%), still GC-blind on G1.
+
+**Deltas from the plan / gotchas hit this run.** (1) `build-trunk.sh` mirror needs the **full 40-char SHA** —
+`git fetch origin <short-sha>` fails "couldn't find remote ref"; also the fix commits weren't on origin, had
+to `git push origin tpc-migration` first. (2) `pkill -f "<pattern>"` **self-kills the ssh** if the pattern
+appears in your own remote command line (killed the session twice; "ant" also matches `gradle-instrumentation-agent`).
+(3) The `abwin` window runs **~77s wall** (not 60 — `sjk mxdump` in `rcnt.sh` is slow), so a 340s loadgen
+**ended before profiling → idle profile**. Fix: profile in a **separate dedicated load run**, keep abwin
+windows loadgen-only. (4) `prep_flip` **races its own `prep.done` removal** — poll for the `"PREP DONE"`
+log line, not the marker file, or you read the previous arm's stale `prep_state.txt`. (5) Under saturation,
+`nodetool` is slow → a 3s tablestats spot-check over-states rate (~390k artifact); trust the abwin window.
+
+**Rig end state.** Node UP routing-ON on `.jar.routing-fixed` (md5 `6a346b24`, both flags, pools=ON, native
+active). Staged jars: `.jar.trunk` (745ce392), `.jar.routing-fixed` (6a346b24), `.jar.routing-validated`
+(bf5e4356 — the pre-fix routing jar, kept for revert). New rig scripts: `/root/{build-routing-fixed,prof44,
+winrun,swap}.sh`; asprof 4.4 at `/opt/async-profiler-4.4-linux-x64/bin/asprof`. Raw in `/root/results_ab/`,
+`/root/results_prof/`. Collapsed profiles also pulled to the mac scratchpad this session.
+
+**NEXT (candidates, user to steer).** (a) The clean next CPU fix mirrors #1 on the **apply side**: memoize /
+cache `MutationShardRouting.route`'s keyspace-scan verdict (0.94% + part of "other") — same invariant-per-table
+argument, and it's the single biggest routing-added `containsIgnoreCase` chunk now. (b) The ~6pp gap is mostly
+structural (shard-memtable apply + async listener machinery + cross-thread wakeups) — diminishing returns on
+micro-opts; the real lever is the shard-aware protocol (design §8) or fewer async hops. (c) ZGC arm to make
+the p99 gate *adjudicable* (needs JDK 21 for generational; rig is 17). (d) Commit is done (fixes on
+`tpc-migration`, pushed); this measurement is notes-only.
+
+> **SUPERSEDED (2026-07-13) by the `../tpc-cpu-parity/` increment.** A ScyllaDB source teardown + an
+> Enberg-2019 re-read overturned candidate (b) above: the ~6pp is **NOT** mostly structural — ~2.5–3pp is our
+> implementation immaturity with concrete Scylla-referenced fixes (apply-side schema handle, single-listener
+> futures, memtable single-writer CAS); only ~0.3–0.7pp is the genuine steering tax. Also corrected: the
+> metrics `findIndex` cost is a *common* cost on both arms (trunk 4.06% > routing 3.38%), NOT in the routing
+> gap. See `../tpc-cpu-parity/{findings,task_plan,progress}.md`. Candidate (a) is Phase 1a there.
+
 ## RIG RE-RUN HANDOFF (2026-07-13) — measure the two CPU fixes vs trunk (fresh context)
 
 Two CPU optimizations are committed on `tpc-migration` (tip `054f14e484`); unit-tested, **perf NOT validated**.

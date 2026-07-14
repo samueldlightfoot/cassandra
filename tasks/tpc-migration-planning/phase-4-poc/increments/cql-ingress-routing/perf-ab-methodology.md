@@ -142,3 +142,91 @@ self-time frames (trunk 0% → routing X%) = enhancement targets:
 
 Raw: rig `/root/results_ab/` (A/B) + `/root/results_prof/{cpu,alloc}_{trunk,routing}.collapsed`. Jars
 preserved: `…jar.trunk` (50ddce8455), `…jar.routing-validated` (bf5e4356).
+
+---
+
+## RESULTS-VS-TRUNK-FIXED (2026-07-13, later) — re-measure with the two CPU fixes
+
+Re-run of the vs-trunk A/B after the two committed CPU optimizations (memoize the CqlShardRouter routing
+verdict `4d27780d47`; skip the seed future for single-mutation async writes `cb036fbc9c`), built into a fresh
+routing jar (`.jar.routing-fixed`, md5 `6a346b24`, contains `CqlShardRouter$Plan`). **TRUNK `50ddce8455`
+(`.jar.trunk`) vs ROUTING-FIXED, back-to-back same session, with a repeat-trunk arm (T2) to bound thermal
+drift** — killing the sequential-drift caveat that muddied the first vs-trunk read. Off-box ccx43 hel1 loadgen
+(deleted after). p99 via ecs `--hdr` (CO-corrected whole-run, ms). Profiles via **async-profiler 4.4** (both
+arms), differential routing−trunk at matched 182k.
+
+### Part A — matched sub-knee ~183k (3 windows/arm)
+| metric | TRUNK T1 (cool) | TRUNK T2 (warm) | trunk mean | ROUTING-FIXED |
+|---|---|---|---|---|
+| deliv/s | 183.9k | 182.9k | ~183.4k | 182.7k |
+| **CPU busy** | 54.6% (53.5/54.5/55.7) | 56.4% (56.5/56.3/56.5) | **~55.5%** | **61.6%** (61.8/61.5/61.5) |
+| **cs/op** | 1.79 | 1.80 | 1.80 | **1.40** (1.36/1.42/1.41) |
+| %usr / %sys | 41.4 / 9.2 | 42.9 / 9.5 | 42 / 9.3 | 47.4 / 9.6 |
+| **p99** (`--hdr`) | 217.1ms | 219.2ms | ~218ms | **223.4ms** |
+| p999 / p50 | 413 / 0.93 | 390 / 0.93 | ~400 / 0.93 | 457 / 0.93 |
+| Routed / shard Blocked | 0 / 0 | 0 / 0 | — | ~100% / 0 |
+
+**Drift control (the point of T2):** trunk warmed **+1.8pp** T1→T2 over ~27 min of sustained load (same
+code, same jar — pure thermal/session drift). So the routing-vs-trunk CPU gap is **+6.1pp vs the trunk mean**,
+bracketed **+5.2pp (vs warm T2) to +7.0pp (vs cool T1)**. cs/op −22% (mechanism intact, now stronger).
+
+### Part B — saturation (matched loaded table, over-drive 350k/cc4000)
+| metric | TRUNK | ROUTING-FIXED | Δ |
+|---|---|---|---|
+| **peak deliv/s** | **260.7k** @97.9% | **274.7k** @98.2% | **+5.3% (routing higher)** |
+| cs/op | 1.486 | **0.820** | −45% |
+| shard Blocked | 0 | 0 | — |
+
+Routing-fixed now delivers **more** at saturation (+5.3%), flipping the earlier flip+step1 result (−4%) and
+beating the prior unfixed vs-trunk (+1.8%). Plausibly the async fast-path (fewer futures/listeners per write)
+raised the shard-path ceiling; caveat — trunk's 260.7k here ran low vs the prior 272.8k, so read as
+"routing ≥ trunk at saturation", not a firm +5%.
+
+### Part C — CPU-hunt re-profile (asprof 4.4 differential, routing−trunk, matched 182k, 30s)
+Routing burns **+11.9% CPU samples** (21327 vs 19055) and **+16.6% alloc** (69069 vs 59216) — down from the
+prior **+20% / +18%**. The +11.9% matches the busy ratio (61.6/55.5 = +11%), internally consistent.
+
+**Fix #1 (memoize routing verdict) — WORKED for its target, but the `containsIgnoreCase` headline barely
+moved (2.48%→2.04% self).** Why: the memoized *decision* is now cheap — `computePlan` = **0 samples** (cache
+hits every request), and the `CqlShardRouter`-attributed `containsIgnoreCase` is down to **0.32%**. The
+remaining `containsIgnoreCase` is **apply-side, which fix #1 never touched**:
+| `containsIgnoreCase` source (routing-fixed) | self-weight |
+|---|---|
+| `CqlShardRouter` (fix #1 target — memoized) | **0.32%** |
+| `MutationShardRouting.route` (I1 apply re-route in `performLocally`, per-mutation, NOT memoized) | 0.94% |
+| `ConsensusMigrationMutationHelper.validateSafeToExecuteNonTransactionally` (apply path) | 0.56% |
+| `Schema.getKeyspaceInstance` (coordinate lookups, `ModificationStatement.executeWithoutConditionAsync`) | ~0.94% (in "other") |
+
+So the prior "2.48% = CqlShardRouter + shard resolution" attribution over-credited the CQL-ingress decision;
+the case-insensitive keyspace scans live mostly in the **structural TPC apply/route stack**.
+
+**Fix #2 (single-mutation async fast-path) — WORKED, as predicted.** `ImmediateFuture` seed alloc = **0**
+(the redundant `success(null)` seed is gone); total alloc **+18%→+16.6%** (−1.4pp, exactly the estimated
+1.4–1.8pp); cs/op 1.62→1.40. The QUORUM-await `AsyncPromise`/`AsyncFuture` (necessary) remain.
+
+**Top routing-added CPU self-frames (routing% − trunk%) — the structural premium the fixes DON'T reach:**
+`containsIgnoreCase` +2.04 (apply-side, above) · `TrieMemtable$MemtableShard` apply lambda +1.05 · async
+listener churn (`ListenerList.notifyExclusive` +0.75, `AsyncFuture.trySet` +0.42, `.appendListener` +0.37) ·
+`itable stub` (megamorphic dispatch) +0.69 · `NaturalOrderComparator.compare` +0.65 · `EpollEventLoop.wakeup`
++0.39 (loop↔shard handoff). All inherent to coordinate+apply on the shard-routing + async-flip path.
+
+### Verdict — did routing CPU move toward trunk?
+**No, not the gap.** Absolute routing CPU dropped 64.9%→61.6%, but **trunk (unchanged code) dropped in
+lockstep 58.0%→55.5%** (session/environment drift), so the **routing-vs-trunk CPU gap is unchanged: +6.9pp
+(prior) → +6.1pp (now), within the drift band** (within-session T1↔T2 drift alone is 1.8pp). The two fixes
+did their specific micro-jobs (decision-side `containsIgnoreCase`→0.32%, `ImmediateFuture` seed gone, alloc
+−1.4pp, cs/op −14%) but the ~6pp premium is **structural** — apply-side keyspace scans, shard-memtable apply,
+async listener machinery, megamorphic dispatch, cross-thread wakeups.
+
+**PoC-criterion read (updated):**
+- **throughput ≥ trunk → PASS** (sub-knee matched; saturation routing-fixed 274.7k ≥ trunk 260.7k; Blocked=0).
+- **p99 ≤ trunk → now essentially NEUTRAL** (223 vs ~218ms, within trunk's own T1/T2 spread 217/219; p50
+  identical 0.93ms → GC-dominated). Improved from the prior +9%; the alloc cut plausibly tightened the tail.
+  Still GC-blind on G1 — a de-GC'd read (ZGC) is the only way to *adjudicate* the p99 half.
+- **CPU (not a gate):** routing still costs ~+6pp over stock trunk; the next lever is the apply-side
+  (`MutationShardRouting.route` is memoizable the same way; the async/shard machinery is structural), not more
+  decision-side micro-opts.
+
+Raw: rig `/root/results_ab/{subresult,sat}_{trunk,routing,trunk2}*.txt` + `/root/results_prof/{cpu,alloc}_
+{trunk,routing}.collapsed` (asprof 4.4). Jars: `.jar.trunk` (50ddce8455), `.jar.routing-fixed` (054f14e484,
+md5 6a346b24), `.jar.routing-validated` (bf5e4356). Rig restored routing-ON on `.jar.routing-fixed`.
