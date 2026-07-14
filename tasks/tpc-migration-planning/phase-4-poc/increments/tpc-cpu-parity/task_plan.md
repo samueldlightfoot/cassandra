@@ -34,16 +34,27 @@ Without this, a 1pp fix is invisible under thermal/session drift.
 - [ ] Measure: asprof cpu differential (`containsIgnoreCase` frame → ~0) + instructions/op.
 - Risk: low (optimization-only; `performLocally` still re-decides the apply shard authoritatively).
 
-### 1b. Async future: single-listener bare field + ready-future fast path (~1.2pp + alloc) — findings §3.1
-- [ ] In `AbstractFuture`, store the lone listener as a bare field; promote to a `ListenerList` node only on
-  the 2nd add (mirror Netty `DefaultPromise`; the field type at `AbstractFuture.java:103` already permits it).
-  Reconcile the `ListenerList.notify/notifyExclusive` path to branch on bare-listener vs list.
-- [ ] Add a ready-future inline path (already-complete → invoke continuation synchronously, skip node+notify;
-  mirror Seastar `future.hh` L1680) and a `make_ready_future`-style singleton for already-available returns.
+### 1b. Async future: three-tier "attach-on-done" (~0.5–0.9pp + alloc) — findings §3.1
+> CORRECTED 2026-07-14 (Fable + concurrency map). The original "single-listener bare field" is DEAD: the
+> `listeners` field is `ListenerList`-typed and its updater `valueCheck`s writes → a bare listener throws
+> `ClassCastException` (not "already permitted"); and the busiest attaches use `addCallback`/`map` which
+> allocate a fused node regardless. Do NOT resurrect it. This ranks BELOW 1a (1a is ~1.2pp at trivial risk).
+- [ ] **Tier 1 (do first, trivial):** in `AbstractWriteResponseHandler.outcome()` (:174), if
+  `writeResult.isDone()` compute the verdict inline and return `ImmediateFuture` — skip the `AsyncPromise` +
+  `scheduler.schedule` timer + `timer.cancel` + listener + drain. `computeVerdict()` is pure (:224-227); a
+  not-done result just falls through to today's path (zero concurrency risk). Bonus: removes a per-write
+  cross-thread timer schedule+cancel (a `EpollEventLoop.wakeup` feeder).
+- [ ] **Tier 2 (core, additive):** ready-path in `AsyncFuture.appendListener` — `isDone(result) &&
+  listeners == null` → resolve executor as `notifyExclusive` does (`ListenerList.java:145-148`) and invoke
+  `notifySelf` inline, never touching the field. Ordering-safe via the in-field `NOTIFYING` hold (:110-121).
+- [ ] **Tier 3 (optional):** done-checks in `addCallback`/`map` (`AbstractFuture.java:273-355`) before node
+  construction, scoped to `notifyExecutor()==null && executor==null`; `map` returns `ImmediateFuture`.
 - [ ] Measure: asprof **alloc** differential (async-future alloc → near-0), GC-log pause analysis (fewer/
   shorter G1 pauses → also helps the p99 tail), instructions/op.
-- Risk: medium — listener ordering + concurrency semantics must be preserved (`AsyncFuture` guarantees
-  ordering). Re-run the future/promise unit tests + the write-path dtests.
+- Risk: Tier 1 low; Tier 2/3 low-moderate — listener ordering + concurrency semantics must be preserved
+  (`AsyncFuture` guarantees ordering). Re-run the future/promise unit tests + the write-path dtests.
+- RF=3 caveat: attach-on-done is correct under RF=3 (fast-path branch; remote-quorum writes take the slow
+  path) but its pp-win is weighted to the RF=1 inline-apply rig — don't over-claim on that number.
 
 ## Phase 2 — metrics `findIndex` O(1) (NOT a gap-closer; ~4% absolute on BOTH arms, upstreamable) — findings §3.3
 - [ ] Replace `DecayingEstimatedHistogramReservoir.findIndex` binary-search bucket lookup with O(1) bit-math

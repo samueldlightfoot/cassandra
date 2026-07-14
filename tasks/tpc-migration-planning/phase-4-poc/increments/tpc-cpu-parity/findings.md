@@ -43,7 +43,7 @@ each ~0.0027pp).
 |---|---|---|---|
 | `SchemaConstants.containsIgnoreCase` (apply-side keyspace scans) | ~1.2 | **OURS** | carries `schema_ptr`; table by UUID hash; zero per-op scan |
 | sharded memtable apply (`TrieMemtable$MemtableShard.apply` +224, trie compares +156) | ~1.4 | **likely OURS** | per-shard memtable is lock-free single-writer (no CAS) |
-| async future/listener (`ListenerList.notifyExclusive`160 `AsyncFuture.trySet`89 `appendListener`79 recycler117) | ~1.2 | **OURS** | inline value futures; a local write allocs ZERO future machinery |
+| async future/listener (`ListenerList.notifyExclusive`160 `AsyncFuture.trySet`89 `appendListener`79) | ~0.9 | **OURS** | inline value futures; a local write allocs ZERO future machinery |
 | megamorphic/`vtable`/`itable stub` (174+63) | ~0.6 | **grey** | monomorphic C++ templates (a genuine JVM↔C++ gap) |
 | steering/scheduling (`EpollEventLoop.wakeup`83 `epoll_wait`82 `_raw_spin_unlock_irq`110) | ~0.7 | **~half genuine TPC tax** | pays cross-shard hop too; mitigates via shard-aware client |
 | commitlog access (`CommitLog.add`80 `coverInMap`74 serialize 78) | ~0.6 | **investigate** | (surprising routing delta; may be a scheduling artifact) |
@@ -54,6 +54,10 @@ trunk pays *more*. It is a Cassandra-wide cost on **both** arms (via `ThreadLoca
 DecayingEstimatedHistogramReservoir.findIndex`, recorded at several metric points per request). It does NOT
 explain routing > trunk. It IS, separately, a ~4%-of-CPU absolute-perf target on **every** Cassandra node
 (see §3.3) — but it is gap-neutral, so do not credit it to routing.
+
+The async row above dropped its `recycler`117 frame (2026-07-14): it has no provenance in any teardown and is
+plausibly Netty transport buffer pooling, not our futures. So the honest async-future bucket is **~0.9pp**
+(328 samples), not the ~1.2 first booked. Don't re-add the recycler to the future cost without attributing it.
 
 ---
 
@@ -76,20 +80,34 @@ All four confirm: the routing-added costs are things a mature TPC engine avoids.
 
 **Our side (verified at source):** `AbstractFuture.addListener` (`src/java/org/apache/cassandra/utils/
 concurrent/AbstractFuture.java:419-421`) does `appendListener(new GenericFutureListenerList(listener))` — it
-**allocates a listener-node for even the first/only listener** (also the constructor paths :131,:137). Netty's
-own `DefaultPromise` stores the first listener as a bare `Object` field and only promotes to a list on the 2nd.
-The `AbstractFuture.listeners` field is *already typed* to hold "either a ListenerList or GenericFutureListener
-(or null)" (comment :103) — so the field supports a bare listener; `addListener` just always wraps it.
+**allocates a listener-node for even the first/only listener** (also the constructor paths :131,:137).
 
-**Fixes (ranked):**
-1. **Single-listener bare field** — store the lone listener bare (mirror Netty `DefaultPromise`), promote to a
-   `ListenerList` node only on the 2nd add. Reconcile with the `notify`/`notifyExclusive` path (it must branch
-   on bare-listener vs list). Deletes `notifyExclusive`+`appendListener` (~1.1pp) + one alloc/write. Lowest risk.
-2. **Ready-future inline fast path** — when the value is already set at add-listener/callback time, invoke the
-   continuation synchronously and skip node+notify (mirror `future.hh` L1680). Helps the *synchronous*
-   intermediate steps (the QUORUM-await completion is genuinely later, so #1 is the bigger write-path win).
-3. **`make_ready_future` idiom** — return a shared/singleton completed future instead of `new AsyncPromise`
-   for already-available returns. Attacks the +16% alloc (extra G1 work) at the source.
+> **CORRECTION (2026-07-14, Fable + concurrency map, source-verified) — the bare-listener fix is DEAD.**
+> The claim below (originally here) that "the `listeners` field is already typed to permit a bare
+> `GenericFutureListener`, so `addListener` just always wraps it" is **false**. The field is typed
+> `ListenerList<V>` and its `AtomicReferenceFieldUpdater` is built with `ListenerList.class` (:103,:105), which
+> runtime-`valueCheck`s every write — storing a bare listener throws `ClassCastException`. A real bare field
+> means widening to `Object` + reconciling ~9 intrusive-stack sites (a core-primitive rewrite), and it saves
+> ~zero on the hot path: the busiest attaches (`MutationVerbHandler:86`, `Dispatcher:593,700`,
+> `ModificationStatement:746`) use `addCallback`/`map`, which allocate a **fused** callback node regardless.
+> The old "deletes `notifyExclusive`+`appendListener` ~1.1pp" also conflates an **alloc** fix with a **drain**
+> fix — `trySet` still CASes and `notify` still drains.
+
+**Corrected fix — a three-tier "attach-on-done" family** (the Seastar ready-future idiom, applied where this
+fork genuinely completes synchronously: local apply completes `writeResult` *before* `AbstractWriteResponse
+Handler.outcome()` attaches on the inline path, so attaches land on an already-done future ~4–5× per write):
+1. **Tier 1 (trivial, caller-level, do first):** in `outcome()` (`AbstractWriteResponseHandler.java:174`), if
+   `writeResult.isDone()` compute the verdict inline and return `ImmediateFuture` — skip the per-write
+   `AsyncPromise` + `scheduler.schedule` timer + `timer.cancel` + listener + drain. `computeVerdict()` is pure
+   (:224-227). Zero concurrency risk. Also kills a per-write cross-thread timer schedule+cancel — a likely
+   feeder of the `EpollEventLoop.wakeup` samples §2 booked as "TPC steering tax."
+2. **Tier 2 (core, additive):** ready-path in `AsyncFuture.appendListener` — when `isDone(result) &&
+   listeners == null`, resolve the executor as `notifyExclusive` does (`ListenerList.java:145-148`) and invoke
+   `notifySelf` inline; never touch the field. Ordering-safe (a drain holds `NOTIFYING` in-field until done,
+   :110-121, so null+done ⇒ all earlier listeners already ran). Low-moderate risk; gate on future/promise units.
+3. **Tier 3 (optional):** done-checks in `addCallback`/`map` (`AbstractFuture.java:273-355`) before node
+   construction, scoped to `notifyExecutor()==null && executor==null`; where node allocs actually die.
+- **KILL:** bare-listener field; recycled node (pooling 24-byte TLAB objects is a wash).
 
 ### 3.2 Schema resolution — Scylla resolves once & carries a typed handle; we re-scan per op
 - Prepared `modification_statement` holds `const schema_ptr s` bound at prepare (`cql3/statements/

@@ -1,5 +1,65 @@
 # Progress — TPC CPU parity (Scylla-guided implementation fixes)
 
+## HANDOFF (2026-07-14) — 1a landed; 1b bare-listener KILLED, redesigned (supersedes the 1b parts below)
+
+**1a (apply-side schema handle) — DONE in the working tree (not committed, not yet dtested).** Cached
+`boolean localSystem` on `Keyspace`, computed once at construction (`SchemaConstants.isLocalSystemKeyspace`),
+exposed as `Keyspace.isLocalSystemKeyspace()`; `MutationShardRouting.route` now reads that field instead of a
+per-mutation name-set scan. Removed the now-dead `SchemaConstants` import. `ant build` = BUILD SUCCESSFUL.
+Semantically identical to the old call (system-ness is a function of the immutable name; a `Keyspace` is never
+virtual). NOTE: the prior session had already given `SchemaConstants.containsIgnoreCase` a hot-path fast path
+(direct `contains`, lowercase only on an uppercase char) — so 1a removes 2×(HashSet probe + full-string scan)
+per mutation, not a full linear scan.
+
+**1b (async future) — the inherited "single-listener bare field" fix is DEAD.** A Fable adjudication +
+concurrency map (both source-verified) killed it:
+- **Impossible as written, not just risky.** `AbstractFuture.listeners` is typed `ListenerList<V>` and its
+  updater is built with `ListenerList.class` (`AbstractFuture.java:103,105`); `AtomicReferenceFieldUpdater`
+  runtime-`valueCheck`s writes, so storing a bare `GenericFutureListener` throws `ClassCastException`. The
+  ":103 comment already permits a bare listener" premise (task_plan §1b, findings §3.1) is **flatly false** —
+  dead text. A real bare field means widening to `Object` + reconciling ~9 intrusive-stack sites — a
+  core-primitive rewrite.
+- **Wrong payoff, wrong mechanism.** The only hot-path `addListener(GenericFutureListener)` is
+  `AbstractWriteResponseHandler:189`; the busiest attaches (`MutationVerbHandler:86`, `Dispatcher:593,700`,
+  `ModificationStatement:746`) use `addCallback`/`map`, which allocate a **fused** node regardless. And the
+  claimed "deletes notifyExclusive ~1.1pp" confuses an **alloc** fix with a **drain** fix — `trySet` still
+  CASes and `notify` still drains; those frames don't vanish by removing a node.
+
+**Corrected 1b = a three-tier "attach-on-done" family** (Seastar ready-future idiom, applied where this fork
+actually completes synchronously — verified: local apply completes `writeResult` *before* `outcome()` attaches
+on the inline path, so attaches land on an already-done future ~4–5× per write):
+- **Tier 1 (trivial, caller-level, DO FIRST after 1a):** in `AbstractWriteResponseHandler.outcome()` (:174),
+  if `writeResult.isDone()` compute the verdict inline and return `ImmediateFuture.success/failure` — skip the
+  `AsyncPromise` + the `scheduler.schedule` timer + `timer.cancel` + listener + drain. `computeVerdict()` is
+  documented pure (:224-227). Zero concurrency risk (not-done ⇒ today's slow path). Also kills a per-write
+  cross-thread timer schedule+cancel — a likely feeder of the `EpollEventLoop.wakeup` samples currently
+  misbooked as "genuine TPC steering tax."
+- **Tier 2 (core, additive):** in `AsyncFuture.appendListener`, when `isDone(result) && listeners == null`,
+  resolve the executor exactly as `notifyExclusive` does (`ListenerList.java:145-148`) and invoke
+  `notifySelf` directly — never touch the field. Ordering-safe: a drain holds `NOTIFYING` in-field until done
+  (`ListenerList.java:110-121`), so null+done ⇒ all earlier listeners already ran. Low-moderate risk; gate on
+  the future/promise unit tests. Never-throw-on-ingress preserved by `notifyListener`'s catch (:157-168).
+- **Tier 3 (optional, literal Seastar):** done-checks in `addCallback`/`map` (`AbstractFuture.java:273-355`)
+  before node construction, scoped to `notifyExecutor()==null && executor==null`; `map` returns
+  `ImmediateFuture` of the mapped value. This is where the node allocs actually die; auto-covers
+  `ImmediateFuture` attach sites.
+- **KILL:** the bare-listener field AND "recycled node" (pooling 24-byte TLAB objects is a wash).
+
+**Numbers corrected.** The async bucket is **~0.9pp, not 1.2** — the "recycler" frame (~0.31pp, 26%) has no
+provenance and is plausibly Netty transport buffer pooling, not our futures. Realistic 1b ceiling **~0.5–0.9pp**
++ part of the +16% alloc (G1/tail relief) + some wakeup samples. So **1a (~1.2pp, trivial) outranks 1b**, and
+neither is measurable without the Phase 0 ruler (~3pp drift floor).
+
+**Revised order:** Phase 0 (ruler) → 1a (done, commit + dtest) → 1b Tier 1 → 1b Tier 2/3 → re-measure →
+Phase 3 memtable. findings §3.1 + task_plan §1b are corrected inline with a dated note.
+
+**RF=3 note (kept honest):** attach-on-done is correct under RF=3 (it's a fast-path branch; remote-quorum
+writes attach before completion and take the slow path). But the measured pp-win is weighted to the RF=1
+inline-apply rig; under RF=3-with-remote-replicas the coordinator awaits remote acks, so the fast path fires
+less. Don't over-claim the pp on the RF=1 number.
+
+---
+
 ## HANDOFF (2026-07-13) — implement the CPU-gap fixes in a fresh context
 
 **Premise (settled, do not re-litigate).** The CQL-ingress-routing build runs **+6pp CPU vs stock trunk** at
