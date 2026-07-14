@@ -133,3 +133,23 @@ perf-ab-methodology.md §RESULTS-VS-TRUNK-FIXED` (the numbers to beat). Then act
 > listener) + ready-future fast path. Measure each in instructions/op + asprof differential. Branch
 > `tpc-migration`. Rig `157.180.98.112` (routing-fixed live; jars + asprof-4.4 staged); Scylla source
 > `~/repos/scylladb`. Gotchas in the handoff §4. Delete any loadgen when done.
+
+---
+
+## PROGRESS LOG (2026-07-14) — 1a + 1b Tier 1 landed, verified, committed
+
+Session outcome: the two lowest-risk local fixes are in; the rig ruler (Phase 0) is the gate to measuring them.
+
+**Committed on `tpc-migration`:**
+- `33c64e9167` — 1a route-side: `Keyspace.localSystem` cached flag; `MutationShardRouting.route` reads it.
+- `a37e9e8f6d` — 1b Tier 1: `AbstractWriteResponseHandler.outcome()` fast path when `writeResult.isDone()`.
+- `d2740c3d3e` — planning-doc correction (bare-listener killed; three-tier attach-on-done recorded).
+
+**Verified locally (all fresh mtime, jdk17, 0 skips):** `MutationShardRoutingTest` 9/9 · `WriteResponseHandler
+Test` 9/9 · `ShardRoutedReplicaApplyTest` (in-JVM, real routed write+read-back — exercises `route()` AND the
+`outcome()` inline-done fast path) 1/1 · `ant build` BUILD SUCCESSFUL. **Not yet measured** (no CPU claim until
+the Phase 0 ruler exists; ~3pp drift floor hides both).
+
+**Next (unchanged order):** Phase 0 rig ruler (verify rig state first — `157.180.98.112`, bills hourly) →
+measure 1a+Tier1 vs trunk in instructions/op → 1b Tier 2/3 → re-measure → Phase 3 memtable. Deferred: 1b
+Tier 2 (`AsyncFuture.appendListener` ready-path) and `validateSafe` classification (needs the rig profile diff).

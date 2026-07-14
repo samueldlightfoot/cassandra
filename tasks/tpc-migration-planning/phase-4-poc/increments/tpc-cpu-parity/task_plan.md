@@ -25,13 +25,17 @@ Without this, a 1pp fix is invisible under thermal/session drift.
 
 ## Phase 1 — the two unambiguous "ours" fixes (biggest clean wins)
 ### 1a. Apply-side schema handle (kills `containsIgnoreCase` ~1.2pp) — findings §3.2
-- [ ] Thread the already-resolved `TableMetadata`/`Keyspace` handle through `MutationShardRouting.route` and
-  the `ConsensusMigrationMutationHelper.validateSafeToExecuteNonTransactionally` apply check, instead of
-  re-deriving keyspace identity per mutation.
-- [ ] If a system-keyspace distinction is genuinely needed on the path, cache a **boolean flag on
-  `TableMetadata`** (computed once), not a per-op `containsIgnoreCase` scan.
+- [x] **route-side DONE** (`33c64e9167`): cached `boolean localSystem` on `Keyspace` (computed once at
+  construction), read via `Keyspace.isLocalSystemKeyspace()` in `MutationShardRouting.route` instead of a
+  per-mutation `SchemaConstants.isLocalSystemKeyspace` name scan. Chose `Keyspace` over `TableMetadata`: route
+  already holds the resolved `Keyspace`, and system-ness is a function of the immutable name.
+- [ ] **`ConsensusMigrationMutationHelper.validateSafeToExecuteNonTransactionally:318` — HELD.** It's on the
+  general apply path (trunk runs it too), so it is likely **gap-neutral**, not routing-added. Classify it with
+  the rig profile diff (routing−trunk frame) before touching; if gap-neutral it belongs with the Phase-2
+  both-arms upstreamable bucket, not the routing-gap A/B.
 - [ ] Scylla ref: `schema_ptr` carried + UUID-hash table lookup (`replica/database.cc:1991`).
-- [ ] Measure: asprof cpu differential (`containsIgnoreCase` frame → ~0) + instructions/op.
+- [x] Verified: `MutationShardRoutingTest` 9/9, `ShardRoutedReplicaApplyTest` (in-JVM) 1/1, `ant build` green.
+- [ ] Measure (rig): asprof cpu differential (`isLocalSystemKeyspace` route frame → ~0) + instructions/op.
 - Risk: low (optimization-only; `performLocally` still re-decides the apply shard authoritatively).
 
 ### 1b. Async future: three-tier "attach-on-done" (~0.5–0.9pp + alloc) — findings §3.1
@@ -39,11 +43,12 @@ Without this, a 1pp fix is invisible under thermal/session drift.
 > `listeners` field is `ListenerList`-typed and its updater `valueCheck`s writes → a bare listener throws
 > `ClassCastException` (not "already permitted"); and the busiest attaches use `addCallback`/`map` which
 > allocate a fused node regardless. Do NOT resurrect it. This ranks BELOW 1a (1a is ~1.2pp at trivial risk).
-- [ ] **Tier 1 (do first, trivial):** in `AbstractWriteResponseHandler.outcome()` (:174), if
-  `writeResult.isDone()` compute the verdict inline and return `ImmediateFuture` — skip the `AsyncPromise` +
+- [x] **Tier 1 DONE** (`a37e9e8f6d`): in `AbstractWriteResponseHandler.outcome()` (:174), if
+  `writeResult.isDone()` compute the verdict inline and return `ImmediateFuture` — skips the `AsyncPromise` +
   `scheduler.schedule` timer + `timer.cancel` + listener + drain. `computeVerdict()` is pure (:224-227); a
-  not-done result just falls through to today's path (zero concurrency risk). Bonus: removes a per-write
-  cross-thread timer schedule+cancel (a `EpollEventLoop.wakeup` feeder).
+  not-done result falls through to today's path (zero concurrency risk). Bonus: removes a per-write
+  cross-thread timer schedule+cancel (a `EpollEventLoop.wakeup` feeder). Verified: `WriteResponseHandlerTest`
+  9/9 + `ShardRoutedReplicaApplyTest` (in-JVM) 1/1, `ant build` green.
 - [ ] **Tier 2 (core, additive):** ready-path in `AsyncFuture.appendListener` — `isDone(result) &&
   listeners == null` → resolve executor as `notifyExclusive` does (`ListenerList.java:145-148`) and invoke
   `notifySelf` inline, never touching the field. Ordering-safe via the in-field `NOTIFYING` hold (:110-121).
