@@ -160,3 +160,28 @@ load-bearing for re-entrant adds (a listener that adds a listener while firing m
 drainer), which "fire inline, never touch the field" violates. Reverted (tree clean, `AsyncPromiseTest` 4/4
 again). Safe form claims the field (`CAS null→NOTIFYING` + re-drain tail) but saves little; gated on the rig
 showing `notifyExclusive` still matters after Tier 1. **Landed this session: 1a + Tier 1 only.**
+
+---
+
+## RIG RESULT (2026-07-14) — the fixes close 76% of the per-op gap; routing ~= trunk
+
+Built an **instructions-per-op ruler** (Phase 0): `perf stat -e instructions,… -p <cass_pid> -- sleep N`
+÷ server-side write delta. Frequency- and co-location-invariant (perf -p isolates the process; instruction
+COUNT per op is what the fixes change), so a co-located loadgen suffices — no second billing box, no turbo
+change needed. Scripts on rig: `/root/{ipo.sh,capstone.sh}`; data `/root/results_ipo/`.
+
+**Capstone A/B (3 arms × 6×40s windows, one session, all ~94k/s co-located, RF=1):**
+| arm | ins/op (n=6) | sd | vs trunk |
+|---|---|---|---|
+| trunk (745ce392) | 102,225 | 2.2% | — |
+| routing-newfixes (1ff5de1b = +1a+Tier1) | 103,698 | 2.2% | **+1.4% (t≈1.2, NOT significant)** |
+| routing-fixed (6a346b24, prior) | 108,456 | 2.0% | +6.1% (t≈4.9, significant) |
+
+**fix_delta = 4,758 ins/op (p<0.005) → closes 76% of the +6.1% gap.** Routing-newfixes is statistically at
+parity with trunk. This 2.6–4.4% effect was invisible under the old %-busy metric (buried in ~3pp thermal
+drift) — the ruler is what made it legible, validating the Phase-0-first ordering.
+
+**Honest caveats:** one operating point (co-located ~94k/s, RF=1). Not yet confirmed near-knee/off-box (182k),
+nor with tail (p99), nor RF=3. Cross-run absolute ins/op drifts ~3% (GC/warmup) — only same-session arm
+deltas are trustworthy (why the capstone put all 3 in one run). Ins/op includes epoll-spin/GC background
+(~2% window sd) equal across arms. Rig left on routing-newfixes; no loadgen box provisioned (co-located).
