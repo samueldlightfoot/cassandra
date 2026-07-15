@@ -42,6 +42,7 @@ import org.apache.cassandra.utils.concurrent.ListenerList.CallbackLambdaListener
 import org.apache.cassandra.utils.concurrent.ListenerList.CallbackListener;
 import org.apache.cassandra.utils.concurrent.ListenerList.CallbackListenerWithExecutor;
 import org.apache.cassandra.utils.concurrent.ListenerList.GenericFutureListenerList;
+import org.apache.cassandra.utils.concurrent.ListenerList.MapListener;
 import org.apache.cassandra.utils.concurrent.ListenerList.RunnableWithExecutor;
 import org.apache.cassandra.utils.concurrent.ListenerList.RunnableWithNotifyExecutor;
 
@@ -339,18 +340,7 @@ public abstract class AbstractFuture<V> implements Future<V>
      */
     protected <T> Future<T> map(AbstractFuture<T> result, Function<? super V, ? extends T> mapper, @Nullable Executor executor)
     {
-        addListener(() -> {
-            try
-            {
-                if (isSuccess()) result.trySet(mapper.apply(getNow()));
-                else result.tryFailure(cause());
-            }
-            catch (Throwable t)
-            {
-                result.tryFailure(t);
-                throw t;
-            }
-        }, executor);
+        appendListener(new MapListener<>(this, result, mapper, executor));
         return result;
     }
 

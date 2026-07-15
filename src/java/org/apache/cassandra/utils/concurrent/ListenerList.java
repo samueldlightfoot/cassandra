@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import javax.annotation.Nullable;
 
@@ -396,6 +397,50 @@ abstract class ListenerList<V> extends IntrusiveStack<ListenerList<V>>
         void notifySelf(Executor notifyExecutor, Future<V> future)
         {
             notifyListener(inExecutor(executor) ? null : executor, task);
+        }
+    }
+
+    /**
+     * A {@code map} continuation as a single listener node: applies {@code mapper} to the source future's
+     * value into {@code result}, fusing the transform lambda and its executor-wrapper node into one
+     * allocation (the slow-path twin of {@link AsyncFuture#map}'s inline fast path). On mapper failure it
+     * both fails {@code result} and rethrows, so the throwable still reaches the executor's failure handler —
+     * matching the old lambda; dropping either half would leave {@code result} hung.
+     */
+    static class MapListener<V, T> extends ListenerList<V> implements Runnable
+    {
+        final Future<V> future;
+        final AbstractFuture<T> result;
+        final Function<? super V, ? extends T> mapper;
+        @Nullable final Executor executor;
+
+        MapListener(Future<V> future, AbstractFuture<T> result, Function<? super V, ? extends T> mapper, @Nullable Executor executor)
+        {
+            this.future = future;
+            this.result = result;
+            this.mapper = mapper;
+            this.executor = executor;
+        }
+
+        @Override
+        public void run()
+        {
+            try
+            {
+                if (future.isSuccess()) result.trySet(mapper.apply(future.getNow()));
+                else result.tryFailure(future.cause());
+            }
+            catch (Throwable t)
+            {
+                result.tryFailure(t);
+                throw t;
+            }
+        }
+
+        @Override
+        void notifySelf(Executor notifyExecutor, Future<V> future)
+        {
+            notifyListener(inExecutor(executor) ? null : executor, this);
         }
     }
 

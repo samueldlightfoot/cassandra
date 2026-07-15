@@ -589,6 +589,29 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         Object coordWriteWarnings = CoordinatorWriteWarnings.captureAndClear();
         ExecutorLocals.clear();
 
+        // Inline fast path for the common already-completed exec (inline-apply write): finalize now and return
+        // the response directly, skipping a per-request promise + callback that would only drain immediately.
+        // The notifyExecutor==null guard keeps this a strict subset of the slow path — an exec that finalizes
+        // on its own notify executor must not be run here. finalizeResponse never throws (degrades to an
+        // ErrorMessage); the try/catch guards only a failure building that error.
+        if (exec.isDone() && exec.notifyExecutor() == null)
+        {
+            Message.Response toSend;
+            try
+            {
+                Message.Response response = exec.isSuccess() ? exec.getNow() : null;
+                Throwable failure = exec.isSuccess() ? null : exec.cause();
+                toSend = finalizeResponse(channel, connection, request, response, failure, locals, coordWarnings, coordWriteWarnings);
+            }
+            catch (Throwable t)
+            {
+                ErrorMessage error = ErrorMessage.fromException(t);
+                error.setStreamId(request.getStreamId());
+                toSend = error;
+            }
+            return ImmediateFuture.success(toSend);
+        }
+
         AsyncPromise<Message.Response> finalized = new AsyncPromise<>();
         exec.addCallback((response, failure) -> {
             Message.Response toSend;

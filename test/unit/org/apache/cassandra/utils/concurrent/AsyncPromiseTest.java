@@ -204,6 +204,33 @@ public class AsyncPromiseTest extends AbstractTestAsyncPromise
         }
     }
 
+    @Test
+    public void testMapAsyncOnNotYetDone()
+    {
+        // Slow path (fused MapListener node): map attaches before completion, fires on completion, yields the value.
+        AsyncPromise<Integer> p = new AsyncPromise<>();
+        org.apache.cassandra.utils.concurrent.Future<Integer> mapped = p.map(v -> v + 100);
+        Assert.assertFalse("must not complete before source", mapped.isDone());
+        p.setSuccess(3);
+        Assert.assertTrue(mapped.isDone());
+        Assert.assertEquals(Integer.valueOf(103), mapped.getNow());
+    }
+
+    @Test
+    public void testMapAsyncMapperThrows()
+    {
+        // Slow path with a throwing mapper: the returned future must FAIL with the thrown exception, never hang.
+        // This is the invariant the Dispatcher inline fast path relies on (its exec is a map result).
+        AsyncPromise<Integer> p = new AsyncPromise<>();
+        RuntimeException boom = new RuntimeException("map boom");
+        org.apache.cassandra.utils.concurrent.Future<Integer> mapped = p.map(v -> { throw boom; });
+        Assert.assertFalse(mapped.isDone());
+        p.setSuccess(3);
+        Assert.assertTrue("mapper throw must still complete the result", mapped.isDone());
+        Assert.assertFalse(mapped.isSuccess());
+        Assert.assertSame(boom, mapped.cause());
+    }
+
     private static final class TestInExecutor implements ExecutorPlus
     {
         static final TestInExecutor INSTANCE = new TestInExecutor();

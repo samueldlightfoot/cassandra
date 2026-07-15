@@ -59,6 +59,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import accord.primitives.Txn;
+import accord.utils.Invariants;
 
 import org.apache.cassandra.batchlog.Batch;
 import org.apache.cassandra.batchlog.BatchlogManager;
@@ -1497,7 +1498,11 @@ public class StorageProxy implements StorageProxyMBean
     {
         RetryingMutationDispatch dispatch = new RetryingMutationDispatch(mutations, consistencyLevel, requestTime);
         dispatch.attempt(preserveTimestamps);
-        return dispatch.result;
+        // The initial attempt either settled inline (returns an ImmediateFuture, no promise allocated) or
+        // registered an async arm (which created result first).
+        Future<Void> future = dispatch.result != null ? dispatch.result : dispatch.settledInline;
+        Invariants.require(future != null);
+        return future;
     }
 
     /**
@@ -1507,7 +1512,12 @@ public class StorageProxy implements StorageProxyMBean
      */
     private static final class RetryingMutationDispatch
     {
-        private final AsyncPromise<Void> result = new AsyncPromise<>();
+        // Created lazily, only when the dispatch must outlive this synchronous attempt() chain (an async arm
+        // exists). A fully-inline settle leaves result null and returns settledInline instead — no promise
+        // allocated. Invariant: result is non-null before any async registration, so an off-thread completion
+        // only ever reads it; both fields are otherwise touched only on the dispatching thread's attempt().
+        private AsyncPromise<Void> result;
+        private Future<Void> settledInline;
         private final List<? extends IMutation> mutations;
         private final ConsistencyLevel consistencyLevel;
         private final Dispatcher.RequestTime requestTime;
@@ -1523,12 +1533,26 @@ public class StorageProxy implements StorageProxyMBean
             this.requestTime = requestTime;
         }
 
+        // Allocate the durable promise on first async need; idempotent within the synchronous attempt() chain.
+        private AsyncPromise<Void> ensureResult()
+        {
+            AsyncPromise<Void> r = result;
+            if (r == null)
+                result = r = new AsyncPromise<>();
+            return r;
+        }
+
+        private boolean isTerminal()
+        {
+            return settledInline != null || (result != null && result.isDone());
+        }
+
         @SuppressWarnings("unchecked")
         private void attempt(PreserveTimestamp preserveTimestamps)
         {
             // A retry re-enters attempt() from an arm's callback; if the write already terminated
             // (e.g. the Accord backstop fired), do not re-dispatch a completed request.
-            if (result.isDone())
+            if (isTerminal())
                 return;
 
             ClusterMetadata cm = ClusterMetadata.current();
@@ -1542,10 +1566,16 @@ public class StorageProxy implements StorageProxyMBean
                 if (accordMutations != null && preserveTimestamps == PreserveTimestamp.mixedTimeSource)
                     checkMixedTimeSourceHandling();
                 IAccordResult<TxnResult> accordResult = accordMutations != null ? mutateWithAccordAsync(cm, accordMutations, consistencyLevel, requestTime, preserveTimestamps) : null;
-                if (accordResult != null && !accordDeadlineArmed)
+                if (accordResult != null)
                 {
-                    accordDeadlineArmed = true;
-                    armAccordDeadline();
+                    // An Accord arm is always async — force the durable promise before it (and the deadline
+                    // timer) can complete off-thread, so the inline-capture path is never reachable here.
+                    AsyncPromise<Void> r = ensureResult();
+                    if (!accordDeadlineArmed)
+                    {
+                        accordDeadlineArmed = true;
+                        armAccordDeadline(r);
+                    }
                 }
                 Tracing.trace("Split mutations into Accord {} and normal {}", accordMutations, normalMutations);
 
@@ -1564,14 +1594,30 @@ public class StorageProxy implements StorageProxyMBean
                 }
 
                 boolean hadNormalMutations = normalMutations != null;
-                PreserveTimestamp pts = preserveTimestamps;
-                IAccordResult<TxnResult> accord = accordResult;
-                normalFuture.addListener(f -> onNormalComplete(accord, hadNormalMutations, pts, (Future<Void>) f));
+                // Inline fast path: a normal-only arm that already completed (local apply done inline) is
+                // handled directly, skipping the listener node + lambda. We register nothing on normalFuture,
+                // so there is no listener ordering to protect; a retry recurses through attempt() exactly as
+                // the async listener would. notifyExecutor==null keeps threading identical to addListener.
+                if (accordResult == null && normalFuture.isDone() && normalFuture.notifyExecutor() == null)
+                {
+                    onNormalComplete(null, hadNormalMutations, preserveTimestamps, normalFuture);
+                }
+                else
+                {
+                    // Once registered, completion may run on another thread — the durable promise must exist first.
+                    ensureResult();
+                    PreserveTimestamp pts = preserveTimestamps;
+                    IAccordResult<TxnResult> accord = accordResult;
+                    normalFuture.addListener(f -> onNormalComplete(accord, hadNormalMutations, pts, (Future<Void>) f));
+                }
             }
             catch (Throwable t)
             {
                 Tracing.trace("{}", getStackTraceAsToString(t));
-                result.tryFailure(t);
+                if (result != null)
+                    result.tryFailure(t);
+                else if (settledInline == null)
+                    settledInline = ImmediateFuture.failure(t);
             }
         }
 
@@ -1655,20 +1701,26 @@ public class StorageProxy implements StorageProxyMBean
         {
             if (failure == null)
             {
-                result.trySuccess(null);
+                if (result != null)
+                    result.trySuccess(null);
+                else if (settledInline == null)
+                    settledInline = ImmediateFuture.success(null);
                 return;
             }
             Throwable t = unchecked(failure);
             // The sync loop's outer catch traces the stack of every exception it rethrows, including the
             // final `throw unchecked(failure)`; keep that trace on the failure path.
             Tracing.trace("{}", getStackTraceAsToString(t));
-            result.tryFailure(t);
+            if (result != null)
+                result.tryFailure(t);
+            else if (settledInline == null)
+                settledInline = ImmediateFuture.failure(t);
         }
 
         // The normal arm is bounded by its per-handler timers, but the Accord arm is awaited via a
         // non-timing addCallback. Bound the whole write at the write-rpc deadline so a lost Accord
         // coordination cannot hang the client, mirroring the sync awaitAndGet() timeout.
-        private void armAccordDeadline()
+        private void armAccordDeadline(AsyncPromise<Void> result)
         {
             ScheduledExecutorService scheduler = requestTime.timeoutScheduler() != null
                                                  ? requestTime.timeoutScheduler()
