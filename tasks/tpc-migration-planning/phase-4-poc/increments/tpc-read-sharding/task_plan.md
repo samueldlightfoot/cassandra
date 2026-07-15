@@ -27,23 +27,31 @@ owner shard. This is the read analog of the write path's RF=3 safety rule.
 
 ## Phases
 
-### Phase 0 — scope + design (read the map, then design; Fable only if a hot-path concurrency primitive is touched)
-- [ ] Confirm the partition key/token is available at ingress dispatch for a single-partition SELECT.
-- [ ] Decide: generalize `CqlShardRouter` to reads (shared token→shard logic) vs a read-specific router.
-- [ ] Design where the local read runs on the owning shard, and how the coordinator's replica-selection /
-      digest / read-repair path stays correct under RF=3 (routing must not bypass multi-replica reads).
-- [ ] Decide the async read shape (if needed): does a `SelectStatement.executeAsync` exist, or is the read path
-      synchronous today? Netty-aligned futures only if built.
+### Phase 0 — scope + design (DONE 2026-07-15; Fable-reviewed — findings.md is the design of record)
+- [x] Partition key/token available: `SinglePartitionReadCommand.partitionKey()` (L497) at the executor; no
+      ingress bind-value extraction needed for the chosen variant.
+- [x] Decision: **Variant A** — route only the local read (swap `Stage.READ`→shard executor at
+      `makeRequests:168`), NOT ingress coordinate routing. No `CqlShardRouter` generalization; reuse
+      `LocalReadRunnable`, no new class. Variant B (ingress + CL gate) deferred until an async read path exists.
+- [x] Coordinator replica-selection/digest/read-repair stay correct because only the local read's *thread*
+      changes — the `makeRequests` loop still contacts all replicas → correct at all CL/RF, no CL gate.
+- [x] Read path is synchronous (`StorageProxy.read` returns a `PartitionIterator`); that synchronicity is why
+      A is right and B premature. No future machinery built this increment.
 
-### Phase 1 — implement single-partition read routing
-- [ ] Route routable single-partition reads to the owning shard executor; keep multi-partition / range /
-      non-routable reads on the shared NTR pool.
-- [ ] Ingress path must not throw (null-returning lookups + try/catch→fallback).
+### Phase 1 — implement single-partition read routing (DONE 2026-07-15 — acceptance = the 5 gates)
+- [x] Route to the shard executor ONLY when: `ShardReads.ENABLED`; **`isShardThread()==false`** (kills the auth
+      nested-read self-stall); not a local-system keyspace; `indexQueryPlan()==null`; `shardForKey` present.
+      Else `Stage.READ` unchanged. Range/multi-partition never reach this path (SinglePartition executor only).
+- [x] `RejectedExecutionException` → `Stage.READ` fallback (drain window); `ShardLocalReadRouted/Fallbacks`.
+- [x] No netty-loop exposure (makeRequests is on the NTR/coordinate thread). New class `service/reads/ShardReads`.
+- Scoping: coordinator-local reads only (replica-side verb-handler routing out of scope; single-node bench +
+  big box are one process so coordinator==replica covers all measurement scenarios). See progress.md.
 
-### Phase 2 — correctness gate
-- [ ] In-JVM dtest (real multi-node cluster, runs on macOS) — single-partition reads correct at RF=1 AND RF=3,
-      at CL ONE and CL>ONE; ingress can't throw; digest/read-repair unaffected.
-- [ ] `ant build` + relevant unit/dtest green; `ant jar` + javap-verify.
+### Phase 2 — correctness gate (DONE 2026-07-15 — GREEN)
+- [x] `ShardRoutedLocalReadTest` (3-node in-JVM, TrieMemtable): PASS. Correct at RF=1 AND RF=3, CL ONE / QUORUM
+      / ALL; routed counter grew ≥200 (path exercised); digest resolution runs on the coordinator.
+- [x] `ant build` clean; `ShardRoutedReplicaApplyTest` (write path) + `ShardExecutorsTest` 5/5 still green.
+- [ ] `ant jar` + javap-verify — deferred to Phase 3 (rig deployment).
 
 ### Phase 3 — CPU-bound read A/B (the payoff — needs the RIGHT regime)
 - [ ] Re-provision the off-box loadgen (deleted). Pre-populate a LARGE dataset so reads miss cache and
@@ -52,6 +60,11 @@ owner shard. This is the read analog of the write path's RF=3 safety rule.
 - [ ] HDR band (p50→p9999) at 0.8–0.95× the knee, trunk vs read-sharding build, INTERLEAVED, MANY rounds
       (Tier-1's 2-round windowed p99 was underpowered → full HDR-histogram merge). + max CPU-bound read
       throughput. Keep contention counter + c2c as GC-immune corroboration.
+- [ ] **Neutralize the dynamic-snitch feedback loop** (disable snitch or monitor local-read fraction) — else
+      shard-queue wait fed to the snitch de-selects self and the mechanism turns itself off mid-run.
+- [ ] **Run a memtable-resident read arm too**, not only the sstable-miss arm — the sstable-only dataset
+      designs out the one locality mechanism this single-L3 box can show (memtable trie node reuse). State the
+      confound before the run.
 - [ ] Delete the loadgen box when done (bills hourly).
 
 ## Review section
@@ -60,3 +73,6 @@ owner shard. This is the read analog of the write path's RF=3 safety rule.
 - RF=3 read correctness preserved (digest/read-repair/replica-selection)? Ingress can't throw?
 - Honest read: even a CPU-bound single-L3 box may show no tail win — that's a valid isolation that justifies
   the big box, not a failure.
+- If the A/B tail is dominated by read/write mutual stalls on the shared shard executors (not the mechanism),
+  the pre-agreed pivot is a SEPARATE per-core sharded read pool (same hash, not the write executors) — keeps
+  per-core read locality without read-blocks-write, at the cost of stepping partly back from one-thread-owns-shard.
