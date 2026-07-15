@@ -104,6 +104,14 @@ public final class ShardExecutors
         return CURRENT_SHARD.get();
     }
 
+    /** True iff the calling thread is currently running a routed task on a shard executor. Used to refuse
+     *  nested routing: a task already on a shard thread that issues more shard-routed work (e.g. a read from
+     *  a routed write coordinate) could submit it back to its own executor and self-stall behind itself. */
+    public static boolean isShardThread()
+    {
+        return CURRENT_SHARD.get() != UNSET;
+    }
+
     /** True iff the calling thread is the single writer for memtable shard {@code memtableShardId}.
      *  Shard {@code m} maps to executor {@code m % SHARD_COUNT}, so more shards than executors is safe:
      *  every write to shard {@code m} still lands on one thread. */

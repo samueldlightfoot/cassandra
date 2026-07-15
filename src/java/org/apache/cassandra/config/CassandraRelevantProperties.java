@@ -205,6 +205,11 @@ public enum CassandraRelevantProperties
      * coordinate + local apply share one thread (deleting the loop-&gt;NTR handoff). Requires
      * {@link #MUTATION_SHARD_ROUTING}. Read once at startup. */
     CQL_INGRESS_ROUTING("cassandra.tpc.cql_ingress_routing", "false"),
+    /** Run a routable single-partition read's local portion on the executor owning its shard instead of the
+     * shared {@code Stage.READ} pool, so the read's CPU work stays on the core that owns that partition's
+     * data. Only the local read moves; the coordinator still contacts every replica, so this is correct at
+     * any consistency level and RF. Requires {@link #MUTATION_SHARD_ROUTING}. Read once at startup. */
+    CQL_READ_ROUTING("cassandra.tpc.cql_read_routing", "false"),
     CRYPTO_PROVIDER_CLASS_NAME("cassandra.crypto_provider_class_name"),
     CURSOR_COMPACTION_ENABLED("cassandra.cursor_compaction_enabled", "true"),
     CUSTOM_DISK_ERROR_HANDLER("cassandra.custom_disk_error_handler"),

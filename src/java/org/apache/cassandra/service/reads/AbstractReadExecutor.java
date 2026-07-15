@@ -165,7 +165,11 @@ public abstract class AbstractReadExecutor
         if (hasLocalEndpoint)
         {
             logger.trace("reading {} locally", readCommand.isDigestQuery() ? "digest" : "data");
-            Stage.READ.maybeExecuteImmediately(new LocalReadRunnable(readCommand, handler, requestTime));
+            LocalReadRunnable localRead = new LocalReadRunnable(readCommand, handler, requestTime);
+            // When read routing is on, run the local read on the executor owning this partition's shard;
+            // otherwise (and on any declined route) the shared read stage, exactly as before.
+            if (!(ShardReads.ENABLED && ShardReads.submitLocalRead(command, localRead)))
+                Stage.READ.maybeExecuteImmediately(localRead);
         }
     }
 
