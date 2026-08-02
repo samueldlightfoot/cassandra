@@ -1,5 +1,12 @@
 # Findings — Read-path sharding design (Phase 0)
 
+> **OUTCOME (2026-07-16, see `result.md` + `progress.md`):** Variant A was built, proven correct + firing, and
+> A/B'd across the full load range. It is a **net regression** on the 6-core shared-L3 rig — p99 1–2 orders of
+> magnitude worse, ~57% more CPU, lower sustainable throughput — because 12 single-threaded floating shard
+> executors head-of-line-block while the shared `Stage.READ` pool load-balances + runs inline. Locality has no
+> payoff on a shared L3. Two open threads: (1) implementation perf bugs inflating the cost (`perf-bug-hunt-plan.md`);
+> (2) the mechanism's fair test is the deferred big-box (multi-L3/NUMA). Design rationale below is preserved as-is.
+
 ## The two routing points (the design fork the start prompt collapsed into one)
 
 A single-partition read's CPU-heavy work (deserialize / merge / decompress / row iteration) lives in the

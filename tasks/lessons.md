@@ -208,3 +208,25 @@ group under a live registry the way the running node does).
   step, not a user decision. Reserve the user's attention for genuine choices.
 - Rule: don't infer "unauthed" from one auth surface (`context list`) — check how the token is actually
   supplied (env var, config file, secret path) per the runbook.
+
+## Characterize the box's true throughput ceiling BEFORE picking an A/B operating point (2026-07-16)
+- Mistake: ran a 3-round read A/B at "offered 140k" believing it was the loaded knee. It delivered only
+  ~99k with cass at ~50% CPU. User challenged the setup ("why 6-core boxes, is the loadgen the bottleneck,
+  same spec?"). A concurrency+rate sweep then showed the box's real max is ~265k r/s and the loadgen was
+  idle (~4/16 cores) — so my "loaded" A/B had run at ~37% of capacity. The operating point was wrong.
+- Rule: before any latency A/B, PIN the box ceiling first: sweep offered-rate AND concurrency, measure
+  BOTH cass cores (pidstat) and loadgen cores, find where delivered plateaus. Pick the A/B rate relative
+  to the MEASURED delivered ceiling, not the offered `--rate` (easy-cass-stress delivers only ~0.65–0.71×
+  of `--rate`; offered ≠ delivered). Run the A/B across the full range (light / near-knee / overload), not
+  one point — a single mistaken point misleads.
+- Rule: identical `delivered` at very different cass CPU (e.g. 99k @ 34% vs 99k @ 54%) proves the ceiling
+  is closed-loop concurrency/latency, NOT cass compute. That test instantly answers "what's the bottleneck."
+- Rule (HT boxes): mpstat "busy%" under-reports physical saturation. On 6C/12T, ~66% mpstat at the
+  throughput plateau = all 6 physical cores maxed (the idle HT siblings can't add throughput). "90–100%
+  mpstat under CPU-bound load" is unreachable by construction; don't chase it — measure cores via pidstat.
+- Rule: easy-cass-stress STDOUT p99 is a windowed/junk value (saw ON 4.46 vs OFF 1.34 that inverted under
+  the real distribution). Trust ONLY the `--hdr` `-reads.txt` HdrHistogram file for percentiles. And the
+  HDR excludes timed-out reads, so under overload read the client ERROR count alongside it.
+- Rule: to launch a loadgen run over ssh that outlives the session, BACKGROUND THE SSH ITSELF on the rig
+  (`$SSHLG "cass-stress … --duration Ns > log 2>&1" &`); never `setsid bash -c '…nested $VAR…'` — the
+  nested quoting garbled `$RATE`→empty and reproduced a fake "delivered=0" anomaly.

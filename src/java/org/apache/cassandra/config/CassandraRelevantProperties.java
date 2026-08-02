@@ -210,6 +210,11 @@ public enum CassandraRelevantProperties
      * data. Only the local read moves; the coordinator still contacts every replica, so this is correct at
      * any consistency level and RF. Requires {@link #MUTATION_SHARD_ROUTING}. Read once at startup. */
     CQL_READ_ROUTING("cassandra.tpc.cql_read_routing", "false"),
+    /** Read-path routing sheds a read back to {@code Stage.READ} when its owning shard executor already has at
+     * least this many queued reads, so an overloaded shard degrades gracefully (the shared pool load-balances)
+     * instead of growing an unbounded queue into multi-second latency and dropped reads. 0 disables the check.
+     * Read once at startup. */
+    CQL_READ_ROUTING_MAX_QUEUE("cassandra.tpc.cql_read_routing_max_queue", "128"),
     CRYPTO_PROVIDER_CLASS_NAME("cassandra.crypto_provider_class_name"),
     CURSOR_COMPACTION_ENABLED("cassandra.cursor_compaction_enabled", "true"),
     CUSTOM_DISK_ERROR_HANDLER("cassandra.custom_disk_error_handler"),

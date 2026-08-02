@@ -155,6 +155,13 @@ public final class ShardExecutors
         };
     }
 
+    /** Queued (not-yet-running) tasks on the executor owning {@code memtableShardId}. A cheap size read used
+     *  to shed load off a backed-up shard before its unbounded queue grows into multi-second latency. */
+    public int pendingTasks(int memtableShardId)
+    {
+        return executors[Math.floorMod(memtableShardId, SHARD_COUNT)].getPendingTaskCount();
+    }
+
     @VisibleForTesting
     SequentialExecutorPlus executorFor(int memtableShardId)
     {

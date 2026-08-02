@@ -33,6 +33,7 @@ import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.CQL_READ_ROUTING;
+import static org.apache.cassandra.config.CassandraRelevantProperties.CQL_READ_ROUTING_MAX_QUEUE;
 import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 /**
@@ -58,6 +59,9 @@ public final class ShardReads
     /** This flag AND mutation shard routing (the shard executors only exist when that is on). Read once at
      *  startup — a mid-run flip would create mixed routed/unrouted windows. */
     public static final boolean ENABLED = CQL_READ_ROUTING.getBoolean() && MutationShardRouting.ROUTING_ENABLED;
+
+    /** Shed a read back to {@code Stage.READ} once its owning shard has this many queued reads; 0 disables. */
+    private static final int MAX_QUEUE = CQL_READ_ROUTING_MAX_QUEUE.getInt();
 
     /** Local reads run on their owning shard executor. */
     private static final Counter routed = Metrics.counter(FACTORY.createMetricName("ShardLocalReadRouted"));
@@ -106,6 +110,12 @@ public final class ShardReads
 
         OptionalInt shard = MutationShardRouting.shardForKey(metadata, read.partitionKey());
         if (shard.isEmpty())
+            return fallback();
+
+        // Shard executors are single-threaded with an unbounded queue: a backed-up shard would otherwise grow
+        // the queue into multi-second latency and expired-read drops. Shed to Stage.READ (which load-balances
+        // across its pool) once the owning shard is deep, so overload degrades gracefully instead of collapsing.
+        if (MAX_QUEUE > 0 && shards.pendingTasks(shard.getAsInt()) >= MAX_QUEUE)
             return fallback();
 
         try
