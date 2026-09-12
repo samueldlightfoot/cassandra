@@ -23,8 +23,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.function.Supplier;
 
-import com.google.common.annotations.VisibleForTesting;
-
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.compress.CorruptBlockException;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
@@ -56,7 +54,6 @@ public class ThreadLocalReadAheadBuffer implements Closeable
         }
     };
 
-    private volatile int bufferSize = -1;
     private final long channelSize;
 
     public ThreadLocalReadAheadBuffer(ChannelProxy channel, int bufferSize, BufferType bufferType)
@@ -74,12 +71,6 @@ public class ThreadLocalReadAheadBuffer implements Closeable
     public boolean hasBuffer()
     {
         return block().buffer != null;
-    }
-
-    @VisibleForTesting
-    int bufferSize()
-    {
-        return bufferSize;
     }
 
     public int remaining()
@@ -100,13 +91,6 @@ public class ThreadLocalReadAheadBuffer implements Closeable
             block.buffer = bufferSupplier.get();
             block.buffer.clear();
         }
-        // bufferSize is a per-instance field, but Block objects are cached in a static
-        // thread-local map keyed by file path and shared across instances. When this
-        // instance reuses a Block allocated by an earlier instance for the same path,
-        // block.buffer is already non-null, so bufferSize must still be initialised here;
-        // leaving it at -1 makes fill() call ByteBuffer.limit(-1) and abort compaction.
-        if (bufferSize == -1)
-            bufferSize = block.buffer.capacity();
         return block;
     }
 
@@ -119,6 +103,7 @@ public class ThreadLocalReadAheadBuffer implements Closeable
     {
         Block block = getBlock();
         ByteBuffer blockBuffer = block.buffer;
+        int bufferSize = blockBuffer.capacity();
         if (position >= channelSize)
             throw new CorruptBlockException(channel.filePath(), position, bufferSize);
 

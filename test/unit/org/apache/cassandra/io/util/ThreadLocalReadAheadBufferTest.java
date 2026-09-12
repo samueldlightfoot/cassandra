@@ -28,6 +28,7 @@ import java.util.Random;
 
 import org.junit.AfterClass;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.quicktheories.WithQuickTheories;
@@ -129,13 +130,6 @@ public class ThreadLocalReadAheadBufferTest implements WithQuickTheories
                 actual.flip();
 
                 Assert.assertEquals(expected, actual);
-
-                // A reused Block self-corrects reads on each fill(), so byte equality alone
-                // passes for any positive bufferSize. Pin the exact invariant the fix
-                // restores: a reused instance initialises bufferSize from the buffer
-                // capacity, not -1 and not some other value.
-                Assert.assertEquals("reused instance must initialise bufferSize from capacity",
-                                    bufferSize, b.bufferSize());
             }
             finally
             {
@@ -183,6 +177,36 @@ public class ThreadLocalReadAheadBufferTest implements WithQuickTheories
                 // B.close() removed the shared Block from the map, so this is a safe no-op
                 // and must not double-free or throw.
                 a.close();
+            }
+        }
+    }
+
+    @Test
+    public void testInstancesWithDifferentBufferCapacities() throws CorruptBlockException
+    {
+        // A Direct instance rounds its buffer up to the device block size, so instances over
+        // one path can put different capacities into the same cached Block. An instance must
+        // not carry a capacity it observed on someone else's Block over to its own.
+        try (ChannelProxy channel = new ChannelProxy(files[0]))
+        {
+            int smallSize = 4096;
+            int largeSize = smallSize * 2;
+            Assume.assumeTrue(channel.size() > 2L * largeSize);
+
+            ThreadLocalReadAheadBuffer large = new ThreadLocalReadAheadBuffer(channel, () -> BufferType.OFF_HEAP.allocate(largeSize));
+            ThreadLocalReadAheadBuffer small = new ThreadLocalReadAheadBuffer(channel, () -> BufferType.OFF_HEAP.allocate(smallSize));
+            try
+            {
+                large.fill(0);
+                testRead(Pair.create(largeSize + 17L, 100), channel, small);
+
+                large.close();
+                testRead(Pair.create(largeSize + 17L, 100), channel, small);
+            }
+            finally
+            {
+                small.close();
+                large.close();
             }
         }
     }
