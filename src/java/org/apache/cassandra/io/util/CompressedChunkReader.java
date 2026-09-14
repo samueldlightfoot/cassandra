@@ -206,10 +206,10 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
 
         private final ChannelProxy channel;
         private final ByteBufferHolder bufferHolder;
-        private final ThreadLocalReadAheadBuffer readAheadBuffer;
+        private final ReadAheadBuffer readAheadBuffer;
 
         private ScanCompressedReader(ChannelProxy channel, ByteBufferHolder bufferHolder,
-                                     ThreadLocalReadAheadBuffer readAheadBuffer)
+                                     ReadAheadBuffer readAheadBuffer)
         {
             this.channel = channel;
             this.bufferHolder = bufferHolder;
@@ -278,19 +278,30 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
 
         private final CompressedReader reader;
         private final CompressedReader scanReader;
+        private final int blockSize;
+        private final int readAheadBufferSize;
 
         public Direct(ChannelProxy channel, CompressionMetadata metadata, DoubleSupplier crcCheckChanceSupplier)
         {
             super(channel, metadata, crcCheckChanceSupplier);
-            int blockSize = FileUtils.getFileBlockSize(channel.file());
+            this.blockSize = FileUtils.getFileBlockSize(channel.file());
             this.reader = new DirectRandomAccessReader(channel, blockSize);
 
-            int readAheadBufferSize = DatabaseDescriptor.getCompressedReadAheadBufferSize();
-            this.scanReader = (readAheadBufferSize > 0 && readAheadBufferSize > metadata.chunkLength())
-                              ? new ScanCompressedReader(channel,
-                                                         new DirectThreadLocalByteBufferHolder(blockSize),
-                                                         new DirectThreadLocalReadAheadBuffer(channel, readAheadBufferSize, blockSize))
-                              : null;
+            int size = DatabaseDescriptor.getCompressedReadAheadBufferSize();
+            this.readAheadBufferSize = (size > 0 && size > metadata.chunkLength()) ? size : 0;
+            this.scanReader = null;
+        }
+
+        // Per-scan view.  Each scan reader is single-threaded and owns its own read-ahead buffer, so no buffer is
+        // shared across threads.  It shares the parent's random-access reader as a fallback; that reader's close() is
+        // a no-op, so the view frees only its own scan buffer.
+        private Direct(Direct parent, CompressedReader scanReader)
+        {
+            super(parent.channel, parent.metadata, parent.crcCheckChanceSupplier);
+            this.blockSize = parent.blockSize;
+            this.reader = parent.reader;
+            this.readAheadBufferSize = 0;
+            this.scanReader = scanReader;
         }
 
         @Override
@@ -337,10 +348,14 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
         @Override
         protected CompressedChunkReader forScan()
         {
-            if (scanReader != null)
-                scanReader.allocateResources();
+            if (readAheadBufferSize == 0)
+                return this;
 
-            return this;
+            ScanCompressedReader scan = new ScanCompressedReader(channel,
+                                                                 new DirectThreadLocalByteBufferHolder(blockSize),
+                                                                 new DirectReadAheadBuffer(channel, readAheadBufferSize, blockSize));
+            scan.allocateResources();
+            return new Direct(this, scan);
         }
 
         @Override
@@ -366,26 +381,38 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
 
         private final CompressedReader reader;
         private final CompressedReader scanReader;
+        private final int readAheadBufferSize;
 
         public Standard(ChannelProxy channel, CompressionMetadata metadata, DoubleSupplier crcCheckChanceSupplier)
         {
             super(channel, metadata, crcCheckChanceSupplier);
             reader = new RandomAccessCompressedReader(channel, metadata);
 
-            int readAheadBufferSize = DatabaseDescriptor.getCompressedReadAheadBufferSize();
-            scanReader = (readAheadBufferSize > 0 && readAheadBufferSize > metadata.chunkLength())
-                         ? new ScanCompressedReader(channel,
-                                                    new ThreadLocalByteBufferHolder(metadata.compressor().preferredBufferType()),
-                                                    new ThreadLocalReadAheadBuffer(channel, readAheadBufferSize, metadata.compressor().preferredBufferType())) : null;
+            int size = DatabaseDescriptor.getCompressedReadAheadBufferSize();
+            this.readAheadBufferSize = (size > 0 && size > metadata.chunkLength()) ? size : 0;
+            this.scanReader = null;
+        }
+
+        // Per-scan view; see Direct for the ownership rationale.
+        private Standard(Standard parent, CompressedReader scanReader)
+        {
+            super(parent.channel, parent.metadata, parent.crcCheckChanceSupplier);
+            this.reader = parent.reader;
+            this.readAheadBufferSize = 0;
+            this.scanReader = scanReader;
         }
 
         @Override
         protected CompressedChunkReader forScan()
         {
-            if (scanReader != null)
-                scanReader.allocateResources();
+            if (readAheadBufferSize == 0)
+                return this;
 
-            return this;
+            ScanCompressedReader scan = new ScanCompressedReader(channel,
+                                                                 new ThreadLocalByteBufferHolder(metadata.compressor().preferredBufferType()),
+                                                                 new ReadAheadBuffer(channel, readAheadBufferSize, metadata.compressor().preferredBufferType()));
+            scan.allocateResources();
+            return new Standard(this, scan);
         }
 
         @Override
