@@ -35,6 +35,7 @@ import org.apache.cassandra.io.util.ChannelProxy;
 import org.apache.cassandra.io.util.CompressedChunkReader;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileSystems;
+import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.io.util.Rebufferer;
 import org.apache.cassandra.io.util.RebuffererFactory;
 import org.apache.cassandra.io.util.SequentialWriterOption;
@@ -116,7 +117,7 @@ public class ChunkCacheScanBypassTest
             RebuffererFactory factory = cache.wrap(reader);
 
             // A scan gets a distinct, non-caching rebufferer and must not add anything to the cache.
-            Rebufferer scan = factory.instantiateRebufferer(true);
+            Rebufferer scan = factory.instantiateRebufferer(ReadPattern.BULK);
             Assertions.assertThat(scan).isNotSameAs(factory);
             try
             {
@@ -131,7 +132,7 @@ public class ChunkCacheScanBypassTest
             }
 
             // A point read reuses the caching rebufferer and populates the cache, proving the cache works.
-            Rebufferer point = factory.instantiateRebufferer(false);
+            Rebufferer point = factory.instantiateRebufferer(ReadPattern.RANDOM);
             Assertions.assertThat(point).isSameAs(factory);
             rebufferWholeFile(point, reader.fileLength(), reader.chunkSize());
             Assertions.assertThat(cache.size()).as("a point read must populate the chunk cache").isGreaterThan(0);
@@ -165,7 +166,7 @@ public class ChunkCacheScanBypassTest
             int chunkSize = reader.chunkSize();
             long chunkCount = (fileLength + chunkSize - 1) / chunkSize;
 
-            Rebufferer scan = factory.instantiateRebufferer(true);
+            Rebufferer scan = factory.instantiateRebufferer(ReadPattern.BULK);
             try
             {
                 rebufferWholeFile(scan, fileLength, chunkSize);

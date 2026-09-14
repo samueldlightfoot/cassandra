@@ -37,6 +37,7 @@ import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.util.ChannelProxy;
 import org.apache.cassandra.io.util.ChunkReader;
 import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.io.util.Rebufferer;
 import org.apache.cassandra.io.util.RebuffererFactory;
 import org.apache.cassandra.metrics.ChunkCacheMetrics;
@@ -258,13 +259,14 @@ public class ChunkCache implements CacheLoader<ChunkCache.Key, ChunkCache.Buffer
         }
 
         @Override
-        public Rebufferer instantiateRebufferer(boolean isScan)
+        public Rebufferer instantiateRebufferer(ReadPattern pattern)
         {
-            // A scan (compaction, index build) reads each chunk once and must not pollute the cache with
-            // one-shot chunks that evict hot data. Delegate to the source so the scan bypasses the cache and
-            // uses its own read-ahead buffer instead. For an Mmap source this also bypasses the chunk cache,
-            // which is correct: mmap data already lives in the OS page cache, so the chunk cache only duplicates it.
-            return isScan ? source.instantiateRebufferer(true) : this;
+            // A one-shot read (compaction, repair, streaming, index build) reads each chunk once and must not
+            // evict hot data. Delegate to the source so it bypasses the cache and uses its own read-ahead buffer
+            // instead. For an Mmap source this also bypasses the chunk cache, which is correct: mmap data already
+            // lives in the OS page cache, so the chunk cache only duplicates it. A partition range read also walks
+            // the file in order, but it may read the same rows again, so it keeps the cache.
+            return pattern.bypassesChunkCache() ? source.instantiateRebufferer(pattern) : this;
         }
 
         @Override

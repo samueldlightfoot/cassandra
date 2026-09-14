@@ -62,6 +62,7 @@ import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.io.util.SequentialWriter;
 import org.apache.cassandra.io.util.SequentialWriterOption;
 import org.apache.cassandra.metrics.StorageMetrics;
@@ -946,7 +947,7 @@ public class DirectCompressedSequentialWriterTest
                         writer.finish();
                         try (CompressionMetadata md = CompressionMetadata.open(metadataFile, dataFile.length(), true);
                              FileHandle fh = new FileHandle.Builder(dataFile).withCompressionMetadata(md).complete();
-                             RandomAccessReader reader = fh.createReader(null, path == ReaderPath.SCAN))
+                             RandomAccessReader reader = fh.createReader(null, path == ReaderPath.SCAN ? ReadPattern.BULK : ReadPattern.RANDOM))
                         {
                             assertReadablePrefix(reader, payload, payload.length, moment, path, params, regime);
                         }
@@ -972,7 +973,7 @@ public class DirectCompressedSequentialWriterTest
                                                BufferRegime regime) throws IOException
     {
         try (FileHandle fh = new FileHandle.Builder(dataFile).withCompressionMetadata(md).complete();
-             RandomAccessReader reader = fh.createReader(null, path == ReaderPath.SCAN))
+             RandomAccessReader reader = fh.createReader(null, path == ReaderPath.SCAN ? ReadPattern.BULK : ReadPattern.RANDOM))
         {
             if (path == ReaderPath.SCAN)
             {

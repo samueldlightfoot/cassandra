@@ -90,9 +90,9 @@ public abstract class CompressedChunkReader extends AbstractReaderFileProxy impl
     }
 
     @Override
-    public Rebufferer instantiateRebufferer(boolean isScan)
+    public Rebufferer instantiateRebufferer(ReadPattern pattern)
     {
-        return new BufferManagingRebufferer.Aligned(isScan ? forScan() : this);
+        return new BufferManagingRebufferer.Aligned(pattern.readsAhead() ? forScan() : this);
     }
 
     protected interface CompressedReader extends Closeable

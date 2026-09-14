@@ -97,6 +97,7 @@ import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.FileUtils.DuplicateHardlinkException;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.metrics.RestorableMeter;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadataRef;
@@ -1421,43 +1422,43 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
 
     public RandomAccessReader openDataReader()
     {
-        return openDataReaderInternal(null, null, false);
+        return openDataReaderInternal(null, null, ReadPattern.RANDOM);
     }
 
     public RandomAccessReader openDataReader(RateLimiter limiter)
     {
         assert limiter != null;
-        return openDataReaderInternal(null, limiter, false);
+        return openDataReaderInternal(null, limiter, ReadPattern.RANDOM);
     }
 
     public RandomAccessReader openDataReader(DiskAccessMode diskAccessMode)
     {
-        return openDataReaderInternal(diskAccessMode, null, false);
+        return openDataReaderInternal(diskAccessMode, null, ReadPattern.RANDOM);
     }
 
-    public RandomAccessReader openDataReaderForScan()
+    public RandomAccessReader openDataReaderForScan(ReadPattern pattern)
     {
-        return openDataReaderInternal(null, null, true);
+        return openDataReaderInternal(null, null, pattern);
     }
 
-    public RandomAccessReader openDataReaderForScan(DiskAccessMode diskAccessMode)
+    public RandomAccessReader openDataReaderForScan(DiskAccessMode diskAccessMode, ReadPattern pattern)
     {
-        return openDataReaderInternal(diskAccessMode, null, true);
+        return openDataReaderInternal(diskAccessMode, null, pattern);
     }
 
     private RandomAccessReader openDataReaderInternal(@Nullable DiskAccessMode diskAccessMode,
                                                       @Nullable RateLimiter limiter,
-                                                      boolean forScan)
+                                                      ReadPattern pattern)
     {
         if (canReuseDfile(diskAccessMode))
-            return dfile.createReader(limiter, forScan, OnReaderClose.RETAIN_FILE_OPEN);
+            return dfile.createReader(limiter, pattern, OnReaderClose.RETAIN_FILE_OPEN);
 
         FileHandle handle = dfile.toBuilder()
                                  .withDiskAccessMode(diskAccessMode)
                                  .complete();
         try
         {
-            return handle.createReader(limiter, forScan, OnReaderClose.CLOSE_FILE);
+            return handle.createReader(limiter, pattern, OnReaderClose.CLOSE_FILE);
         }
         catch (Throwable t)
         {
