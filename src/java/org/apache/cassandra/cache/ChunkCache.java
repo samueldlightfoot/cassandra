@@ -260,7 +260,11 @@ public class ChunkCache implements CacheLoader<ChunkCache.Key, ChunkCache.Buffer
         @Override
         public Rebufferer instantiateRebufferer(boolean isScan)
         {
-            return this;
+            // A scan (compaction, index build) reads each chunk once and must not pollute the cache with
+            // one-shot chunks that evict hot data. Delegate to the source so the scan bypasses the cache and
+            // uses its own read-ahead buffer instead. For an Mmap source this also bypasses the chunk cache,
+            // which is correct: mmap data already lives in the OS page cache, so the chunk cache only duplicates it.
+            return isScan ? source.instantiateRebufferer(true) : this;
         }
 
         @Override
