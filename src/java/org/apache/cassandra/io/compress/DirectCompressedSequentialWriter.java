@@ -175,6 +175,13 @@ public class DirectCompressedSequentialWriter extends CompressedSequentialWriter
         syncDataOnlyInternal();
     }
 
+    @Override
+    protected void syncFullInternal()
+    {
+        finalizeDataFile();
+        force(true);
+    }
+
     // Brings the file to its final on-disk form exactly once. openFinalEarly's sync and commit's doPrepare
     // both land here; whichever runs first does the work, the other is a no-op. Safe because the writer is
     // switched out right after openFinalEarly, so nothing writes once the file is final.
@@ -325,7 +332,7 @@ public class DirectCompressedSequentialWriter extends CompressedSequentialWriter
             writeAlignedBlocks(flushLimit);
 
             // O_DIRECT required padding; truncate back to actual data size.
-            fchannel.truncate(actualDataSize);
+            truncateChannel(actualDataSize);
         }
         catch (IOException e)
         {
@@ -363,8 +370,7 @@ public class DirectCompressedSequentialWriter extends CompressedSequentialWriter
         @Override
         protected void doPrepare()
         {
-            finalizeDataFile();
-            syncDataOnlyInternal();
+            syncFullInternal();
             writeDigestFile();
             sstableMetadataCollector.addCompressionRatio(compressedSize, uncompressedSize);
             metadataWriter.finalizeLength(current(), chunkCount).prepareToCommit();

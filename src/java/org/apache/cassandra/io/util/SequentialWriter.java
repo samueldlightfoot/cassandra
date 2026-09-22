@@ -29,18 +29,24 @@ import java.util.function.LongConsumer;
 
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.SyncUtil;
 import org.apache.cassandra.utils.concurrent.Transactional;
 import org.apache.cassandra.utils.memory.MemoryUtil;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.TRICKLE_FSYNC_USE_FDATASYNC;
 import static org.apache.cassandra.utils.Throwables.merge;
 
 /**
- * Adds buffering, mark, and fsyncing to OutputStream.  We always fsync on close; we may also
- * fsync incrementally if Config.trickle_fsync is enabled.
+ * Adds buffering, mark, and fsyncing to OutputStream.  We always fsync on close; we may also pace
+ * writeback at intervals if Config.trickle_fsync is enabled.
  */
 public class SequentialWriter extends BufferedDataOutputStreamPlus implements Transactional
 {
+    // Operator escape hatch back to the per-interval fdatasync, should writeback pacing misbehave in the
+    // field. Deliberately not a yaml option, and never enabled automatically.
+    private static final boolean TRICKLE_WITH_FDATASYNC = TRICKLE_FSYNC_USE_FDATASYNC.getBoolean();
+
     // absolute path to the given file
     private final String filePath;
     private final File file;
@@ -67,6 +73,13 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
     protected long lastFlushOffset;
 
     protected LongConsumer runPostFlush;
+
+    // Ranges handed to the kernel at the last two intervals. Compressed offsets on a compressed writer,
+    // while the interval that triggers them counts uncompressed bytes.
+    private long previousWritebackPosition = 0;
+    private long lastWritebackPosition = 0;
+    // Negative when writeback cannot be paced, which is how trySyncFileRange reads it too.
+    private final int writebackFd;
 
     private final TransactionalProxy txnProxy = txnProxy();
 
@@ -96,7 +109,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         @Override
         protected void doPrepare()
         {
-            syncInternal();
+            syncFullInternal();
         }
 
         @Override
@@ -194,6 +207,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         this.file = file;
         this.filePath = file.absolutePath();
         this.option = option;
+        this.writebackFd = option.trickleFsync() && !TRICKLE_WITH_FDATASYNC ? NativeLibrary.getfd(fchannel) : -1;
     }
 
     public void skipBytes(long numBytes) throws IOException
@@ -213,9 +227,21 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
 
     protected void syncDataOnlyInternal()
     {
+        force(false);
+    }
+
+    /** The only sync that commits the file's size and timestamps; writeback pacing commits no metadata. */
+    protected void syncFullInternal()
+    {
+        doFlush(0);
+        force(true);
+    }
+
+    protected void force(boolean metaData)
+    {
         try
         {
-            SyncUtil.force(fchannel, false);
+            SyncUtil.force(fchannel, metaData);
         }
         catch (IOException e)
         {
@@ -234,6 +260,83 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         syncDataOnlyInternal();
     }
 
+    /** Paces writeback at the trickle interval, so dirty pages do not pile up into one kernel-sized burst. */
+    private void trickleSync()
+    {
+        if (TRICKLE_WITH_FDATASYNC)
+            syncDataOnlyInternal();
+        else
+            trySyncFileRangeInternal();
+    }
+
+    /**
+     * Hands the kernel the range written since the last interval and waits on the range before it, so at
+     * most two intervals of writeback are ever outstanding. {@link NativeLibrary#trySyncFileRange} says
+     * why the wait cannot be folded into the same call.
+     * <p>
+     * The positions advance only once both ranges are handed over, so a refused range is retried whole
+     * at the next interval. Nothing is ever synced in its place — nor when there is no descriptor to
+     * hand it to.
+     */
+    private void trySyncFileRangeInternal()
+    {
+        // only a failed getfd reaches this — trickle off and the hatch never call in here
+        if (writebackFd < 0)
+            return;
+
+        long pos;
+        try
+        {
+            pos = fchannel.position();
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, getPath());
+        }
+
+        if (pos <= lastWritebackPosition)
+            return;
+
+        if (!syncFileRange(lastWritebackPosition, pos - lastWritebackPosition, NativeLibrary.SYNC_FILE_RANGE_WRITE))
+            return;
+
+        if (lastWritebackPosition > previousWritebackPosition
+            && !syncFileRange(previousWritebackPosition, lastWritebackPosition - previousWritebackPosition,
+                              NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE))
+            return;
+
+        previousWritebackPosition = lastWritebackPosition;
+        lastWritebackPosition = pos;
+    }
+
+    /**
+     * Every route that shrinks the file goes through here, so no paced range outlives the bytes it names.
+     * A range left past the end of the file short-circuits every later interval.
+     */
+    protected void truncateChannel(long toSize)
+    {
+        try
+        {
+            fchannel.truncate(toSize);
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, getPath());
+        }
+
+        lastWritebackPosition = Math.min(lastWritebackPosition, toSize);
+        previousWritebackPosition = Math.min(previousWritebackPosition, lastWritebackPosition);
+    }
+
+    /**
+     * The one call {@link #trySyncFileRangeInternal} makes, so tests can observe the ranges it builds on
+     * platforms that do not have the syscall.
+     */
+    protected boolean syncFileRange(long offset, long nbytes, int flags)
+    {
+        return NativeLibrary.trySyncFileRange(writebackFd, offset, nbytes, flags);
+    }
+
     @Override
     protected void doFlush(int count)
     {
@@ -244,7 +347,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
             bytesSinceTrickleFsync += buffer.position();
             if (bytesSinceTrickleFsync >= option.trickleFsyncByteInterval())
             {
-                syncDataOnlyInternal();
+                trickleSync();
                 bytesSinceTrickleFsync = 0;
             }
         }
@@ -417,15 +520,8 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
 
     public void truncate(long toSize)
     {
-        try
-        {
-            fchannel.truncate(toSize);
-            lastFlushOffset = toSize;
-        }
-        catch (IOException e)
-        {
-            throw new FSWriteError(e, getPath());
-        }
+        truncateChannel(toSize);
+        lastFlushOffset = toSize;
     }
 
     public boolean isOpen()

@@ -688,6 +688,7 @@ public enum CassandraRelevantProperties
     /** Activate write survey mode. The node not becoming an active ring member, and you must use JMX StorageService->joinRing() to finalize the ring joining. */
     TEST_WRITE_SURVEY("cassandra.write_survey"),
     TOLERATE_SSTABLE_SIZE("cassandra.tolerate_sstable_size"),
+    TRICKLE_FSYNC_USE_FDATASYNC("cassandra.trickle_fsync.use_fdatasync", "false"),
     TRIGGERS_DIR("cassandra.triggers_dir"),
     TRUNCATE_BALLOT_METADATA("cassandra.truncate_ballot_metadata"),
     TYPE_UDT_CONFLICT_BEHAVIOR("cassandra.type.udt.conflict_behavior"),

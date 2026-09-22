@@ -28,7 +28,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A {@code NativeLibraryWrapper} implementation for Linux.
+ * A {@code NativeLibraryWrapper} implementation for Linux. Also the one AIX gets, and the one every
+ * operating system Cassandra does not recognise gets, since {@code getOsType} maps those to
+ * {@code LINUX}. So a symbol that only Linux has must not be declared alongside the rest; see how
+ * {@code sync_file_range} is registered below.
  * <p>
  * When JNA is initialized, all methods that have the 'native' keyword
  * will be attmpted to be linked against. As Java doesn't have the equivalent
@@ -80,6 +83,30 @@ public class NativeLibraryLinux implements NativeLibraryWrapper
     private static native Pointer strerror(int errnum) throws LastErrorException;
     private static native long getpid() throws LastErrorException;
 
+    /**
+     * Registered on its own: declared with the symbols above it would fail {@code Native.register} for the
+     * whole class on the other platforms served here, and an unavailable native library fails startup
+     * ({@code StartupChecks.checkNativeLibraryInitialization}). Alone it costs only writeback pacing — the
+     * unregistered method throws {@code UnsatisfiedLinkError}, which
+     * {@code NativeLibrary.trySyncFileRange} treats as "not submitted".
+     */
+    private static class SyncFileRange
+    {
+        static
+        {
+            try
+            {
+                Native.register(SyncFileRange.class, com.sun.jna.NativeLibrary.getInstance("c", Collections.emptyMap()));
+            }
+            catch (NoClassDefFoundError | UnsatisfiedLinkError | NoSuchMethodError e)
+            {
+                logger.warn("Failed to link sync_file_range against JNA. trickle_fsync will not pace writeback.", e);
+            }
+        }
+
+        private static native int sync_file_range(int fd, long offset, long nbytes, int flags) throws LastErrorException;
+    }
+
     public int callMlockall(int flags) throws UnsatisfiedLinkError, RuntimeException
     {
         return mlockall(flags);
@@ -98,6 +125,11 @@ public class NativeLibraryLinux implements NativeLibraryWrapper
     public int callPosixFadvise(int fd, long offset, int len, int flag) throws UnsatisfiedLinkError, RuntimeException
     {
         return posix_fadvise(fd, offset, len, flag);
+    }
+
+    public int callSyncFileRange(int fd, long offset, long nbytes, int flags) throws UnsatisfiedLinkError, RuntimeException
+    {
+        return SyncFileRange.sync_file_range(fd, offset, nbytes, flags);
     }
 
     public int callOpen(String path, int flags) throws UnsatisfiedLinkError, RuntimeException

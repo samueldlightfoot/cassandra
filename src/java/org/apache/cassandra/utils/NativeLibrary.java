@@ -73,6 +73,10 @@ public final class NativeLibrary
     private static final int POSIX_FADV_DONTNEED   = 4; /* fadvise.h */
     private static final int POSIX_FADV_NOREUSE    = 5; /* fadvise.h */
 
+    public static final int SYNC_FILE_RANGE_WAIT_BEFORE = 1; /* fs.h */
+    public static final int SYNC_FILE_RANGE_WRITE       = 2; /* fs.h */
+    public static final int SYNC_FILE_RANGE_WAIT_AFTER  = 4; /* fs.h */
+
     private static final NativeLibraryWrapper wrappedLibrary;
     private static boolean jnaLockable = false;
 
@@ -346,6 +350,60 @@ public final class NativeLibrary
                 logger.warn(errMsg);
                 throw new FSWriteError(e, errMsg);
             }
+        }
+    }
+
+    /**
+     * Starts writeback of a file range, and optionally waits for writeback already started, without the
+     * metadata commit an {@code fsync} performs. Durability still rests on a later {@code fsync}.
+     * <p>
+     * Pacing writeback takes two calls over two disjoint, adjacent ranges: {@code SYNC_FILE_RANGE_WRITE}
+     * submits the newest range, and {@code SYNC_FILE_RANGE_WAIT_BEFORE} over the range before it bounds
+     * how much writeback can accumulate. Both flags on a single range is inert: {@code WAIT_BEFORE}
+     * waits only on pages already tagged {@code PAGECACHE_TAG_WRITEBACK} (mm/filemap.c), and the range
+     * it was handed in the same call has not been tagged yet.
+     *
+     * @return {@code true} if the range was submitted to the kernel. {@code false} means it was not, and
+     *         nothing was synced in its place, so the caller must not advance its positions.
+     */
+    public static boolean trySyncFileRange(int fd, long offset, long nbytes, int flags)
+    {
+        if (fd < 0 || osType != LINUX)
+            return false;
+
+        try
+        {
+            int result = wrappedLibrary.callSyncFileRange(fd, offset, nbytes, flags);
+            if (result != 0)
+            {
+                NoSpamLogger.log(logger,
+                                 NoSpamLogger.Level.WARN,
+                                 10,
+                                 TimeUnit.MINUTES,
+                                 "sync_file_range({}, {}, {}, {}) returned {}.", fd, offset, nbytes, flags, result);
+                return false;
+            }
+
+            return true;
+        }
+        catch (UnsatisfiedLinkError e)
+        {
+            // JNA unavailable, or no such symbol: the caller loses writeback pacing, nothing else
+            return false;
+        }
+        catch (RuntimeException e)
+        {
+            if (!(e instanceof LastErrorException))
+                throw e;
+
+            if (REQUIRE)
+                NoSpamLogger.log(logger,
+                                 NoSpamLogger.Level.WARN,
+                                 10,
+                                 TimeUnit.MINUTES,
+                                 "sync_file_range({}, {}, {}, {}) failed, errno ({}).", fd, offset, nbytes, flags, errno(e));
+
+            return false;
         }
     }
 

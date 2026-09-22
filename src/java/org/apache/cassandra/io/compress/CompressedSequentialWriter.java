@@ -375,15 +375,8 @@ public class CompressedSequentialWriter extends SequentialWriter
 
     private void truncate(long toFileSize, long toBufferOffset)
     {
-        try
-        {
-            fchannel.truncate(toFileSize);
-            lastFlushOffset = toBufferOffset;
-        }
-        catch (IOException e)
-        {
-            throw new FSWriteError(e, getPath());
-        }
+        truncateChannel(toFileSize);
+        lastFlushOffset = toBufferOffset;
     }
 
     protected void writeDigestFile()
@@ -462,7 +455,7 @@ public class CompressedSequentialWriter extends SequentialWriter
         @Override
         protected void doPrepare()
         {
-            syncInternal();
+            syncFullInternal();
             writeDigestFile();
             sstableMetadataCollector.addCompressionRatio(compressedSize, uncompressedSize);
             metadataWriter.finalizeLength(current(), chunkCount).prepareToCommit();

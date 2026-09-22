@@ -981,14 +981,15 @@ index_summary_capacity:
 # Min unit: m
 index_summary_resize_interval: 60m
 
-# Whether to, when doing sequential writing, fsync() at intervals in
-# order to force the operating system to flush the dirty
-# buffers. Enable this to avoid sudden dirty buffer flushing from
-# impacting read latencies. Almost always a good idea on SSDs; not
-# necessarily on platters.
+# Whether to, when doing sequential writing, hand the dirty buffers to the
+# operating system at intervals, rather than let them build up until it
+# flushes them in one burst. Enable this to avoid sudden dirty buffer flushing
+# from impacting read latencies. Almost always a good idea on SSDs; not
+# necessarily on platters. Takes effect on Linux only.
 trickle_fsync: false
 # The interval is counted in uncompressed bytes, so for compressed SSTables
-# (the default) an fsync fires after fewer bytes than this reach the disk.
+# (the default) writeback starts after fewer bytes than this reach the disk.
+# Up to two intervals may be awaiting writeback at once.
 # Min unit: KiB
 trickle_fsync_interval: 10240KiB
 

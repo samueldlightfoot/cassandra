@@ -100,6 +100,12 @@ public class NativeLibraryDarwin implements NativeLibraryWrapper
         throw new UnsatisfiedLinkError();
     }
 
+    public int callSyncFileRange(int fd, long offset, long nbytes, int flags) throws UnsatisfiedLinkError, RuntimeException
+    {
+        // sync_file_range is not available on Darwin/Mac
+        throw new UnsatisfiedLinkError();
+    }
+
     public int callOpen(String path, int flags) throws UnsatisfiedLinkError, RuntimeException
     {
         return open(path, flags);

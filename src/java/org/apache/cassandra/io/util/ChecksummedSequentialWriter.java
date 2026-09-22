@@ -66,7 +66,7 @@ public class ChecksummedSequentialWriter extends SequentialWriter
         @Override
         protected void doPrepare()
         {
-            syncInternal();
+            syncFullInternal();
             digestFile.ifPresent(crcMetadata::writeFullChecksum);
             crcWriter.prepareToCommit();
         }

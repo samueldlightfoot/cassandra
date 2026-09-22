@@ -54,6 +54,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import static org.apache.cassandra.schema.CompressionParams.DEFAULT_CHUNK_LENGTH;
 import static org.apache.commons.io.FileUtils.readFileToByteArray;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class CompressedSequentialWriterTest extends SequentialWriterTest
@@ -161,7 +162,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
     }
 
     @Test
-    public void testTrickleFsyncFiresWhileWritingCompressedData() throws IOException
+    public void testTricklePacesWritebackWhileWritingCompressedData() throws IOException
     {
         int chunk = 4096;
         MetadataCollector collector = new MetadataCollector(new ClusteringComparator(UTF8Type.instance));
@@ -177,7 +178,13 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
                                                   CompressionParams.lz4(chunk), collector))
         {
             writer.write(new byte[chunk * 20]);
-            assertTrue("trickle_fsync must fire during a compressed flush", writer.dataSyncs.get() > 0);
+            assertFalse("trickle_fsync must pace writeback during a compressed flush", writer.ranges.isEmpty());
+
+            // the interval counts uncompressed input, the ranges address the compressed file: confuse the
+            // two and the ranges run off the end of it
+            long onDisk = writer.getOnDiskFilePointer();
+            assertTrue("ranges must stay inside the compressed file", writer.lastRangeEnd() <= onDisk);
+            assertTrue("input must compress far enough for that to mean something", onDisk < chunk * 20 / 2);
         }
         finally
         {
@@ -203,6 +210,7 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         {
             writer.write(new byte[chunk * 20]);
             assertEquals("no trickle fsync expected when disabled", 0, writer.dataSyncs.get());
+            assertTrue("no writeback pacing expected when disabled", writer.ranges.isEmpty());
         }
         finally
         {
@@ -226,10 +234,11 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         }
     }
 
-    /** Counts data-only syncs so a test can see whether the trickle interval sync fired. */
+    /** Records what the trickle interval did: data-only syncs, and the writeback ranges it handed over. */
     private static class CountingCSW extends CompressedSequentialWriter
     {
         final AtomicInteger dataSyncs = new AtomicInteger();
+        final List<long[]> ranges = new ArrayList<>();
 
         CountingCSW(File file, File offsetsFile, File digestFile, SequentialWriterOption option,
                     CompressionParams parameters, MetadataCollector collector)
@@ -242,6 +251,21 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         {
             dataSyncs.incrementAndGet();
             super.syncDataOnlyInternal();
+        }
+
+        @Override
+        protected boolean syncFileRange(long offset, long nbytes, int flags)
+        {
+            ranges.add(new long[]{ offset, nbytes });
+            return true;
+        }
+
+        long lastRangeEnd()
+        {
+            long end = 0;
+            for (long[] range : ranges)
+                end = Math.max(end, range[0] + range[1]);
+            return end;
         }
     }
 
