@@ -294,14 +294,16 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
             throw new FSWriteError(e, getPath());
         }
 
-        if (pos <= lastWritebackPosition)
+        long newRangeBytes = pos - lastWritebackPosition;
+        if (newRangeBytes <= 0)
             return;
 
-        if (!syncFileRange(lastWritebackPosition, pos - lastWritebackPosition, NativeLibrary.SYNC_FILE_RANGE_WRITE))
+        if (!syncFileRange(lastWritebackPosition, newRangeBytes, NativeLibrary.SYNC_FILE_RANGE_WRITE))
             return;
 
-        if (lastWritebackPosition > previousWritebackPosition
-            && !syncFileRange(previousWritebackPosition, lastWritebackPosition - previousWritebackPosition,
+        long previousRangeBytes = lastWritebackPosition - previousWritebackPosition;
+        if (previousRangeBytes > 0
+            && !syncFileRange(previousWritebackPosition, previousRangeBytes,
                               NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE))
             return;
 
@@ -328,10 +330,6 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         previousWritebackPosition = Math.min(previousWritebackPosition, lastWritebackPosition);
     }
 
-    /**
-     * The one call {@link #trySyncFileRangeInternal} makes, so tests can observe the ranges it builds on
-     * platforms that do not have the syscall.
-     */
     protected boolean syncFileRange(long offset, long nbytes, int flags)
     {
         return NativeLibrary.trySyncFileRange(writebackFd, offset, nbytes, flags);
