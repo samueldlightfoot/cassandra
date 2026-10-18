@@ -116,6 +116,7 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_FOREGROUND;
 import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_PID_FILE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.COM_SUN_MANAGEMENT_JMXREMOTE_PORT;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DTEST_AVOID_SYSTEM_EXIT;
 import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_CLASS_PATH;
 import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_RMI_SERVER_RANDOM_ID;
 import static org.apache.cassandra.config.CassandraRelevantProperties.JAVA_VERSION;
@@ -641,13 +642,15 @@ public class CassandraDaemon
     {
         VirtualKeyspaceRegistry.instance.register(VirtualSchemaKeyspace.instance);
         VirtualKeyspaceRegistry.instance.register(SystemViewsKeyspace.instance);
-        VirtualKeyspaceRegistry.instance.register(new VirtualKeyspace(VIRTUAL_METRICS, createMetricsKeyspaceTables()));
 
         if (DatabaseDescriptor.getAccord().enable_virtual_debug_only_keyspace)
         {
             VirtualKeyspaceRegistry.instance.register(AccordDebugKeyspace.instance);
             VirtualKeyspaceRegistry.instance.register(AccordDebugRemoteKeyspace.instance);
         }
+
+        if (CassandraRelevantProperties.VIRTUAL_KEYSPACE_SYSTEM_METRICS_ENABLED.getBoolean())
+            VirtualKeyspaceRegistry.instance.register(new VirtualKeyspace(VIRTUAL_METRICS, createMetricsKeyspaceTables()));
 
         // Flush log messages to system_views.system_logs virtual table as there were messages already logged
         // before that virtual table was instantiated.
@@ -1010,7 +1013,7 @@ public class CassandraDaemon
 
     private void exitOrFail(int code, String message, Throwable cause)
     {
-        if (runManaged)
+        if (runManaged || DTEST_AVOID_SYSTEM_EXIT.getBoolean())
         {
             RuntimeException t = cause!=null ? new RuntimeException(message, cause) : new RuntimeException(message);
             throw t;

@@ -467,6 +467,11 @@ public interface GuardrailsConfig
     int getMinimumReplicationFactorFailThreshold();
 
     /**
+     * @return The threshold to fail when the CMS size (aggregate replication factor across DCs) is below the threshold.
+     */
+    int getMinimumCmsSizeFailThreshold();
+
+    /**
      * @return The threshold to warn when replication factor is greater than threshold.
      */
     int getMaximumReplicationFactorWarnThreshold();
@@ -726,4 +731,22 @@ public interface GuardrailsConfig
      * driver version is below the specified minimum.
      */
     Map<String, String> getMinimumClientDriverVersionsDisallowed();
+
+    /**
+     * @return the warning threshold for the Zstd compressor level
+     */
+    int getZstdCompressionLevelWarnThreshold();
+
+    /**
+     * @return the failure threshold for the Zstd compressor level
+     */
+    int getZstdCompressionLevelFailThreshold();
+
+    /**
+     * Sets warning and failure thresholds for the Zstd compressor levels.
+     *
+     * @param warn value to set for warn threshold
+     * @param fail value to set for fail threshold
+     */
+    void setZstdCompressionLevelThreshold(int warn, int fail);
 }

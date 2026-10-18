@@ -545,7 +545,7 @@ public class Config
     public volatile boolean use_creation_time_for_hint_ttl = true;
 
     public volatile boolean incremental_backups = false;
-    public boolean trickle_fsync = false;
+    public boolean trickle_fsync = true;
     @Replaces(oldName = "trickle_fsync_interval_in_kb", converter = Converters.KIBIBYTES_DATASTORAGE, deprecated = true)
     public DataStorageSpec.IntKibibytesBound trickle_fsync_interval = new DataStorageSpec.IntKibibytesBound("10240KiB");
 
@@ -1053,6 +1053,7 @@ public class Config
     public volatile int minimum_replication_factor_fail_threshold = -1;
     public volatile int maximum_replication_factor_warn_threshold = -1;
     public volatile int maximum_replication_factor_fail_threshold = -1;
+    public volatile int minimum_cms_size_fail_threshold = -1;
     public volatile boolean zero_ttl_on_twcs_warned = true;
     public volatile boolean zero_ttl_on_twcs_enabled = true;
     public volatile boolean non_partition_restricted_index_query_enabled = true;
@@ -1074,6 +1075,9 @@ public class Config
     public volatile DataStorageSpec.LongBytesBound sai_frozen_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
     public volatile DataStorageSpec.LongBytesBound sai_vector_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("16KiB");
     public volatile DataStorageSpec.LongBytesBound sai_vector_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("32KiB");
+
+    public volatile int zstd_compression_level_warn_threshold = -1;
+    public volatile int zstd_compression_level_fail_threshold = -1;
 
     public volatile DurationSpec.LongNanosecondsBound streaming_state_expires = new DurationSpec.LongNanosecondsBound("3d");
     public volatile DataStorageSpec.LongBytesBound streaming_state_size = new DataStorageSpec.LongBytesBound("40MiB");

@@ -127,6 +127,7 @@ import org.apache.cassandra.metrics.CASClientRequestMetrics;
 import org.apache.cassandra.metrics.ClientRequestSizeMetrics;
 import org.apache.cassandra.metrics.DenylistMetrics;
 import org.apache.cassandra.metrics.ReadRepairMetrics;
+import org.apache.cassandra.metrics.ReadResponseMetrics;
 import org.apache.cassandra.metrics.StorageMetrics;
 import org.apache.cassandra.net.ArtificialLatency;
 import org.apache.cassandra.net.ForwardingInfo;
@@ -311,6 +312,7 @@ public class StorageProxy implements StorageProxyMBean
 
 
         ReadRepairMetrics.init();
+        ReadResponseMetrics.init();
 
         if (!Paxos.isLinearizable())
         {
@@ -2083,9 +2085,9 @@ public class StorageProxy implements StorageProxyMBean
     public static AbstractWriteResponseHandler<IMutation> mutateCounter(CounterMutation cm, String localDataCenter, Dispatcher.RequestTime requestTime) throws UnavailableException, OverloadedException
     {
         ClusterMetadata metadata = ClusterMetadata.current();
-        Replica replica = ReplicaPlans.findCounterLeaderReplica(metadata, cm.getKeyspaceName(), cm.key(), localDataCenter, cm.consistency());
+        Pair<Replica, EndpointsForToken> replicas = ReplicaPlans.findCounterLeaderReplica(metadata, cm.getKeyspaceName(), cm.key(), localDataCenter, cm.consistency());
 
-        if (replica.isSelf())
+        if (replicas.left.isSelf())
         {
             return applyCounterMutationOnCoordinator(cm, localDataCenter, requestTime);
         }
@@ -2110,9 +2112,9 @@ public class StorageProxy implements StorageProxyMBean
             AbstractWriteResponseHandler<IMutation> responseHandler = new WriteResponseHandler<>(forWrite,
                                                                                                  WriteType.COUNTER, null, requestTime);
 
-            Tracing.trace("Enqueuing counter update to {}", replica);
+            Tracing.trace("Enqueuing counter update to {}", replicas.left);
             Message message = Message.outWithFlag(Verb.COUNTER_MUTATION_REQ, cm, MessageFlag.CALL_BACK_ON_FAILURE);
-            MessagingService.instance().sendWriteWithCallback(message, replica, responseHandler);
+            MessagingService.instance().sendWriteWithCallback(message, replicas.left, responseHandler);
             return responseHandler;
         }
     }
@@ -2276,7 +2278,7 @@ public class StorageProxy implements StorageProxyMBean
         consistencyLevel = tableParams.transactionalMode.readCLForMode(tableParams.transactionalMigrationFrom, consistencyLevel, cm, tableMetadata.id, command.dataRange().keyRange());
         TableMetadatas tables = TableMetadatas.of(tableMetadata);
         TxnRead read = TxnRead.createRangeRead(tables, command, range, consistencyLevel);
-        Txn.Kind kind = shouldReadEphemerally(read.keys(), tableParams, Read);
+        Txn.Kind kind = shouldReadEphemerally(read.keys(), tableParams, Read, read);
         TableMetadatasAndKeys tablesAndKeys = new TableMetadatasAndKeys(tables, read.keys());
         Txn txn = new Txn.InMemory(kind, read.keys(), read, TxnQuery.RANGE_QUERY, null, tablesAndKeys);
         IAccordService accordService = AccordService.instance();
@@ -2296,7 +2298,7 @@ public class StorageProxy implements StorageProxyMBean
         TableMetadatasAndKeys.KeyCollector keyCollector = new TableMetadatasAndKeys.KeyCollector(tables);
         consistencyLevel = consistencyLevelForAccordRead(cm, tableMetadata.id, group, consistencyLevel);
         TxnRead read = TxnRead.createSerialRead(group.queries, consistencyLevel, keyCollector);
-        Txn.Kind kind = shouldReadEphemerally(read.keys(), tableParams, Read);
+        Txn.Kind kind = shouldReadEphemerally(read.keys(), tableParams, Read, read);
         Txn txn = new Txn.InMemory(kind, read.keys(), read, TxnQuery.ALL, null, keyCollector.buildTablesAndKeys());
         return AccordService.instance().coordinateAsync(tableMetadata.epoch.getEpoch(), txn, consistencyLevel, requestTime);
     }
@@ -2753,7 +2755,16 @@ public class StorageProxy implements StorageProxyMBean
                 try (ReadExecutionController controller = command.executionController(trackRepairedStatus);
                      UnfilteredPartitionIterator iterator = command.executeLocally(controller))
                 {
-                    response = command.createResponse(iterator, controller.getRepairedDataInfo());
+                    if (command.isLimitedToOnePartition() && !command.isDigestQuery())
+                    {
+                        ConsistencyLevel cl = handler.consistencyLevel();
+                        boolean localReplicaOnly = cl == ConsistencyLevel.ONE || cl == ConsistencyLevel.LOCAL_ONE;
+                        response = command.createLocalObjectResponse(iterator, controller.getRepairedDataInfo(), localReplicaOnly);
+                    }
+                    else
+                    {
+                        response = command.createResponse(iterator, controller.getRepairedDataInfo());
+                    }
                 }
                 catch (RejectException e)
                 {

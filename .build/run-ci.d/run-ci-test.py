@@ -26,24 +26,44 @@
 
 
 import argparse
+import contextlib
+import io
+import jenkins
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
+from urllib.error import HTTPError
+import yaml
 
 
 # Import the functions from the script
 from run_ci import (
     DEPLOY_YAML,
+    check_agent_capacity,
     debug,
     install_jenkins,
     get_jenkins,
     trigger_jenkins_build,
     spin_while,
+    retry_call,
+    wait_for_build_number,
+    wait_for_build_complete,
     delete_remote_junit_files,
     cleanup_and_maybe_teardown,
     helm_installation_lock,
 )
+
+
+def quietly(action):
+    """
+    Calls action() with the spinner's output discarded and its sleep skipped.
+    spin_while writes ten cursor-control frames per poll, which floods the test output.
+    """
+    with patch('run_ci.time.sleep'), contextlib.redirect_stdout(io.StringIO()):
+        return action()
+
 
 class TestCIPipeline(unittest.TestCase):
 
@@ -153,13 +173,99 @@ class TestCIPipeline(unittest.TestCase):
         mock_server = MagicMock()
         mock_build_job.return_value = mock_server.build_job.return_value = 123
         mock_wait_for_build_number.return_value = 456
+        # a MagicMock job_info shows no parameterDefinitions, so this takes the
+        # non-parameter build path, which sleeps for six seconds
         with patch('run_ci.spin_while', side_effect=lambda msg, condition: 0):
-            queue_item = trigger_jenkins_build(mock_server, "test-job", param1="value1")
+            queue_item = quietly(lambda: trigger_jenkins_build(mock_server, "test-job", param1="value1"))
         self.assertEqual(queue_item, 123)
 
     def test_spin_while(self):
-        result = spin_while("Testing", lambda: True)
+        result = quietly(lambda: spin_while("Testing", lambda: True))
         self.assertEqual(result, 0)
+
+    def test_wait_for_build_complete_ignores_mid_build_result(self):
+        """A pipeline latches UNSTABLE while later stages still run. That is not completion."""
+        mock_server = MagicMock()
+        mock_server.get_build_info.side_effect = [
+            {'building': True, 'result': None},
+            {'building': True, 'result': 'UNSTABLE'},
+            {'building': True, 'result': 'UNSTABLE'},
+            {'building': False, 'result': 'UNSTABLE'},
+        ]
+        quietly(lambda: wait_for_build_complete(mock_server, "test-job", 456))
+        self.assertEqual(mock_server.get_build_info.call_count, 4)
+
+    def test_wait_for_build_complete_missing_building_field(self):
+        """An absent `building` field must never read as finished."""
+        mock_server = MagicMock()
+        mock_server.get_build_info.side_effect = [
+            {'result': 'SUCCESS'},
+            {'building': False, 'result': 'SUCCESS'},
+        ]
+        quietly(lambda: wait_for_build_complete(mock_server, "test-job", 456))
+        self.assertEqual(mock_server.get_build_info.call_count, 2)
+
+    def test_wait_for_build_complete_survives_api_error(self):
+        mock_server = MagicMock()
+        mock_server.get_build_info.side_effect = [
+            jenkins.JenkinsException("connection reset"),
+            jenkins.JenkinsException("connection reset"),
+            {'building': False, 'result': 'SUCCESS'},
+        ]
+        quietly(lambda: wait_for_build_complete(mock_server, "test-job", 456))
+        self.assertEqual(mock_server.get_build_info.call_count, 3)
+
+    def test_wait_for_build_number_pending_executable(self):
+        """A queued item can carry "executable": null before Jenkins starts it."""
+        mock_server = MagicMock()
+        mock_server.get_queue_item.side_effect = [
+            {'executable': None},
+            {'executable': {'number': 456}},
+        ]
+        self.assertEqual(quietly(lambda: wait_for_build_number(mock_server, 123)), 456)
+
+    def test_retry_call_returns_result(self):
+        self.assertEqual(retry_call(lambda: "downloaded", "download it", IOError, 3, 0), "downloaded")
+
+    def test_retry_call_raises_after_retries(self):
+        attempts = []
+
+        def always_fails():
+            attempts.append(1)
+            raise IOError("connection reset by peer")
+
+        with self.assertRaises(IOError):
+            retry_call(always_fails, "download it", IOError, 3, 0)
+        self.assertEqual(len(attempts), 3)
+
+    def test_retry_call_does_not_retry_a_404(self):
+        """An artifact a build never archived stays absent, so one attempt is enough."""
+        attempts = []
+
+        def not_found():
+            attempts.append(1)
+            raise HTTPError("http://ci/artifact", 404, "Not Found", {}, None)
+
+        with self.assertRaises(HTTPError):
+            retry_call(not_found, "download it", IOError, 5, 0)
+        self.assertEqual(len(attempts), 1)
+
+    def test_retry_call_retries_a_503(self):
+        """A gateway error is transient, unlike a 404."""
+        attempts = []
+
+        def unavailable():
+            attempts.append(1)
+            raise HTTPError("http://ci/artifact", 503, "Service Unavailable", {}, None)
+
+        with self.assertRaises(HTTPError):
+            retry_call(unavailable, "download it", IOError, 3, 0)
+        self.assertEqual(len(attempts), 3)
+
+    def test_retry_call_always_attempts_once(self):
+        """max_retries=0 must not raise None."""
+        with self.assertRaises(IOError):
+            retry_call(lambda: (_ for _ in ()).throw(IOError("nope")), "download it", IOError, 0, 0)
 
     @patch('run_ci.stream.stream')
     def test_delete_remote_junit_files(self, mock_stream):
@@ -177,6 +283,90 @@ class TestCIPipeline(unittest.TestCase):
     def test_helm_installation_lock(self, mock_flock):
         with helm_installation_lock(Path("/tmp/.fake.lock")):
             mock_flock.assert_called()
+
+    LARGE_NODE = ('{"items":[{"metadata":{"labels":{"eks.amazonaws.com/nodegroup":"amd64-large-ondemand-2",'
+                  '"cassandra.jenkins.agent":"true","cassandra.jenkins.agent.large":"true"}}}]}')
+
+    @staticmethod
+    def ca_status(nested: bool = True) -> str:
+        """
+        The autoscaler's status configmap, holding the live cluster's node groups and maximums.
+
+        maxSize is the only in-cluster record of what a pool can hold, and a pool at zero nodes has no
+        nodes to count, so the check reads it from here.
+        """
+        # Two groups per size, each pair summing to that size's instanceCap in jenkins-deployment.yaml.  Raise
+        # these whenever a cap is raised, or the committed values stop passing their own check.
+        groups = [(f"eks-amd64-{size}-ondemand-{n}-{n}cfd1c1", 0, maximum)
+                  for size, maximum in (("large", 153), ("medium", 75), ("small", 10), ("report", 2))
+                  for n in (2, 3)]
+
+        groups.append(("eks-jenkins-controller-0-2acd8787", 1, 1))
+        return yaml.safe_dump({"nodeGroups": [
+            {"name": name, **({"health": {"minSize": minimum, "maxSize": maximum}} if nested
+                              else {"minSize": minimum, "maxSize": maximum})}
+            for name, minimum, maximum in groups]})
+
+    def capacity_check(self, values: dict, nodes: str = '{"items":[]}', autoscaler: bool = True,
+                       nested: bool = True):
+        """
+        Runs check_agent_capacity against the autoscaler ceilings above, returning the exit code or 0.
+
+        `autoscaler=False` stands in for a cluster whose ceilings cannot be read at all, a managed
+        autoscaler that publishes no status configmap for instance, where kubectl exits non-zero.
+        """
+        def kubectl(_kubeconfig, _kubecontext, _ns, command):
+            if "nodes" in command:
+                return nodes
+            if not autoscaler:
+                raise subprocess.CalledProcessError(1, "kubectl", stderr="configmaps not found")
+            return self.ca_status(nested)
+        with patch('run_ci.run_kubectl_command', kubectl):
+            try:
+                check_agent_capacity(None, None, "default", values)
+                return 0
+            except SystemExit as e:
+                return e.code
+
+    def deployed_values(self, size: str = None, **overrides) -> dict:
+        """The committed values, optionally with one podTemplate's keys replaced."""
+        with open(DEPLOY_YAML, encoding="utf-8") as deploy_yaml:
+            values = yaml.safe_load(deploy_yaml)
+        if size:
+            template = yaml.safe_load(values["agent"]["podTemplates"][f"agent-dind-{size}"])
+            template[0].update(overrides)
+            values["agent"]["podTemplates"][f"agent-dind-{size}"] = yaml.safe_dump(template)
+        return values
+
+    def test_check_agent_capacity_allows_the_committed_values(self):
+        self.assertEqual(0, self.capacity_check(self.deployed_values()))
+        self.assertEqual(0, self.capacity_check(self.deployed_values(), nodes=self.LARGE_NODE))
+
+    def test_check_agent_capacity_blocks_a_cap_above_the_pool(self):
+        # 400 against the 306 nodes two large groups can hold: 94 agents could never be scheduled, which is
+        # not idle but a churn loop, and is what preceded the 2026-08-11 controller stall
+        over = self.deployed_values("large", instanceCap=400, instanceCapStr="400")
+        self.assertEqual(1, self.capacity_check(over))
+        # a cluster whose ceilings cannot be read leaves it unchecked rather than blocking a valid deploy
+        self.assertEqual(0, self.capacity_check(over, autoscaler=False))
+
+    def test_check_agent_capacity_reads_maxsize_wherever_it_is_published(self):
+        # the live cluster nests a group's maximum under its health condition, and the check also takes it
+        # from the group.  Reading the wrong key costs nothing visible: the ceilings come out empty and
+        # every cap passes unchecked, so the shapes are pinned here rather than in a deploy
+        over = self.deployed_values("large", instanceCap=400, instanceCapStr="400")
+        for nested in (True, False):
+            self.assertEqual(1, self.capacity_check(over, nested=nested))
+            self.assertEqual(0, self.capacity_check(self.deployed_values(), nested=nested))
+
+    def test_check_agent_capacity_blocks_contradictory_config(self):
+        # the plugin takes the cap from either key, so a disagreement resolves to whichever applies last
+        self.assertEqual(1, self.capacity_check(self.deployed_values("large", instanceCapStr="400")))
+        # a nodeSelector the live nodes contradict strands every agent of that size
+        typo = self.deployed_values("large", nodeSelector="cassandra.jenkins.agent.large=ture")
+        self.assertEqual(1, self.capacity_check(typo, nodes=self.LARGE_NODE))
+        # unconfirmable is not the same as contradicted: with that pool at zero there is nothing to check against
+        self.assertEqual(0, self.capacity_check(typo))
 
 if __name__ == '__main__':
     unittest.main()

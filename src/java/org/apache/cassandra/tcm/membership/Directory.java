@@ -61,13 +61,13 @@ import static org.apache.cassandra.db.TypeSizes.sizeof;
 import static org.apache.cassandra.tcm.membership.NodeVersion.CURRENT;
 import static org.apache.cassandra.tcm.membership.NodeVersion.CURRENT_METADATA_VERSION;
 
-public class Directory implements MetadataValue<Directory>, EndpointLookup
+public class Directory implements MetadataValue<Directory>, EndpointLookup, NodeIdLookup
 {
     public static final Serializer serializer = new Serializer();
 
     public static Directory EMPTY = new Directory();
 
-    private final int nextId;
+    public final int nextId;
     private final Epoch lastModified;
     private final BTreeBiMap<NodeId, InetAddressAndPort> peers;
     private final BTreeSet<RemovedNode> removedNodes;
@@ -399,6 +399,7 @@ public class Directory implements MetadataValue<Directory>, EndpointLookup
                              racksByDC.withForce(location.datacenter, rackEP));
     }
 
+    @Override
     public NodeId peerId(InetAddressAndPort endpoint)
     {
         return peers.inverse().get(endpoint);
@@ -409,6 +410,7 @@ public class Directory implements MetadataValue<Directory>, EndpointLookup
         return peers.inverse().containsKey(endpoint);
     }
 
+    @Override
     public InetAddressAndPort endpoint(NodeId id)
     {
         return peers.get(id);

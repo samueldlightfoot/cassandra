@@ -46,9 +46,9 @@ memtable_allocation_type: offheap_objects
 
 commitlog_disk_access_mode: auto
 
-background_write_disk_access_mode: direct
+cursor_compaction_enabled: true
 
-trickle_fsync: true
+background_write_disk_access_mode: direct
 
 sstable:
   selected_format: bti

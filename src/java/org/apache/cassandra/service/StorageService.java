@@ -819,7 +819,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             BootstrapAndReplace.checkUnsafeReplace(shouldBootstrap());
         }
 
-        if (isReplacingSameAddress())
+        if (isReplacing() && isReplacingSameAddress())
         {
             BootstrapAndReplace.gossipStateToHibernate(ClusterMetadata.current(), ClusterMetadata.currentNullable().myNodeId());
             Gossiper.instance.start(SystemKeyspace.incrementAndGetGeneration(), false);
@@ -3864,9 +3864,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         assert !isShutdown;
         isShutdown = true;
 
-        Throwable preShutdownHookThrowable = Throwables.perform(null, preShutdownHooks.stream().map(h -> h::run));
-        if (preShutdownHookThrowable != null)
-            logger.error("Attempting to continue draining after pre-shutdown hooks returned exception", preShutdownHookThrowable);
+        runPreShutdownHooks();
 
         try
         {
@@ -3953,6 +3951,10 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             // we don't want to start any new compactions while we are draining
             disableAutoCompaction();
 
+            // AutoRepair has to stop before flushes and CommitLog.shutdownBlocking(),
+            // else in-flight repairs may block attempting to write to system tables
+            AutoRepair.instance.shutdownBlocking();
+
             // count CFs first, since forceFlush could block for the flushWriter to get a queue slot empty
             totalCFs = 0;
             for (Keyspace keyspace : Keyspace.nonLocalStrategy())
@@ -4010,8 +4012,6 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             CommitLog.instance.forceRecycleAllSegments();
 
             CommitLog.instance.shutdownBlocking();
-
-            AutoRepair.instance.shutdownBlocking();
 
             // wait for miscellaneous tasks like sstable and commitlog segment deletion
             ColumnFamilyStore.shutdownPostFlushExecutor();
@@ -4082,6 +4082,13 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             return preShutdownHooks.add(hook);
 
         return false;
+    }
+
+    public void runPreShutdownHooks()
+    {
+        Throwable preShutdownHookThrowable = Throwables.perform(null, preShutdownHooks.stream().map(h -> h::run));
+        if (preShutdownHookThrowable != null)
+            logger.error("Attempting to continue draining after pre-shutdown hooks returned exception", preShutdownHookThrowable);
     }
 
     /**
@@ -5872,6 +5879,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                     table.getCompactionStrategyManager().mutateRepaired(sstables, repairedAt, null, false);
                 return sstables;
             }, predicate, OperationType.ANTICOMPACTION, true, false, true);
+            if (result == null)
+                throw new RuntimeException("Unable to cancel in-progress compactions for " + keyspace + '.' + tableName + ". Usually retrying will work.");
             sstablesTouched.addAll(result.stream().map(sst -> sst.descriptor.baseFile().name()).collect(Collectors.toList()));
         }
         return sstablesTouched;

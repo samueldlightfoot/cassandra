@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
@@ -130,6 +131,38 @@ public class DecommissionTest extends TestBaseImpl
 
             unpauseCommits(cmsNode);
             resumeThread.join(TimeUnit.MINUTES.toMillis(2));
+        }
+    }
+
+    @Test
+    public void testOperationModeOnFreshDecomAfterRejectedAttempt() throws Exception
+    {
+        try (Cluster cluster = builder().withNodes(3)
+                                        .withConfig(config -> config.with(NETWORK, GOSSIP))
+                                        .start())
+        {
+            populate(cluster, 0, 100, 1, 2, ConsistencyLevel.QUORUM);
+
+            IInvokableInstance cmsNode = cluster.get(1);
+            IInvokableInstance leavingNode = cluster.get(2);
+
+            leavingNode.nodetoolResult("decommission").asserts().failure();
+            leavingNode.runOnInstance(() -> assertEquals(StorageService.Mode.DECOMMISSION_FAILED,
+                                                         StorageService.instance.operationMode()));
+
+            Callable<Epoch> midLeavePaused = pauseBeforeCommit(cmsNode, e -> e instanceof PrepareLeave.MidLeave);
+
+            Thread decomThread = new Thread(() -> leavingNode.nodetoolResult("decommission", "--force").asserts().success());
+            decomThread.start();
+            midLeavePaused.call();
+
+            leavingNode.runOnInstance(() ->
+                assertEquals("operationMode during re-decommission after rejected attempt should be LEAVING, not DECOMMISSION_FAILED",
+                             StorageService.Mode.LEAVING,
+                             StorageService.instance.operationMode()));
+
+            unpauseCommits(cmsNode);
+            decomThread.join(TimeUnit.MINUTES.toMillis(2));
         }
     }
 
@@ -403,6 +436,21 @@ public class DecommissionTest extends TestBaseImpl
                     }
                 });
             }
+        }
+    }
+
+    @Test
+    public void testDontReplicateToLeftNodes() throws IOException, TimeoutException
+    {
+        try (Cluster cluster = init(builder().withNodes(3)
+                                        .withConfig(config -> config.with(NETWORK, GOSSIP))
+                                        .start()))
+        {
+            cluster.get(2).nodetoolResult("decommission", "--force").asserts().success();
+            long mark = cluster.get(1).logs().mark();
+            cluster.coordinator(1).execute(withKeyspace("create table %s.tbl (id int primary key)"), ConsistencyLevel.ONE);
+            cluster.get(3).logs().watchFor("Enacted.*CreateTableStatement.*tbl");
+            assertTrue(cluster.get(1).logs().grep(mark, "Replicating newly committed transformations up to.*127.0.0.2.*").getResult().isEmpty());
         }
     }
 

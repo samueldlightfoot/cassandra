@@ -25,10 +25,10 @@ Python dependencies are found in .build/run-ci.d/requirements.txt
 Custom environment variables can be set in .build/.run-ci.env
 
 lint with:
- `pylint --disable=C0301,W0511,C0103,W0702,C0415,C0116,C0115,R0914,W0603,R0915,R0913,R0917,R0911,W0212,W0621 run-ci`
+ `pylint --disable=C0301,C0302,W0511,C0103,W0702,C0415,C0116,C0115,R0914,W0603,R0915,R0913,R0917,R0911,W0212,W0621 run-ci`
 
 test with:
- `python .build/run-ci.d/run-ci-test.py`
+ `python run-ci.d/run-ci-test.py`
 """
 
 import argparse
@@ -36,7 +36,9 @@ import fcntl
 import getpass
 import gzip
 import itertools
+import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -47,6 +49,7 @@ import time
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlretrieve
 from typing import Optional, Tuple
 
@@ -96,31 +99,39 @@ def get_current_branch() -> str:
     return subprocess.run(["git", "-C", str(CASSANDRA_DIR), "branch", "--show-current"],
                           capture_output=True, text=True, check=True).stdout.strip()
 
+def require_tracking_remote(branch: str):
+    """ Exits when the branch tracks no remote, since nothing can then be inferred about what to build. """
+    if 0 == subprocess.run(["git", "-C", str(CASSANDRA_DIR), "rev-parse", "--abbrev-ref", f"{branch}@{{u}}"],
+                           capture_output=True, text=True, check=False).returncode:
+        return
+    print(f"Branch {branch} tracks no remote, so the fork and branch to build cannot be detected.")
+    print("\nEither set the tracking up, which git will do on the first push of every new branch:")
+    print("    git config --global push.autoSetupRemote true")
+    print(f"  or for this branch alone: `git push --set-upstream <remote> {branch}`")
+    print("\nOr name what to build explicitly, with -r/--repository and -b/--branch.")
+    sys.exit(1)
+
 def is_local_git_dirty(args) -> bool:
     """Returns True if there are uncommitted/unpushed changes in the local git repository."""
     # use base_job_name to verify the remote branch exists
     base_job_name(args)
     # check if the working directory is clean
     clean = subprocess.run(["git", "-C", str(CASSANDRA_DIR), "diff-index", "--quiet", "HEAD", "--"], check=False).returncode
-    # check if there are unpushed committed changes
-    unpushed_commits = bool(subprocess.run(["git", "-C", str(CASSANDRA_DIR), "log", "@{u}..HEAD", "--name-only"],
-                                           capture_output=True, text=True, check=False).stdout.strip())
-    return 0 != clean or unpushed_commits
+    # `@{u}` resolves to nothing without tracking, which would read as nothing unpushed.  Callers reach here
+    # only past require_tracking_remote, but report dirty on failure rather than depend on that invariant
+    unpushed = subprocess.run(["git", "-C", str(CASSANDRA_DIR), "log", "@{u}..HEAD", "--name-only"],
+                              capture_output=True, text=True, check=False)
+    return 0 != clean or 0 != unpushed.returncode or bool(unpushed.stdout.strip())
 
-def get_tracking_remote_url() -> str:
-    """
-    Returns the tracking remote URL of the current branch, falling back to the 'origin' remote URL.
-    """
-    try:
-        # Get the tracking remote URL of the current branch
-        remote_name = subprocess.run(["git", "-C", str(CASSANDRA_DIR), "config", "--get", f"branch.{DEFAULT_REPO_BRANCH}.remote"],
-                                     capture_output=True, text=True, check=True).stdout.strip()
+def get_tracking_remote_url() -> Optional[str]:
+    """ Returns the tracking remote URL of the current branch, or None when the branch tracks nothing. """
+    remote = subprocess.run(["git", "-C", str(CASSANDRA_DIR), "config", "--get", f"branch.{DEFAULT_REPO_BRANCH}.remote"],
+                            capture_output=True, text=True, check=False)
 
-    except subprocess.CalledProcessError:
-        # Fallback to the 'origin' remote URL
-        remote_name = "origin"
+    if 0 != remote.returncode:
+        return None
 
-    repo_url = subprocess.run(["git", "-C", str(CASSANDRA_DIR), "remote", "get-url", remote_name],
+    repo_url = subprocess.run(["git", "-C", str(CASSANDRA_DIR), "remote", "get-url", remote.stdout.strip()],
                                capture_output=True, text=True, check=True).stdout.strip()
     if repo_url.startswith("git@github.com:"):
         repo_url = repo_url.replace("git@github.com:", "https://github.com/")
@@ -139,6 +150,13 @@ DEFAULT_DTEST_REPO_BRANCH = "trunk"
 DEFAULT_PROFILE = "skinny"
 DEFAULT_POD_NAME = "cassius-jenkins-0"
 DEFAULT_CONTAINER_NAME = "jenkins"
+# Jenkins API failures that are usually transient, and are retried while polling.
+# jenkins.NotFoundException extends jenkins.JenkinsException, so it needs no entry
+JENKINS_API_ERRORS = (jenkins.JenkinsException, requests.exceptions.ConnectionError)
+# number of consecutive failed polls before the script warns the user
+POLL_FAILURES_BEFORE_WARNING = 10
+# errors urlretrieve raises, including HTTPError (a subclass of OSError) on a missing artifact
+DOWNLOAD_URL_ERRORS = (requests.exceptions.RequestException, IOError)
 LOCAL_RESULTS_BASEDIR = CASSANDRA_DIR / "build/ci/"
 # AWS/GCloud specifics for node_cleaner function, needed for node_cleaner
 AWS_REGION = os.environ.get("AWS_REGION")
@@ -208,7 +226,14 @@ def parse_arguments() -> argparse.Namespace:
     """
     args = argument_parser().parse_args()
 
-    assert args.repository.startswith("https://github.com/") and args.repository.removesuffix(".git").endswith("cassandra"),\
+    # -r defaults to the branch's tracking remote, which is absent when the branch tracks nothing.  Only the
+    # flows that build, or that name artefacts after a build, need it: installing and tearing down do not,
+    # so an untracked branch can still deploy the cluster.
+    if not args.repository and not (args.only_setup or args.only_tear_down or args.only_node_cleaner):
+        require_tracking_remote(args.branch)
+
+    assert not args.repository or (args.repository.startswith("https://github.com/")
+                                   and args.repository.removesuffix(".git").endswith("cassandra")),\
         f"Only github apache/cassandra (forked) repository supported, got: {args.repository}"
     assert args.dtest_repository.startswith("https://github.com/") and args.dtest_repository.removesuffix(".git").endswith("cassandra-dtest"),\
         f"Only github apache/cassandra-dtest (forked) repository supported, got: {args.dtest_repository}"
@@ -269,6 +294,183 @@ def run_helm_command(kubeconfig: Optional[str], kubecontext: Optional[str], kube
     cmd += ["--namespace", kube_ns]
     cmd += command
     return subprocess.run(cmd, capture_output=capture_output, text=True, check=check)
+
+def check_agent_capacity(kubeconfig: Optional[str], kubecontext: Optional[str], kube_ns: str, values: dict):
+    """
+    Refuses to deploy podTemplates that ask for more agents than the cluster can ever schedule.
+
+    An instanceCap above the nodes its pool can hold does not merely idle: the podAntiAffinity in each
+    template puts one agent on a node, so the surplus pods can never be scheduled, they drive the
+    autoscaler to maxSize, expire after waitForPodSec and are requested again in a loop.  That churn is
+    what preceded the 2026-08-11 controller stall, both large node groups pinned at their maximum while
+    fifteen agents did the work.
+    Only what is established is enforced: a ceiling that could not be read is left unchecked, since
+    blocking a valid deploy on a check that cannot see the answer is worse than no check.
+    """
+
+    def agent_templates(values: dict) -> list:
+        """
+        The agent podTemplates as [{name, size, selector, instance_cap, instance_cap_str}].
+
+        The templates are opaque strings to the helm chart, parsed only by the kubernetes plugin, so they
+        are loaded here as the yaml they are.  `size` is the suffix of the `cassandra.jenkins.agent.<size>`
+        nodeSelector, which is what ties a template to a node pool.
+        """
+        templates = []
+        for name, raw in (values.get("agent", {}).get("podTemplates") or {}).items():
+            try:
+                template = yaml.safe_load(raw)[0]
+            except (yaml.YAMLError, IndexError, TypeError):
+                debug(f"Could not parse podTemplate {name}, skipping it")
+                continue
+            selector = dict(pair.split("=", 1) for pair in str(template.get("nodeSelector", "")).split(",")
+                            if "=" in pair)
+            size = next((key.rsplit(".", 1)[1] for key in selector if key.startswith("cassandra.jenkins.agent.")), None)
+            templates.append({"name": name, "size": size, "selector": selector,
+                              "instance_cap": template.get("instanceCap"),
+                              "instance_cap_str": template.get("instanceCapStr")})
+        return templates
+
+    def node_pool_sizes(kubeconfig: Optional[str], kubecontext: Optional[str], kube_ns: str) -> Tuple[dict, dict]:
+        """
+        What the live nodes reveal, as ({node pool name: size}, {label key: set of values seen}).
+
+        Live nodes are the authoritative way to tie a node pool to an agent size, and the only way to
+        confirm a nodeSelector is spelt the way the nodes actually are.  Pools scaled to zero contribute
+        nothing, which is the normal resting state, so neither result can be treated as exhaustive.
+        """
+        pool_label = ("eks.amazonaws.com/nodegroup", "cloud.google.com/gke-nodepool")
+        pools, seen = {}, {}
+        try:
+            nodes = json.loads(run_kubectl_command(kubeconfig, kubecontext, kube_ns, ["get", "nodes", "-o", "json"]))
+        except (subprocess.CalledProcessError, json.JSONDecodeError, TypeError) as e:
+            debug(f"Could not read nodes, agent sizes will not be attributed from them: {e}")
+            return pools, seen
+        for node in nodes.get("items", []):
+            labels = node.get("metadata", {}).get("labels", {})
+            for key, value in labels.items():
+                seen.setdefault(key, set()).add(value)
+            pool = next((labels[key] for key in pool_label if key in labels), None)
+            size = next((key.rsplit(".", 1)[1] for key, value in labels.items()
+                         if key.startswith("cassandra.jenkins.agent.") and value == "true"
+                         and key != "cassandra.jenkins.agent"), None)
+            if pool and size:
+                pools[pool] = size
+        return pools, seen
+
+    def pool_ceilings(kubeconfig: Optional[str], kubecontext: Optional[str], pools: dict, sizes: set) -> Tuple[dict, list]:
+        """
+        The most agents each size can ever run, as ({size: max nodes}, [(unattributed pool, maxSize)]).
+
+        kubectl cannot see a pool's maximum directly: a pool at zero nodes has no nodes to count, so the
+        only in-cluster record is the cluster-autoscaler's status configmap.  A managed autoscaler (GKE)
+        does not publish it, in which case nothing is established and the caller must not treat that as a
+        pass.  The autoscaler names a pool for its underlying group (`eks-<nodegroup>-<uuid>`), so a live
+        node's pool label is matched into it as a substring, falling back to the size word in the name for
+        pools that are scaled to zero.  Anything still unmatched is returned for reporting, never ignored.
+        """
+
+        def nodegroup_max_size(group: dict) -> Optional[int]:
+            """
+            A group's maximum, from its health condition where the autoscaler publishes it, or from the
+            group itself.
+            """
+            if not isinstance(group, dict):
+                return None
+            for value in ((group.get("health") or {}).get("maxSize"), group.get("maxSize")):
+                if isinstance(value, str) and value.strip().isdigit():
+                    return int(value)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+            return None
+
+        try:
+            status = yaml.safe_load(run_kubectl_command(kubeconfig, kubecontext, "kube-system",
+                                                        ["get", "configmap", "cluster-autoscaler-status",
+                                                         "-o", "jsonpath={.data.status}"]))
+        except (subprocess.CalledProcessError, yaml.YAMLError) as e:
+            debug(f"Could not read the cluster-autoscaler status configmap: {e}")
+            return {}, []
+        ceilings, unattributed = {}, []
+        for group in (status or {}).get("nodeGroups", []) if isinstance(status, dict) else []:
+            maximum = nodegroup_max_size(group)
+            if maximum is None:
+                continue
+            name = group.get("name", "")
+            size = next((size for pool, size in pools.items() if pool and pool in name), None)
+            if not size:
+                words = [word for word in sizes if re.search(rf"(^|[-_]){re.escape(word)}([-_]|$)", name)]
+                size = words[0] if len(words) == 1 else None
+            if not size:
+                # the controller has its own pool, and runs no agents
+                if "jenkins-controller" not in name:
+                    unattributed.append((name, maximum))
+                continue
+            ceilings[size] = ceilings.get(size, 0) + maximum
+        return ceilings, unattributed
+
+    def check_template_capacity(template: dict, ceilings: dict, seen: dict) -> Tuple[list, list]:
+        """One podTemplate's (errors, warnings), errors being what could never be scheduled."""
+        name, size, cap = template["name"], template["size"], template["instance_cap"]
+        errors, warnings = [], []
+        # the plugin takes the cap from either key, so a disagreement resolves to whichever applies last
+        if str(template["instance_cap_str"]) != str(cap):
+            errors.append(f"{name}: instanceCap {cap} disagrees with instanceCapStr {template['instance_cap_str']}")
+        for key, value in template["selector"].items():
+            if key not in seen:
+                # the resting state is every pool at zero, so this is not worth a warning on each deploy
+                debug(f"{name}: nodeSelector {key}={value} unconfirmed, no node currently carries {key}")
+            elif value not in seen[key]:
+                errors.append(f"{name}: nodeSelector {key}={value} matches no node, though {key} is present with"
+                              f" {sorted(seen[key])}; agents would never be scheduled")
+        if size is None:
+            warnings.append(f"{name}: no cassandra.jenkins.agent.<size> nodeSelector, cap {cap} not checked")
+        elif size not in ceilings:
+            # a size unresolved while others resolved is a blind spot worth flagging.  Nothing resolving at all
+            # means the check could not run here, a fact about the cluster and not about these values
+            unchecked = f"{name}: instanceCap {cap} unchecked, no ceiling could be established for {size!r}"
+            if ceilings:
+                warnings.append(unchecked)
+            else:
+                debug(unchecked)
+        elif isinstance(cap, int) and cap > ceilings[size]:
+            errors.append(f"{name}: instanceCap {cap} exceeds the {ceilings[size]} nodes the {size} pool can hold,"
+                          f" so {cap - ceilings[size]} agents could never be scheduled")
+        else:
+            debug(f"{name}: instanceCap {cap} within the {size} pool's {ceilings[size]} nodes")
+        return errors, warnings
+
+    templates = agent_templates(values)
+    if not templates:
+        return
+    pools, seen = node_pool_sizes(kubeconfig, kubecontext, kube_ns)
+    ceilings, unattributed = pool_ceilings(kubeconfig, kubecontext, pools,
+                                           {template["size"] for template in templates if template["size"]})
+    errors, warnings = [], []
+    for template in templates:
+        template_errors, template_warnings = check_template_capacity(template, ceilings, seen)
+        errors += template_errors
+        warnings += template_warnings
+
+    container_cap = values.get("agent", {}).get("containerCap")
+    total = sum(template["instance_cap"] for template in templates if isinstance(template["instance_cap"], int))
+    if isinstance(container_cap, int) and total > container_cap:
+        # benign, and not a fault to warn about on every deploy: the cloud cap leaves builds queued rather
+        # than creating pods that cannot be scheduled, it only stops every pool reaching its cap at once
+        debug(f"instanceCaps sum to {total} against a containerCap of {container_cap}, so the cloud cap binds"
+              f" first and the pools cannot all reach their cap at once")
+    for name, maximum in unattributed:
+        warnings.append(f"node pool {name!r} (maxSize {maximum}) matched no agent size and was not counted")
+
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+    if errors:
+        print("\nRefusing to deploy agent podTemplates that could never be scheduled:\n")
+        for error in errors:
+            print(f"  {error}")
+        print("\nFix the podTemplate in .jenkins/k8s/jenkins-deployment.yaml, or raise the node pool's maximum"
+              " first (see .jenkins/k8s/README.md).")
+        sys.exit(1)
 
 def install_jenkins(kubeconfig: Optional[str], kubecontext: Optional[str], kube_ns: str,
                     values_override: Optional[str] = None):
@@ -337,7 +539,7 @@ def install_jenkins(kubeconfig: Optional[str], kubecontext: Optional[str], kube_
 
         lost = detect_lost_values(helm_values(), proposed)
         if not lost:
-            return
+            return proposed
 
         print(f"\nWARNING: {len(lost)} value(s) the deployed jenkins has are absent from what is about to be applied.")
         print("Each is either a customisation of this site, or a key removed from jenkins-deployment.yaml since"
@@ -354,8 +556,10 @@ def install_jenkins(kubeconfig: Optional[str], kubecontext: Optional[str], kube_
         if input("\nDrop these values and continue? [y/N] ").strip().lower() not in ("y", "yes"):
             print("Aborted, nothing was deployed.")
             sys.exit(1)
+        return proposed
 
-    confirm_helm_updates()
+    # the values checked are the merged result, so a site override raising an instanceCap is checked too
+    check_agent_capacity(kubeconfig, kubecontext, kube_ns, confirm_helm_updates())
 
     print("Adding Helm repository for Jenkins Operator...")
     subprocess.run(["helm", "repo", "add", "jenkins", "https://charts.jenkins.io"], check=True)
@@ -363,8 +567,12 @@ def install_jenkins(kubeconfig: Optional[str], kubecontext: Optional[str], kube_
 
     # site customisations are applied last, helm merges each -f over the previous
     values_files = ["-f", DEPLOY_YAML] + (["-f", values_override] if values_override else [])
+    # --timeout is longer than helm's 5m default, which `--wait` would otherwise spend waiting for a pod
+    # whose controller.probes.startupProbe already permits a 300s boot, then fail a deploy that was
+    # succeeding.  Keep it clear of that budget plus the readinessProbe's, see jenkins-deployment.yaml
     result = run_helm_command(kubeconfig, kubecontext, kube_ns,
-                              ["upgrade", "--install"] + values_files + ["cassius", "jenkins/jenkins", "--wait"])
+                              ["upgrade", "--install"] + values_files
+                              + ["cassius", "jenkins/jenkins", "--wait", "--timeout", "10m"])
 
     run_kubectl_command(kubeconfig, kubecontext, kube_ns,
                         ["exec", DEFAULT_POD_NAME, "--",
@@ -453,30 +661,89 @@ def trigger_jenkins_build(server: jenkins.Jenkins, job_name: str, **build_params
     return server.build_job(job_name, parameters=build_params)
 
 
+def get_build_info(server: jenkins.Jenkins, job_name: str, build_number: int) -> dict:
+    """Returns the Jenkins build info, or an empty dict if the API call failed."""
+    try:
+        return server.get_build_info(job_name, build_number)
+    except JENKINS_API_ERRORS as e:
+        debug(f"Failed get_build_info: {e}")
+        return {}
+
+
+def get_queue_item(server: jenkins.Jenkins, queue_item: int) -> dict:
+    """Returns the Jenkins queue item, or an empty dict if the API call failed."""
+    try:
+        return server.get_queue_item(queue_item)
+    except JENKINS_API_ERRORS as e:
+        debug(f"Failed get_queue_item: {e}")
+        return {}
+
+
+def warn_on_repeated_failures(state: dict, description: str):
+    """Prints a warning every POLL_FAILURES_BEFORE_WARNING consecutive Jenkins API failures."""
+    state["failures"] += 1
+    if 0 == state["failures"] % POLL_FAILURES_BEFORE_WARNING:
+        print(f"\r\033[KWarning: {state['failures']} consecutive Jenkins API failures for {description}."
+              " Still polling. Set DEBUG=1 for details.")
+
+
 def wait_for_build_number(server: jenkins.Jenkins, queue_item: int) -> int:
-    spin_while("Waiting for job build number… ", lambda: ('executable' in server.get_queue_item(queue_item)))
-    build_number = server.get_queue_item(queue_item)['executable']['number']
+    """Waits for Jenkins to start the queued item, and returns its build number."""
+    state = {"build_number": None, "failures": 0}
+
+    def is_started() -> bool:
+        item = get_queue_item(server, queue_item)
+        if not item:
+            warn_on_repeated_failures(state, f"queue item {queue_item}")
+            return False
+        state["failures"] = 0
+        # a queued item can carry "executable": null, so test the value and not the key
+        executable = item.get('executable')
+        if executable is None:
+            return False
+        state["build_number"] = executable['number']
+        return True
+
+    spin_while("Waiting for job build number… ", is_started)
+    build_number = state["build_number"]
     sys.stdout.write("\033[F\033[K")  # Move cursor up one line and clear i
     print(f"\rBuild number: {build_number}\n")
     return build_number
 
 
 def wait_for_build_complete(server: jenkins.Jenkins, job_name: str, build_number: int):
-    """Waits for Jenkins build completion by monitoring the build status."""
+    """
+    Waits for Jenkins build completion by monitoring the build status.
 
-    def get_build_info(server: jenkins.Jenkins, job_name: str, build_number: int) -> dict:
-        try:
-            return server.get_build_info(job_name, build_number)
-        except (jenkins.NotFoundException, jenkins.JenkinsException, requests.exceptions.ConnectionError) as e:
-            debug(f"Failed get_build_info: {e}")
-            return {}
+    A pipeline latches its result as soon as one stage reports a failed test, while the
+    other stages continue to run. Completion therefore needs `building` to be false, and
+    not only a non-null `result`.
+    """
+    start_time = time.time()
+    state = {"info": {}, "failures": 0, "latched": False}
 
-    elapsed_time = spin_while("Waiting for build to complete… ",
-                              lambda: get_build_info(server, job_name, build_number).get('result'))
+    def is_complete() -> bool:
+        info = get_build_info(server, job_name, build_number)
+        if not info:
+            warn_on_repeated_failures(state, f"{job_name} build {build_number}")
+            return False
+        state["failures"] = 0
+        state["info"] = info
+        result = info.get('result')
+        # default `building` to True: never read a missing field as finished
+        if info.get('building', True):
+            if result is not None and not state["latched"]:
+                state["latched"] = True
+                minutes, seconds = divmod(int(time.time() - start_time), 60)
+                print(f"\r\033[KBuild latched result {result} after {minutes:02}:{seconds:02}."
+                      " Stages are still running…")
+            return False
+        return result is not None
+
+    elapsed_time = spin_while("Waiting for build to complete… ", is_complete)
 
     minutes, seconds = divmod(elapsed_time, 60)
-    result = get_build_info(server, job_name, build_number)['result']
-    print(f"\r---\nBuild completed after {minutes:02}:{seconds:02} with status: {result}")
+    print(f"\r---\nBuild completed after {minutes:02}:{seconds:02} with status: {state['info'].get('result')}")
 
 
 def spin_while(message="", is_complete=lambda: False) -> int:
@@ -737,38 +1004,51 @@ def delete_remote_junit_files(k8s_client, pod_name: str, kube_ns: str, base_job_
     debug("Remote JUnit XML files cleaned.")
 
 
+def is_transient(error) -> bool:
+    """A 404 means the artifact was never archived, so retrying it only wastes time."""
+    return not (isinstance(error, HTTPError) and 404 == error.code)
+
+
+def retry_call(action, description: str, errors, max_retries: int = 5, delay: int = 5):
+    """
+    Calls action(), and retries it up to max_retries times on `errors`.
+    Raises the last error if every attempt failed.
+    """
+    attempts = max(1, max_retries)
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return action()
+        except errors as e:
+            last_error = e
+            if not is_transient(e):
+                break
+            if attempt < attempts - 1:
+                debug(f" Failed to {description}: {e}. Retrying ({attempt + 1}/{attempts})...")
+                time.sleep(delay)
+    debug(f"Failed to {description}: {last_error}")
+    raise last_error
+
+
 def download_results_and_print_summary(k8s_client, pod_name: str, kube_ns: str, build_number: int, ip: str, args):
 
     def download_console_log(pod_name: str, container_name: str,  kubeconfig: Optional[str], kubecontext: Optional[str], kube_ns: str, console_log_path: str, local_console_log: Path):
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                run_kubectl_command(kubeconfig, kubecontext, kube_ns,
-                                    ["cp", "-c", container_name, f"{kube_ns}/{pod_name}:{console_log_path}", str(local_console_log)])
-
-                print(f"Console log saved to {local_console_log}.gz\n")
-                break
-            except subprocess.CalledProcessError as e:
-                if attempt < max_retries:
-                    debug(f" Failed to download {pod_name}:{console_log_path}: {e}. Retrying ({attempt + 1}/{max_retries})...")
-                    time.sleep(5)  # Wait before retrying
-                else:
-                    raise
+        # this runs in a thread, so it must report its own failure. an escaping
+        # exception would print a traceback and leave the caller reading a missing file
+        try:
+            retry_call(lambda: run_kubectl_command(kubeconfig, kubecontext, kube_ns,
+                                                   ["cp", "-c", container_name, f"{kube_ns}/{pod_name}:{console_log_path}", str(local_console_log)]),
+                       f"download {pod_name}:{console_log_path}", subprocess.CalledProcessError)
+        except subprocess.CalledProcessError as e:
+            print(f"WARNING: could not download the console log {pod_name}:{console_log_path}: {e}")
+            return
+        print(f"Console log saved to {local_console_log}.gz\n")
 
     def download_archive_tarball(kubeconfig: Optional[str], kubecontext: Optional[str], kube_ns: str, pod_name: str, container_name: str, remote_path: str, local_path, max_retries=5):
-        for attempt in range(max_retries):
-            try:
-                run_kubectl_command(kubeconfig, kubecontext, kube_ns,
-                                    ["cp", "-c", container_name, f"{kube_ns}/{pod_name}:{remote_path}", str(local_path)])
-
-                debug(f"Build Artifacts saved in {local_path}")
-                break
-            except subprocess.CalledProcessError as e:
-                if attempt < max_retries:
-                    debug(f" Failed to download {pod_name}:{remote_path}: {e}. Retrying ({attempt + 1}/{max_retries})...")
-                    time.sleep(5)  # Wait before retrying
-                else:
-                    raise
+        retry_call(lambda: run_kubectl_command(kubeconfig, kubecontext, kube_ns,
+                                               ["cp", "-c", container_name, f"{kube_ns}/{pod_name}:{remote_path}", str(local_path)]),
+                   f"download {pod_name}:{remote_path}", subprocess.CalledProcessError, max_retries)
+        debug(f"Build Artifacts saved in {local_path}")
 
     def extract_and_rename(archive_path: str, local_results_dir: str, ci_summary_file: str, ci_details_file: str):
         with tarfile.open(archive_path, "r:gz") as tar:
@@ -826,17 +1106,8 @@ def download_results_and_print_summary(k8s_client, pod_name: str, kube_ns: str, 
             os.remove(local_console_log)
 
     def download_url(url, dest, max_retries=5):
-        for attempt in range(max_retries):
-            try:
-                urlretrieve(url, dest)
-                debug(f" saved {dest}")
-                break
-            except (requests.exceptions.RequestException, IOError) as e:
-                if attempt < max_retries:
-                    debug(f" Failed to download {url}: {e}. Retrying ({attempt + 1}/{max_retries})...")
-                    time.sleep(5)  # Wait before retrying
-                else:
-                    raise
+        retry_call(lambda: urlretrieve(url, dest), f"download {url}", DOWNLOAD_URL_ERRORS, max_retries)
+        debug(f" saved {dest}")
 
     local_results_dir = LOCAL_RESULTS_BASEDIR / ip.replace(".", "-") / str(build_number)
     local_results_dir.mkdir(parents=True, exist_ok=True)
@@ -844,13 +1115,21 @@ def download_results_and_print_summary(k8s_client, pod_name: str, kube_ns: str, 
     ci_summary_file = local_results_dir / f"ci_summary_{repo_owner}_{args.branch.replace('/', '-')}_{build_number}.html"
     ci_details_file = local_results_dir / f"results_details_{repo_owner}_{args.branch.replace('/', '-')}_{build_number}.tar.xz"
     if args.url:
-        download_url(f"http://{ip}/job/{base_job_name(args)}/{build_number}/artifact/ci_summary.html", ci_summary_file)
-        download_url(f"http://{ip}/job/{base_job_name(args)}/{build_number}/artifact/results_details.tar.xz", ci_details_file)
+        artifact_url = f"http://{ip}/job/{base_job_name(args)}/{build_number}/artifact"
+        for url, dest in [(f"{artifact_url}/ci_summary.html", ci_summary_file),
+                          (f"{artifact_url}/results_details.tar.xz", ci_details_file)]:
+            try:
+                download_url(url, dest)
+            except DOWNLOAD_URL_ERRORS as e:
+                print(f" Could not download {url}: {e}")
+                print(" A build that was aborted or that failed skips the Summary stage,"
+                      " and archives no artifacts.")
         if (ci_summary_file).exists():
             print(f"CI summary saved as {ci_summary_file}")
         if (ci_details_file).exists():
             print(f"Details file saved as {ci_details_file}")
-        print(" (attach ci_summary….html and results_details….tar.xz to the JIRA ticket)")
+        if (ci_summary_file).exists() or (ci_details_file).exists():
+            print(" (attach ci_summary….html and results_details….tar.xz to the JIRA ticket)")
         print("--- Build Summary ---")
         print_results_summary_ci_summary(ci_summary_file)
     else:
@@ -885,8 +1164,10 @@ def download_results_and_print_summary(k8s_client, pod_name: str, kube_ns: str, 
 
             console_log_thread.join()
             print_results_summary(local_console_log, ci_summary_file)
-        except client.exceptions.ApiException as e:
-            print(f"Failed to tarball artifacts at {archive_path_in_pod} in {pod_name}: {e}")
+        # CalledProcessError comes from the kubectl cp, TarError and OSError from the extract
+        except (client.exceptions.ApiException, subprocess.CalledProcessError, tarfile.TarError, OSError) as e:
+            print(f"Failed to collect the artifacts at {archive_path_in_pod} in {pod_name}: {e}")
+            console_log_thread.join()
 
 
 def cleanup_and_maybe_teardown(kubeconfig: Optional[str], kubecontext: Optional[str], kube_ns: str, tear_down: bool):
