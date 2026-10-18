@@ -302,19 +302,14 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
             return;
 
         long previousRangeBytes = lastWritebackPosition - previousWritebackPosition;
-        if (previousRangeBytes > 0
-            && !syncFileRange(previousWritebackPosition, previousRangeBytes,
-                              NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE))
+        if (previousRangeBytes > 0 && !syncFileRange(previousWritebackPosition, previousRangeBytes,
+                                                     NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE))
             return;
 
         previousWritebackPosition = lastWritebackPosition;
         lastWritebackPosition = pos;
     }
 
-    /**
-     * Every route that shrinks the file goes through here, so no paced range outlives the bytes it names.
-     * A range left past the end of the file short-circuits every later interval.
-     */
     protected void truncateChannel(long toSize)
     {
         try
