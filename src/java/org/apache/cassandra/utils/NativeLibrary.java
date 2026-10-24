@@ -357,11 +357,9 @@ public final class NativeLibrary
      * Starts writeback of a file range, and optionally waits for writeback already started, without the
      * metadata commit an {@code fsync} performs. Durability still rests on a later {@code fsync}.
      * <p>
-     * Pacing writeback takes two calls over two disjoint, adjacent ranges: {@code SYNC_FILE_RANGE_WRITE}
-     * submits the newest range, and {@code SYNC_FILE_RANGE_WAIT_BEFORE} over the range before it bounds
-     * how much writeback can accumulate. Both flags on a single range is inert: {@code WAIT_BEFORE}
-     * waits only on pages already tagged {@code PAGECACHE_TAG_WRITEBACK} (mm/filemap.c), and the range
-     * it was handed in the same call has not been tagged yet.
+     * {@code WAIT_BEFORE} and {@code WRITE} on one range is inert: {@code WAIT_BEFORE} waits only on pages
+     * already tagged {@code PAGECACHE_TAG_WRITEBACK} (mm/filemap.c), and pages handed over in the same call
+     * are not tagged yet. Waiting therefore takes a second call over an earlier range.
      *
      * @return {@code true} if the range was submitted to the kernel. {@code false} means it was not, and
      *         nothing was synced in its place, so the caller must not advance its positions.
@@ -388,7 +386,7 @@ public final class NativeLibrary
         }
         catch (UnsatisfiedLinkError e)
         {
-            // JNA unavailable, or no such symbol: the caller loses writeback pacing, nothing else
+            // an absent symbol costs writeback pacing and nothing else
             return false;
         }
         catch (RuntimeException e)

@@ -180,8 +180,6 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
             writer.write(new byte[chunk * 20]);
             assertFalse("trickle_fsync must pace writeback during a compressed flush", writer.ranges.isEmpty());
 
-            // the interval counts uncompressed input, the ranges address the compressed file: confuse the
-            // two and the ranges run off the end of it
             long onDisk = writer.getOnDiskFilePointer();
             assertTrue("ranges must stay inside the compressed file", writer.lastRangeEnd() <= onDisk);
             assertTrue("input must compress far enough for that to mean something", onDisk < chunk * 20 / 2);
@@ -234,7 +232,6 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         }
     }
 
-    /** Records what the trickle interval did: data-only syncs, and the writeback ranges it handed over. */
     private static class CountingCSW extends CompressedSequentialWriter
     {
         final AtomicInteger dataSyncs = new AtomicInteger();

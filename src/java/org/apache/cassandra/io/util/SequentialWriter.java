@@ -43,8 +43,7 @@ import static org.apache.cassandra.utils.Throwables.merge;
  */
 public class SequentialWriter extends BufferedDataOutputStreamPlus implements Transactional
 {
-    // Operator escape hatch back to the per-interval fdatasync, should writeback pacing misbehave in the
-    // field. Deliberately not a yaml option, and never enabled automatically.
+    // Operator-only: a libc without sync_file_range loses pacing rather than falling back to fdatasync.
     private static final boolean TRICKLE_WITH_FDATASYNC = TRICKLE_FSYNC_USE_FDATASYNC.getBoolean();
 
     // absolute path to the given file
@@ -65,8 +64,8 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
     //expect block (same as buffer size) alignment for everything except the last block
     private final boolean strictFlushing;
 
-    // whether to do trickling fsync() to avoid sudden bursts of dirty buffer flushing by kernel causing read
-    // latency spikes
+    // whether to pace writeback at intervals, to avoid sudden bursts of dirty buffer flushing by the
+    // kernel causing read latency spikes
     protected final SequentialWriterOption option;
     private long bytesSinceTrickleFsync = 0;
 
@@ -78,7 +77,6 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
     // while the interval that triggers them counts uncompressed bytes.
     private long previousWritebackPosition = 0;
     private long lastWritebackPosition = 0;
-    // Negative when writeback cannot be paced, which is how trySyncFileRange reads it too.
     private final int writebackFd;
 
     private final TransactionalProxy txnProxy = txnProxy();
@@ -260,7 +258,6 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         syncDataOnlyInternal();
     }
 
-    /** Paces writeback at the trickle interval, so dirty pages do not pile up into one kernel-sized burst. */
     private void trickleSync()
     {
         if (TRICKLE_WITH_FDATASYNC)
@@ -271,16 +268,11 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
 
     /**
      * Hands the kernel the range written since the last interval and waits on the range before it, so at
-     * most two intervals of writeback are ever outstanding. {@link NativeLibrary#trySyncFileRange} says
-     * why the wait cannot be folded into the same call.
-     * <p>
-     * The positions advance only once both ranges are handed over, so a refused range is retried whole
-     * at the next interval. Nothing is ever synced in its place — nor when there is no descriptor to
-     * hand it to.
+     * most two intervals of writeback are ever outstanding, and the thread never waits on what it just
+     * wrote. {@link NativeLibrary#trySyncFileRange} says why the wait cannot be folded into the same call.
      */
     private void trySyncFileRangeInternal()
     {
-        // only a failed getfd reaches this — trickle off and the hatch never call in here
         if (writebackFd < 0)
             return;
 
@@ -301,6 +293,8 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         if (!syncFileRange(lastWritebackPosition, newRangeBytes, NativeLibrary.SYNC_FILE_RANGE_WRITE))
             return;
 
+        // Positions advance only when every range offered was taken, so a refused range is retried whole.
+        // The first interval has no range before it and must still advance, or they never move again.
         long previousRangeBytes = lastWritebackPosition - previousWritebackPosition;
         if (previousRangeBytes > 0 && !syncFileRange(previousWritebackPosition, previousRangeBytes,
                                                      NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE))

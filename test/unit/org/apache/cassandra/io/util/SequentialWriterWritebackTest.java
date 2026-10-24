@@ -69,8 +69,7 @@ public class SequentialWriterWritebackTest
         RecordingWriter writer = writer(BUFFER_SIZE);
         writeIntervals(writer, 3);
 
-        // three intervals: one submit for the first, a submit plus a wait for each of the other two
-        assertEquals(5, writer.calls.size());
+        assertEquals("the first interval has no range before it to wait on", 5, writer.calls.size());
         assertWrite(writer.calls.get(0), 0, BUFFER_SIZE);
 
         assertWrite(writer.calls.get(1), BUFFER_SIZE, BUFFER_SIZE);
@@ -95,7 +94,6 @@ public class SequentialWriterWritebackTest
         writer.submit = true;
         writeIntervals(writer, 1);
 
-        // positions did not advance over the failed call, so the missed range is submitted with the new one
         assertWrite(writer.calls.get(2), BUFFER_SIZE, 2 * BUFFER_SIZE);
         assertWaitBefore(writer.calls.get(3), 0, BUFFER_SIZE);
         assertEquals("a range that was not submitted must not be synced some other way", 0, writer.dataSyncs);
@@ -116,7 +114,6 @@ public class SequentialWriterWritebackTest
         writeIntervals(writer, 2);
 
         assertTrue("intervals must keep firing after a truncate", writer.calls.size() > before);
-        // the rewritten tail is paced from the truncation point, not skipped and not re-paced from zero
         assertWrite(writer.calls.get(before), truncateTarget, BUFFER_SIZE);
     }
 

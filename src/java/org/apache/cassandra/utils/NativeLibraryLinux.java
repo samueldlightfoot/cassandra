@@ -30,8 +30,7 @@ import org.slf4j.LoggerFactory;
 /**
  * A {@code NativeLibraryWrapper} implementation for Linux. Also the one AIX gets, and the one every
  * operating system Cassandra does not recognise gets, since {@code getOsType} maps those to
- * {@code LINUX}. So a symbol that only Linux has must not be declared alongside the rest; see how
- * {@code sync_file_range} is registered below.
+ * {@code LINUX}. So a symbol that only Linux has must not be declared alongside the rest.
  * <p>
  * When JNA is initialized, all methods that have the 'native' keyword
  * will be attmpted to be linked against. As Java doesn't have the equivalent
@@ -86,9 +85,7 @@ public class NativeLibraryLinux implements NativeLibraryWrapper
     /**
      * Registered on its own: declared with the symbols above it would fail {@code Native.register} for the
      * whole class on the other platforms served here, and an unavailable native library fails startup
-     * ({@code StartupChecks.checkNativeLibraryInitialization}). Alone it costs only writeback pacing — the
-     * unregistered method throws {@code UnsatisfiedLinkError}, which
-     * {@code NativeLibrary.trySyncFileRange} treats as "not submitted".
+     * ({@code StartupChecks.checkNativeLibraryInitialization}). Alone it costs only writeback pacing.
      */
     private static class SyncFileRange
     {

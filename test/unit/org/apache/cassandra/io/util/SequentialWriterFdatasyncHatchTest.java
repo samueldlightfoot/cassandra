@@ -38,7 +38,9 @@ public class SequentialWriterFdatasyncHatchTest
 
     static
     {
-        TRICKLE_FSYNC_USE_FDATASYNC.setBoolean(true);
+        // Set through the published property name: a rename there breaks every operator's -D silently.
+        assertEquals("cassandra.trickle_fsync.use_fdatasync", TRICKLE_FSYNC_USE_FDATASYNC.getKey());
+        System.setProperty(TRICKLE_FSYNC_USE_FDATASYNC.getKey(), "true");
     }
 
     @BeforeClass
