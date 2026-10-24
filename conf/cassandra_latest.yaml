@@ -973,7 +973,8 @@ memtable_allocation_type: offheap_objects
 # operating system at intervals, rather than let them build up until it
 # flushes them in one burst. Enable this to avoid sudden dirty buffer flushing
 # from impacting read latencies. Almost always a good idea on SSDs; not
-# necessarily on platters. Takes effect on Linux only.
+# necessarily on platters. The interval sync needs sync_file_range, which exists
+# only on Linux; elsewhere it is skipped.
 trickle_fsync: true
 # The interval bounds how much dirty data one writeback submission covers, so it
 # bounds the size of a single writeback burst. Raising it trades read tail latency
