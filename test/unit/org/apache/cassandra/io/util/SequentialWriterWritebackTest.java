@@ -28,12 +28,15 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.NativeLibrary;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 /**
  * The writeback range bookkeeping behind {@code trickle_fsync}, exercised through a seam rather than the
@@ -97,6 +100,26 @@ public class SequentialWriterWritebackTest
         assertWrite(writer.calls.get(2), BUFFER_SIZE, 2 * BUFFER_SIZE);
         assertWaitBefore(writer.calls.get(3), 0, BUFFER_SIZE);
         assertEquals("a range that was not submitted must not be synced some other way", 0, writer.dataSyncs);
+    }
+
+    @Test
+    public void aFailedWaitIsAWriteErrorOnTheFile() throws IOException
+    {
+        RecordingWriter writer = writer(BUFFER_SIZE);
+        writeIntervals(writer, 1);
+
+        IOException eio = new IOException("errno (5)");
+        writer.waitFailure = eio;
+        try
+        {
+            writeIntervals(writer, 1);
+            fail("a writeback error must not be swallowed: the close-time fsync will no longer report it");
+        }
+        catch (FSWriteError e)
+        {
+            assertSame(eio, e.getCause());
+            assertEquals(writer.getPath(), e.path);
+        }
     }
 
     @Test
@@ -204,6 +227,7 @@ public class SequentialWriterWritebackTest
         final List<Range> calls = new ArrayList<>();
         int dataSyncs = 0;
         boolean submit = true;
+        IOException waitFailure;
 
         RecordingWriter(File file, SequentialWriterOption option)
         {
@@ -212,9 +236,11 @@ public class SequentialWriterWritebackTest
         }
 
         @Override
-        protected boolean syncFileRange(long offset, long nbytes, int flags)
+        protected boolean syncFileRange(long offset, long nbytes, int flags) throws IOException
         {
             calls.add(new Range(offset, nbytes, flags));
+            if (waitFailure != null && flags == NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE)
+                throw waitFailure;
             return submit;
         }
 

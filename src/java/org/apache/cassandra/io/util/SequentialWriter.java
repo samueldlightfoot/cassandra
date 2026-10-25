@@ -267,25 +267,25 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         try
         {
             pos = fchannel.position();
+
+            long newRangeBytes = pos - lastWritebackPosition;
+            if (newRangeBytes <= 0)
+                return;
+
+            if (!syncFileRange(lastWritebackPosition, newRangeBytes, NativeLibrary.SYNC_FILE_RANGE_WRITE))
+                return;
+
+            // Positions advance only when every range offered was taken, so a refused range is retried whole.
+            // The first interval has no range before it and must still advance, or they never move again.
+            long previousRangeBytes = lastWritebackPosition - previousWritebackPosition;
+            if (previousRangeBytes > 0 && !syncFileRange(previousWritebackPosition, previousRangeBytes,
+                                                         NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE))
+                return;
         }
         catch (IOException e)
         {
             throw new FSWriteError(e, getPath());
         }
-
-        long newRangeBytes = pos - lastWritebackPosition;
-        if (newRangeBytes <= 0)
-            return;
-
-        if (!syncFileRange(lastWritebackPosition, newRangeBytes, NativeLibrary.SYNC_FILE_RANGE_WRITE))
-            return;
-
-        // Positions advance only when every range offered was taken, so a refused range is retried whole.
-        // The first interval has no range before it and must still advance, or they never move again.
-        long previousRangeBytes = lastWritebackPosition - previousWritebackPosition;
-        if (previousRangeBytes > 0 && !syncFileRange(previousWritebackPosition, previousRangeBytes,
-                                                     NativeLibrary.SYNC_FILE_RANGE_WAIT_BEFORE))
-            return;
 
         previousWritebackPosition = lastWritebackPosition;
         lastWritebackPosition = pos;
@@ -306,7 +306,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         previousWritebackPosition = Math.min(previousWritebackPosition, lastWritebackPosition);
     }
 
-    protected boolean syncFileRange(long offset, long nbytes, int flags)
+    protected boolean syncFileRange(long offset, long nbytes, int flags) throws IOException
     {
         return NativeLibrary.trySyncFileRange(writebackFd, offset, nbytes, flags);
     }

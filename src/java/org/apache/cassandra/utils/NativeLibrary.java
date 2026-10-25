@@ -58,7 +58,10 @@ public final class NativeLibrary
     private static final int MCL_CURRENT;
     private static final int MCL_FUTURE;
 
+    private static final int EPERM  = 1;
     private static final int ENOMEM = 12;
+    private static final int EINVAL = 22;
+    private static final int ENOSYS = 38;
 
     private static final int F_GETFL   = 3;  /* get file status flags */
     private static final int F_SETFL   = 4;  /* set file status flags */
@@ -363,8 +366,10 @@ public final class NativeLibrary
      *
      * @return {@code true} if the range was submitted to the kernel. {@code false} means it was not, and
      *         nothing was synced in its place, so the caller must not advance its positions.
+     * @throws IOException if writeback failed. A failed wait clears the error the kernel holds for
+     *         {@code fd}, so a later {@code fsync} on it succeeds: this is the only report of the lost write.
      */
-    public static boolean trySyncFileRange(int fd, long offset, long nbytes, int flags)
+    public static boolean trySyncFileRange(int fd, long offset, long nbytes, int flags) throws IOException
     {
         if (fd < 0 || osType != LINUX)
             return false;
@@ -394,12 +399,18 @@ public final class NativeLibrary
             if (!(e instanceof LastErrorException))
                 throw e;
 
+            int errno = errno(e);
+            // Refused or unimplemented (seccomp, gVisor, WSL1); anything else is a writeback failure
+            if (errno != ENOSYS && errno != EPERM && errno != EINVAL)
+                throw new IOException(String.format("sync_file_range(%d, %d, %d, %d) failed, errno (%d)",
+                                                    fd, offset, nbytes, flags, errno), e);
+
             if (REQUIRE)
                 NoSpamLogger.log(logger,
                                  NoSpamLogger.Level.WARN,
                                  10,
                                  TimeUnit.MINUTES,
-                                 "sync_file_range({}, {}, {}, {}) failed, errno ({}).", fd, offset, nbytes, flags, errno(e));
+                                 "sync_file_range({}, {}, {}, {}) failed, errno ({}).", fd, offset, nbytes, flags, errno);
 
             return false;
         }
