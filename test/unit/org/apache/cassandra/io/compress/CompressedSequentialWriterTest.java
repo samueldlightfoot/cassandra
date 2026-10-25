@@ -244,10 +244,11 @@ public class CompressedSequentialWriterTest extends SequentialWriterTest
         }
 
         @Override
-        protected void syncDataOnlyInternal()
+        protected void force(boolean metaData)
         {
-            dataSyncs.incrementAndGet();
-            super.syncDataOnlyInternal();
+            if (!metaData)
+                dataSyncs.incrementAndGet();
+            super.force(metaData);
         }
 
         @Override

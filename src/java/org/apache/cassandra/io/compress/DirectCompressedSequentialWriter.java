@@ -169,17 +169,10 @@ public class DirectCompressedSequentialWriter extends CompressedSequentialWriter
     // blocks — the last chunk's sub-block tail would stay buffered and the reader would short-read.
     // Finalize first so the reader sees the complete file.
     @Override
-    protected void syncInternal()
+    protected void syncInternal(boolean metaData)
     {
         finalizeDataFile();
-        syncDataOnlyInternal();
-    }
-
-    @Override
-    protected void syncFullInternal()
-    {
-        finalizeDataFile();
-        force(true);
+        force(metaData);
     }
 
     // Brings the file to its final on-disk form exactly once. openFinalEarly's sync and commit's doPrepare
@@ -370,7 +363,7 @@ public class DirectCompressedSequentialWriter extends CompressedSequentialWriter
         @Override
         protected void doPrepare()
         {
-            syncFullInternal();
+            syncInternal(true);
             writeDigestFile();
             sstableMetadataCollector.addCompressionRatio(compressedSize, uncompressedSize);
             metadataWriter.finalizeLength(current(), chunkCount).prepareToCommit();

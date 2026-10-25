@@ -107,7 +107,8 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         @Override
         protected void doPrepare()
         {
-            syncFullInternal();
+            // The only sync that makes timestamps durable; sync_file_range pacing doesn't even commit the size.
+            syncInternal(true);
         }
 
         @Override
@@ -220,19 +221,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
      */
     public void sync()
     {
-        syncInternal();
-    }
-
-    protected void syncDataOnlyInternal()
-    {
-        force(false);
-    }
-
-    /** The only sync that commits the file's size and timestamps; writeback pacing commits no metadata. */
-    protected void syncFullInternal()
-    {
-        doFlush(0);
-        force(true);
+        syncInternal(false);
     }
 
     protected void force(boolean metaData)
@@ -252,18 +241,10 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
      * Otherwise it will leave a non-uniform size compressed block in the middle of the file
      * and the compressed format can't handle that.
      */
-    protected void syncInternal()
+    protected void syncInternal(boolean metaData)
     {
         doFlush(0);
-        syncDataOnlyInternal();
-    }
-
-    private void trickleSync()
-    {
-        if (TRICKLE_WITH_FDATASYNC)
-            syncDataOnlyInternal();
-        else
-            trySyncFileRangeInternal();
+        force(metaData);
     }
 
     /**
@@ -271,8 +252,14 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
      * most two intervals of writeback are ever outstanding, and the thread never waits on what it just
      * wrote. {@link NativeLibrary#trySyncFileRange} says why the wait cannot be folded into the same call.
      */
-    private void trySyncFileRangeInternal()
+    private void paceWriteback()
     {
+        if (TRICKLE_WITH_FDATASYNC)
+        {
+            force(false);
+            return;
+        }
+
         if (writebackFd < 0)
             return;
 
@@ -334,7 +321,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
             bytesSinceTrickleFsync += buffer.position();
             if (bytesSinceTrickleFsync >= option.trickleFsyncByteInterval())
             {
-                trickleSync();
+                paceWriteback();
                 bytesSinceTrickleFsync = 0;
             }
         }
@@ -482,7 +469,7 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
         }
 
         // synchronize current buffer with disk - we don't want any data loss
-        syncInternal();
+        syncInternal(false);
 
         // truncate file to given position
         truncate(truncateTarget);

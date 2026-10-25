@@ -219,10 +219,11 @@ public class SequentialWriterWritebackTest
         }
 
         @Override
-        protected void syncDataOnlyInternal()
+        protected void force(boolean metaData)
         {
-            dataSyncs++;
-            super.syncDataOnlyInternal();
+            if (!metaData)
+                dataSyncs++;
+            super.force(metaData);
         }
     }
 }
