@@ -225,14 +225,11 @@ Upgrading
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
     return the same value as the address column. This avoids the risk of client connections overwhelming
     DNS. (CASSANDRA-21539)
-    - trickle_fsync now paces writeback with sync_file_range rather than issuing an fdatasync at every
-    interval, and every SSTable component file is fully fsynced when it is closed. Up to two intervals may
-    be awaiting writeback at once where before it was one, so a trickle_fsync_interval raised above the
-    10240KiB default now holds twice the unwritten data it did before. sync_file_range exists only on
-    Linux; elsewhere the interval sync is skipped and dirty data accumulates to the kernel's own
-    thresholds, as it does with trickle_fsync disabled. -Dcassandra.trickle_fsync.use_fdatasync=true
-    restores the per-interval fdatasync on any platform; the close-time fsync is unaffected by it.
-    (CASSANDRA-21679)
+    - trickle_fsync now paces writeback with sync_file_range instead of an fdatasync at every interval, and
+    every SSTable component file is fully fsynced on close. Two intervals can now await writeback at once, so
+    a trickle_fsync_interval raised above the 10240KiB default holds twice the unwritten data it did. Off
+    Linux the interval sync is skipped. -Dcassandra.trickle_fsync.use_fdatasync=true restores the
+    per-interval fdatasync on any platform; the close-time fsync still runs. (CASSANDRA-21679)
 
 Deprecation
 -----------
