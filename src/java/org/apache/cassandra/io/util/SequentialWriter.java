@@ -64,15 +64,13 @@ public class SequentialWriter extends BufferedDataOutputStreamPlus implements Tr
     //expect block (same as buffer size) alignment for everything except the last block
     private final boolean strictFlushing;
 
-    // whether to pace writeback at intervals, to avoid sudden bursts of dirty buffer flushing by the
-    // kernel causing read latency spikes
     protected final SequentialWriterOption option;
-    private long bytesSinceTrickleFsync = 0;
 
     protected long lastFlushOffset;
 
     protected LongConsumer runPostFlush;
 
+    private long bytesSinceTrickleFsync = 0;
     // Ranges handed to the kernel at the last two intervals. Compressed offsets on a compressed writer,
     // while the interval that triggers them counts uncompressed bytes.
     private long previousWritebackPosition = 0;
