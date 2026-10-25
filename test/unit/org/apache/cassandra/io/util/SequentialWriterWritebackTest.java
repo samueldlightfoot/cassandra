@@ -38,10 +38,6 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
-/**
- * The writeback range bookkeeping behind {@code trickle_fsync}, exercised through a seam rather than the
- * syscall, so it runs everywhere rather than on Linux alone.
- */
 public class SequentialWriterWritebackTest
 {
     private static final int BUFFER_SIZE = 4096;

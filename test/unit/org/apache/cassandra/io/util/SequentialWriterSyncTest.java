@@ -41,9 +41,8 @@ import static java.util.Arrays.asList;
 import static org.junit.Assert.assertEquals;
 
 /**
- * Which sync each writer in the family issues, and when. A read-back cannot tell an fsync from an
- * fdatasync, and the unit suite runs under {@code cassandra.skip_sync}, so neither the file nor the
- * channel can answer this; {@code force(boolean)} is the one call every sync path funnels through.
+ * Records fsyncs and fdatasyncs at {@code force(boolean)}, which all of them go through: a read-back
+ * cannot tell one from the other, and the unit suite runs under {@code cassandra.skip_sync}.
  */
 @RunWith(Parameterized.class)
 public class SequentialWriterSyncTest
