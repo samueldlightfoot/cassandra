@@ -38,9 +38,9 @@ public class SequentialWriterFdatasyncHatchTest
 
     static
     {
-        // Set through the published property name: a rename there breaks every operator's -D silently.
-        assertEquals("cassandra.trickle_fsync.use_fdatasync", TRICKLE_FSYNC_USE_FDATASYNC.getKey());
-        System.setProperty(TRICKLE_FSYNC_USE_FDATASYNC.getKey(), "true");
+        assertEquals("renaming the key silently breaks every operator's -D",
+                     "cassandra.trickle_fsync.use_fdatasync", TRICKLE_FSYNC_USE_FDATASYNC.getKey());
+        TRICKLE_FSYNC_USE_FDATASYNC.setBoolean(true);
     }
 
     @BeforeClass
@@ -98,7 +98,7 @@ public class SequentialWriterFdatasyncHatchTest
         }
 
         @Override
-        protected boolean syncFileRange(long offset, long nbytes, int flags)
+        protected boolean syncFileRange(long offset, long nbytes, int flags) throws IOException
         {
             rangeCalls++;
             return super.syncFileRange(offset, nbytes, flags);
