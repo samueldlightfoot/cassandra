@@ -28,9 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A {@code NativeLibraryWrapper} implementation for Linux. Also the one AIX gets, and the one every
- * operating system Cassandra does not recognise gets, since {@code getOsType} maps those to
- * {@code LINUX}. So a symbol that only Linux has must not be declared alongside the rest.
+ * A {@code NativeLibraryWrapper} implementation for Linux.
  * <p>
  * When JNA is initialized, all methods that have the 'native' keyword
  * will be attmpted to be linked against. As Java doesn't have the equivalent
@@ -83,9 +81,11 @@ public class NativeLibraryLinux implements NativeLibraryWrapper
     private static native long getpid() throws LastErrorException;
 
     /**
-     * Registered on its own: declared with the symbols above it would fail {@code Native.register} for the
-     * whole class on the other platforms served here, and an unavailable native library fails startup
-     * ({@code StartupChecks.checkNativeLibraryInitialization}). Alone it costs only writeback pacing.
+     * Kept in its own class because this wrapper also serves AIX and unrecognised platforms, whose libc may
+     * lack sync_file_range. If it were registered with the symbols above, a missing symbol would fail
+     * {@code Native.register} for all of them, and an unavailable native library fails startup
+     * ({@code StartupChecks.checkNativeLibraryInitialization}). Registered alone, a missing symbol only
+     * disables writeback pacing.
      */
     private static class SyncFileRange
     {
