@@ -992,7 +992,8 @@ index_summary_resize_interval: 60m
 # flushes them in one burst. Enable this to avoid sudden dirty buffer flushing
 # from impacting read latencies. Almost always a good idea on SSDs; not
 # necessarily on platters. The interval sync needs sync_file_range, which exists
-# only on Linux; elsewhere it is skipped.
+# only on Linux; elsewhere it is skipped. Even on Linux it has no effect on ZFS,
+# tmpfs or overlayfs, or on files written with O_DIRECT.
 trickle_fsync: true
 # The interval bounds how much dirty data one writeback submission covers, so it
 # bounds the size of a single writeback burst. Raising it trades read tail latency
